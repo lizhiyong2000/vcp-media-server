@@ -36,8 +36,8 @@ use crate::protocol::rtp::rtcp::rtcp_sr::RtcpSenderReport;
 use crate::protocol::rtp::utils::TPacker;
 use crate::protocol::rtp::utils::TUnPacker;
 
-use crate::protocol::rtp::utils::Marshal;
-use crate::protocol::rtp::utils::Unmarshal;
+use crate::common::Marshal;
+use crate::common::Unmarshal;
 
 use super::rtsp_codec::RtspCodecId;
 use super::rtsp_codec::RtspCodecInfo;

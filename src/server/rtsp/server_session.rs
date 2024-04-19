@@ -6,13 +6,13 @@ use byteorder::BigEndian;
 use bytes::BytesMut;
 
 
-use crate::common::marshal_trait::Marshal;
-use crate::common::marshal_trait::Unmarshal;
+use crate::common::Marshal;
+use crate::common::Unmarshal;
 use crate::utils::bytesio::bytesio::TNetIO;
 use crate::utils::bytesio::bytesio::TcpIO;
 
 use crate::protocol::rtp::define::ANNEXB_NALU_START_CODE;
-use crate::protocol::rtp::utils::Marshal as RtpMarshal;
+use crate::common::Marshal as RtpMarshal;
 use crate::protocol::rtp::RtpPacket;
 use crate::protocol::rtsp::rtsp_range::RtspRange;
 
@@ -28,8 +28,7 @@ use crate::protocol::rtsp::rtsp_transport::RtspTransport;
 
 use crate::common::http::HttpRequest as RtspRequest;
 use crate::common::http::HttpResponse as RtspResponse;
-use crate::common::http::Marshal as RtspMarshal;
-use crate::common::http::Unmarshal as RtspUnmarshal;
+
 
 
 
@@ -215,9 +214,18 @@ impl RTSPServerSession {
     //publish stream: OPTIONS->ANNOUNCE->SETUP->RECORD->TEARDOWN
     //subscribe stream: OPTIONS->DESCRIBE->SETUP->PLAY->TEARDOWN
     async fn on_rtsp_message(&mut self) -> Result<(), SessionError> {
-        let data = self.reader.extract_remaining_bytes();
+        // let data = self.reader.extract_remaining_bytes();
+
+        let data = self.reader.get_remaining_bytes();
+
+
+        log::trace!("received rtsp message data, length {}", data.len());
 
         if let Some(rtsp_request) = RtspRequest::unmarshal(std::str::from_utf8(&data)?) {
+            log::trace!("received rtsp request message:{}", rtsp_request);
+
+            _= self.reader.read_bytes(rtsp_request.origin_length);
+
             match rtsp_request.method.as_str() {
                 rtsp_method_name::OPTIONS => {
                     self.handle_options(&rtsp_request).await?;
@@ -249,6 +257,10 @@ impl RTSPServerSession {
 
                 _ => {}
             }
+        } else{
+            log::trace!("not a valid rtsp request message");
+            let data = self.io.lock().await.read().await?;
+            self.reader.extend_from_slice(&data[..]);
         }
 
         Ok(())
@@ -310,12 +322,12 @@ impl RTSPServerSession {
         //     auth.authenticate(&stream_name, &rtsp_request.uri.query, false)?;
         // }
 
-        // if let Some(request_body) = &rtsp_request.body {
-        //     if let Some(sdp) = Sdp::unmarshal(request_body) {
-        //         self.sdp = sdp.clone();
-        //         self.stream_handler.set_sdp(sdp).await;
-        //     }
-        // }
+        if let Some(request_body) = &rtsp_request.body {
+            if let Some(sdp) = Sdp::unmarshal(request_body) {
+                self.sdp = sdp.clone();
+                // self.stream_handler.set_sdp(sdp).await;
+            }
+        }
 
         //new tracks for publish session
         self.new_tracks()?;
@@ -749,6 +761,9 @@ impl RTSPServerSession {
     // }
 
     async fn send_response(&mut self, response: &RtspResponse) -> Result<(), SessionError> {
+
+        log::debug!("send response:==========================\n{}=============", response);
+
         self.writer.write(response.marshal().as_bytes())?;
         self.writer.flush().await?;
 

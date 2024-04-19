@@ -1,7 +1,7 @@
 pub mod fmtp;
 pub mod rtpmap;
 
-use crate::common::marshal_trait::{Marshal, Unmarshal};
+use crate::common::{Marshal, Unmarshal};
 use rtpmap::RtpMap;
 use std::collections::HashMap;
 
@@ -13,7 +13,7 @@ pub struct Bandwidth {
     bandwidth: u16,
 }
 
-impl Unmarshal for Bandwidth {
+impl Unmarshal<&str, Option<Bandwidth>> for Bandwidth {
     //   b=AS:284\r\n\
     fn unmarshal(raw_data: &str) -> Option<Self> {
         let mut sdp_bandwidth = Bandwidth::default();
@@ -33,7 +33,7 @@ impl Unmarshal for Bandwidth {
     }
 }
 
-impl Marshal for Bandwidth {
+impl Marshal<String> for Bandwidth {
     fn marshal(&self) -> String {
         format!("{}:{}\r\n", self.b_type, self.bandwidth)
     }
@@ -95,7 +95,7 @@ pub struct Sdp {
     attributes: HashMap<String, String>,
 }
 
-impl Unmarshal for SdpMediaInfo {
+impl Unmarshal<&str, Option<SdpMediaInfo>> for SdpMediaInfo {
     //m=audio 11704 RTP/AVP 96 97 98 0 8 18 101 99 100 */
     //m=video 20003 RTP/AVP 97
     fn unmarshal(raw_data: &str) -> Option<Self> {
@@ -140,7 +140,7 @@ impl Unmarshal for SdpMediaInfo {
 // a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3; config=119056E500\r\n\
 // a=control:streamid=1\r\n"
 
-impl Marshal for SdpMediaInfo {
+impl Marshal<String> for SdpMediaInfo {
     fn marshal(&self) -> String {
         let fmts_str = self
             .fmts
@@ -177,7 +177,7 @@ impl Marshal for SdpMediaInfo {
     }
 }
 
-impl Unmarshal for Sdp {
+impl Unmarshal<&str, Option<Sdp>>  for Sdp {
     fn unmarshal(raw_data: &str) -> Option<Self> {
         let mut sdp = Sdp {
             raw_string: raw_data.to_string(),
@@ -300,7 +300,7 @@ impl Unmarshal for Sdp {
 // t=0 0\r\n\
 // a=tool:libavformat 58.76.100\r\n\
 
-impl Marshal for Sdp {
+impl Marshal<String> for Sdp {
     fn marshal(&self) -> String {
         let mut sdp_str = format!(
             "v={}\r\no={}\r\ns={}\r\nc={}\r\nt={}\r\n",
@@ -322,7 +322,7 @@ impl Marshal for Sdp {
 #[cfg(test)]
 mod tests {
 
-    use crate::common::marshal_trait::{Marshal, Unmarshal};
+    use crate::common::{Marshal, Unmarshal};
 
     use super::Sdp;
 

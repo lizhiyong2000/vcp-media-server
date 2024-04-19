@@ -1,16 +1,10 @@
 use crate::scanf;
 use indexmap::IndexMap;
-use std::fmt;
+use tokio::task::LocalEnterGuard;
+use std::fmt::{self, Display};
 
-pub trait Unmarshal {
-    fn unmarshal(request_data: &str) -> Option<Self>
-    where
-        Self: Sized;
-}
+use crate::common::{Marshal, Unmarshal};
 
-pub trait Marshal {
-    fn marshal(&self) -> String;
-}
 
 #[derive(Debug, Clone, Default)]
 pub enum Schema {
@@ -47,7 +41,7 @@ pub struct Uri {
     pub query: Option<String>,
 }
 
-impl Unmarshal for Uri {
+impl Unmarshal<&str, Option<Uri>> for Uri {
     /*
     RTSP HTTP header : "ANNOUNCE rtsp://127.0.0.1:5544/stream RTSP/1.0\r\n\
     the uri rtsp://127.0.0.1:5544/stream is standard with schema://host:port/path?query.
@@ -118,7 +112,7 @@ impl Unmarshal for Uri {
     }
 }
 
-impl Marshal for Uri {
+impl Marshal<String> for Uri {
     fn marshal(&self) -> String {
         /*first pice path and query together*/
         let path_with_query = if let Some(query) = &self.query {
@@ -151,7 +145,10 @@ pub struct HttpRequest {
     pub version: String,
     pub headers: IndexMap<String, String>,
     pub body: Option<String>,
+    pub body_length: Option<usize>,
+    pub origin_length: usize,
 }
+
 
 impl HttpRequest {
     pub fn get_header(&self, header_name: &String) -> Option<&String> {
@@ -170,9 +167,13 @@ pub fn parse_content_length(request_data: &str) -> Option<u32> {
     length_str.trim().parse().ok()
 }
 
-impl Unmarshal for HttpRequest {
+impl Unmarshal<&str, Option<HttpRequest>> for HttpRequest {
     fn unmarshal(request_data: &str) -> Option<Self> {
         let mut http_request = HttpRequest::default();
+
+        log::trace!("request data, len:{}\n{}", request_data.len(), request_data);
+
+
         let header_end_idx = if let Some(idx) = request_data.find("\r\n\r\n") {
             let data_except_body = &request_data[..idx];
             let mut lines = data_except_body.lines();
@@ -238,16 +239,40 @@ impl Unmarshal for HttpRequest {
             request_data.len()
         );
 
-        if request_data.len() > header_end_idx {
-            /*parse body*/
-            http_request.body = Some(request_data[header_end_idx..].to_string());
+        http_request.origin_length += header_end_idx;
+
+        for (key, value) in http_request.headers.iter() {
+            if key.eq_ignore_ascii_case("Content-Length"){
+                if let Ok(len) = value.parse::<usize>(){
+                    
+                    if request_data.len() - header_end_idx < len as usize{
+                        log::debug!("request body length error");
+                        return None;
+                    }
+                    http_request.body_length = Some(len);
+                    http_request.body = Some(request_data[header_end_idx..header_end_idx + len as usize].to_string());
+
+                    http_request.origin_length += len;
+
+
+                    // http_request.body = Some(request_data[header_end_idx..].to_string());
+                }else{
+                    log::debug!("request body length error");
+                    return None;
+                }
+            }
         }
+
+        // if request_data.len() > header_end_idx {
+        //     /*parse body*/
+            
+        // }
 
         Some(http_request)
     }
 }
 
-impl Marshal for HttpRequest {
+impl Marshal<String> for HttpRequest {
     fn marshal(&self) -> String {
         let mut request_str = format!(
             "{} {} {}\r\n",
@@ -273,6 +298,13 @@ impl Marshal for HttpRequest {
     }
 }
 
+
+impl Display for HttpRequest{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.marshal())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HttpResponse {
     pub version: String,
@@ -282,7 +314,7 @@ pub struct HttpResponse {
     pub body: Option<String>,
 }
 
-impl Unmarshal for HttpResponse {
+impl Unmarshal<&str, Option<HttpResponse>> for HttpResponse {
     fn unmarshal(request_data: &str) -> Option<Self> {
         let mut http_response = HttpResponse::default();
         let header_end_idx = if let Some(idx) = request_data.find("\r\n\r\n") {
@@ -326,7 +358,7 @@ impl Unmarshal for HttpResponse {
     }
 }
 
-impl Marshal for HttpResponse {
+impl Marshal<String> for HttpResponse {
     fn marshal(&self) -> String {
         let mut response_str = format!(
             "{} {} {}\r\n",
@@ -334,7 +366,7 @@ impl Marshal for HttpResponse {
         );
 
         for (header_name, header_value) in &self.headers {
-            if header_name != &"Content-Length".to_string() {
+            if !header_name.eq_ignore_ascii_case("Content-Length") {
                 response_str += &format!("{header_name}: {header_value}\r\n");
             }
         }
@@ -348,6 +380,13 @@ impl Marshal for HttpResponse {
             response_str += body;
         }
         response_str
+    }
+}
+
+
+impl Display for HttpResponse{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.marshal())
     }
 }
 

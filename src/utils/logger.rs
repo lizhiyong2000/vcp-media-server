@@ -1,9 +1,15 @@
+use std::str::FromStr;
+
 use chrono::Local;
+use tracing::instrument::WithSubscriber;
+use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 // use tracing::{info, instrument};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{self, fmt, fmt::format::Writer, fmt::time::FormatTime};
+use tracing_subscriber::{self, filter::LevelFilter, fmt, fmt::format::Writer, fmt::time::FormatTime};
+
+// use tracing_subscriber::{fmt::Layer, prelude::*, EnvFilter, Registry};
 
 use tracing_appender;
 
@@ -18,8 +24,7 @@ impl FormatTime for LocalTimer {
 }
 
 pub(crate) fn setup_log() -> WorkerGuard {
-    // 设置日志输出时的格式，例如，是否包含日志级别、是否包含日志来源位置、设置日志的时间格式
-    // 参考: https://docs.rs/tracing-subscriber/0.3.3/tracing_subscriber/fmt/struct.SubscriberBuilder.html#method.with_timer
+    
     let format = tracing_subscriber::fmt::format()
         .with_level(true)
         .with_target(true)
@@ -30,6 +35,7 @@ pub(crate) fn setup_log() -> WorkerGuard {
 
     // 初始化并设置日志格式(定制和筛选日志)
     tracing_subscriber::registry()
+        .with(LevelFilter::from_str("INFO").unwrap())
         .with(
             fmt::Layer::new()
                 .event_format(format.clone())

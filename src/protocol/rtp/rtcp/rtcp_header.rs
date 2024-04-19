@@ -3,8 +3,8 @@ use bytes::BytesMut;
 
 
 use super::errors::RtcpError;
-use crate::protocol::rtp::utils::Marshal;
-use crate::protocol::rtp::utils::Unmarshal;
+use crate::common::Marshal;
+use crate::common::Unmarshal;
 
 use crate::utils::bytesio::bytes_reader::BytesReader;
 use crate::utils::bytesio::bytes_writer::BytesWriter;

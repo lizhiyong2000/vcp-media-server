@@ -15,8 +15,8 @@ use crate::utils::bytesio::bytes_reader::BytesReader;
 use crate::utils::bytesio::bytes_writer::BytesWriter;
 use rtp_header::RtpHeader;
 
-use self::utils::Marshal;
-use self::utils::Unmarshal;
+use crate::common::Marshal;
+use crate::common::Unmarshal;
 
 #[derive(Debug, Clone, Default)]
 pub struct RtpPacket {

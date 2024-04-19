@@ -1,7 +1,7 @@
 use super::errors::RtcpError;
 use super::rtcp_header::RtcpHeader;
-use crate::protocol::rtp::utils::Marshal;
-use crate::protocol::rtp::utils::Unmarshal;
+use crate::common::Marshal;
+use crate::common::Unmarshal;
 use byteorder::BigEndian;
 use bytes::BytesMut;
 use crate::utils::bytesio::bytes_reader::BytesReader;

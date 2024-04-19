@@ -1,4 +1,4 @@
-use crate::common::marshal_trait::{Marshal, Unmarshal};
+use crate::common::{Marshal, Unmarshal};
 use super::rtsp_utils::scanf;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -25,7 +25,7 @@ pub struct RtspTransport {
     pub ssrc: Option<u32>,
 }
 
-impl Unmarshal for RtspTransport {
+impl Unmarshal<&str, Option<RtspTransport>> for RtspTransport {
     fn unmarshal(raw_data: &str) -> Option<Self> {
         let mut rtsp_transport = RtspTransport::default();
 
@@ -101,7 +101,7 @@ impl Unmarshal for RtspTransport {
     }
 }
 
-impl Marshal for RtspTransport {
+impl Marshal<String> for RtspTransport {
     fn marshal(&self) -> String {
         let protocol_type = match self.protocol_type {
             ProtocolType::TCP => "RTP/AVP/TCP",
@@ -150,8 +150,8 @@ impl Marshal for RtspTransport {
 #[cfg(test)]
 mod tests {
 
-    use crate::common::marshal_trait::Marshal;
-    use crate::common::marshal_trait::Unmarshal;
+    use crate::common::Marshal;
+    use crate::common::Unmarshal;
 
     use super::RtspTransport;
 

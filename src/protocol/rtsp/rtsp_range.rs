@@ -1,4 +1,4 @@
-use crate::common::marshal_trait::{Marshal, Unmarshal};
+use crate::common::{Marshal, Unmarshal};
 
 use super::rtsp_utils;
 
@@ -16,7 +16,7 @@ pub struct RtspRange {
     end: Option<i64>,
 }
 
-impl Unmarshal for RtspRange {
+impl Unmarshal<&str, Option<RtspRange>> for RtspRange {
     fn unmarshal(raw_data: &str) -> Option<Self> {
         let mut rtsp_range = RtspRange::default();
 
@@ -87,7 +87,7 @@ impl Unmarshal for RtspRange {
     }
 }
 
-impl Marshal for RtspRange {
+impl Marshal<String> for RtspRange {
     fn marshal(&self) -> String {
         String::default()
     }
@@ -97,7 +97,7 @@ impl Marshal for RtspRange {
 mod tests {
 
     use super::RtspRange;
-    use crate::common::marshal_trait::Unmarshal;
+    use crate::common::Unmarshal;
 
     #[test]
     fn test_parse_transport() {

@@ -1,4 +1,4 @@
-use crate::common::marshal_trait::{Marshal, Unmarshal};
+use crate::common::{Marshal, Unmarshal};
 
 #[derive(Debug, Clone, Default)]
 pub struct RtpMap {
@@ -8,7 +8,7 @@ pub struct RtpMap {
     pub encoding_param: String,
 }
 
-impl Unmarshal for RtpMap {
+impl Unmarshal<&str, Option<RtpMap>> for RtpMap {
     // a=rtpmap:96 H264/90000\r\n\
     // a=rtpmap:97 MPEG4-GENERIC/48000/2\r\n\
 
@@ -44,7 +44,7 @@ impl Unmarshal for RtpMap {
     }
 }
 
-impl Marshal for RtpMap {
+impl Marshal<String> for RtpMap {
     fn marshal(&self) -> String {
         let mut rtpmap = format!(
             "{} {}/{}",
@@ -61,7 +61,7 @@ impl Marshal for RtpMap {
 #[cfg(test)]
 mod tests {
 
-    use crate::common::marshal_trait::{Marshal, Unmarshal};
+    use crate::common::{Marshal, Unmarshal};
 
     use super::RtpMap;
 

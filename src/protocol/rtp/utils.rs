@@ -13,15 +13,15 @@ use std::time::SystemTime;
 // use streamhub::define::FrameData;
 use tokio::sync::Mutex;
 
-pub trait Unmarshal<T1, T2> {
-    fn unmarshal(data: T1) -> T2
-    where
-        Self: Sized;
-}
+// pub trait Unmarshal<T1, T2> {
+//     fn unmarshal(data: T1) -> T2
+//     where
+//         Self: Sized;
+// }
 
-pub trait Marshal<T> {
-    fn marshal(&self) -> T;
-}
+// pub trait Marshal<T> {
+//     fn marshal(&self) -> T;
+// }
 
 // pub type OnFrameFn = Box<dyn Fn(FrameData) -> Result<(), UnPackerError> + Send + Sync>;
 

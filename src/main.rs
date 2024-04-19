@@ -31,13 +31,13 @@ async fn main() -> Result<()> {
     let es2 = event_sender.clone();
 
     tokio::spawn(async{
-        let rtsp_server = TcpServer::new(ServerType::RTSP, "0.0.0.0:9999".to_string(), es1);
+        let rtsp_server = TcpServer::new(ServerType::RTSP, "0.0.0.0:8554".to_string(), es1);
         rtsp_server.start().await;
     }
     );
 
     tokio::spawn(async{
-        let rtmp_server = TcpServer::new(ServerType::RTMP, "0.0.0.0:9998".to_string(), es2);
+        let rtmp_server = TcpServer::new(ServerType::RTMP, "0.0.0.0:1935".to_string(), es2);
         rtmp_server.start().await;
     }
     );

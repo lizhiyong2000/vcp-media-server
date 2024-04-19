@@ -5,8 +5,8 @@ use crate::utils::bytesio::bytes_errors::BytesWriteError;
 use crate::utils::bytesio::bytes_reader::BytesReader;
 use crate::utils::bytesio::bytes_writer::BytesWriter;
 
-use super::utils::Marshal;
-use super::utils::Unmarshal;
+use crate::common::Marshal;
+use crate::common::Unmarshal;
 
 #[derive(Debug, Clone, Default)]
 pub struct RtpHeader {

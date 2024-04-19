@@ -1,4 +1,4 @@
-use crate::common::marshal_trait::{Marshal, Unmarshal};
+use crate::common::{Marshal, Unmarshal};
 use base64::{engine::general_purpose, Engine as _};
 use bytes::{BufMut, BytesMut};
 
@@ -69,7 +69,7 @@ impl Fmtp {
 }
 
 // a=fmtp:96 packetization-mode=1; sprop-parameter-sets=Z2QAFqyyAUBf8uAiAAADAAIAAAMAPB4sXJA=,aOvDyyLA; profile-level-id=640016
-impl Unmarshal for H264Fmtp {
+impl Unmarshal<&str, Option<H264Fmtp>> for H264Fmtp {
     fn unmarshal(raw_data: &str) -> Option<Self> {
         let mut h264_fmtp = H264Fmtp::default();
         let eles: Vec<&str> = raw_data.splitn(2, ' ').collect();
@@ -115,7 +115,7 @@ impl Unmarshal for H264Fmtp {
     }
 }
 
-impl Marshal for H264Fmtp {
+impl Marshal<String> for H264Fmtp {
     // a=fmtp:96 packetization-mode=1; sprop-parameter-sets=Z2QAFqyyAUBf8uAiAAADAAIAAAMAPB4sXJA=,aOvDyyLA; profile-level-id=640016
     fn marshal(&self) -> String {
         let sps_str = general_purpose::STANDARD.encode(&self.sps);
@@ -131,7 +131,7 @@ impl Marshal for H264Fmtp {
     }
 }
 
-impl Unmarshal for H265Fmtp {
+impl Unmarshal<&str, Option<H265Fmtp>> for H265Fmtp {
     //"a=fmtp:96 sprop-vps=QAEMAf//AWAAAAMAkAAAAwAAAwA/ugJA; sprop-sps=QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXHy5bpKTC8BAQAAAwABAAADAA8I; sprop-pps=RAHAc8GJ"
     fn unmarshal(raw_data: &str) -> Option<Self> {
         let mut h265_fmtp = H265Fmtp::default();
@@ -173,7 +173,7 @@ impl Unmarshal for H265Fmtp {
     }
 }
 
-impl Marshal for H265Fmtp {
+impl Marshal<String> for H265Fmtp {
     //"a=fmtp:96 sprop-vps=QAEMAf//AWAAAAMAkAAAAwAAAwA/ugJA; sprop-sps=QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXHy5bpKTC8BAQAAAwABAAADAA8I; sprop-pps=RAHAc8GJ"
     fn marshal(&self) -> String {
         let sps_str = String::from_utf8(self.sps.to_vec()).unwrap();
@@ -189,7 +189,7 @@ impl Marshal for H265Fmtp {
     }
 }
 
-impl Unmarshal for Mpeg4Fmtp {
+impl Unmarshal<&str, Option<Mpeg4Fmtp>> for Mpeg4Fmtp {
     //a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3; config=121056e500
     fn unmarshal(raw_data: &str) -> Option<Self> {
         let mut mpeg4_fmtp = Mpeg4Fmtp::default();
@@ -246,7 +246,7 @@ impl Unmarshal for Mpeg4Fmtp {
     }
 }
 
-impl Marshal for Mpeg4Fmtp {
+impl Marshal<String> for Mpeg4Fmtp {
     //a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3; config=121056e500
     fn marshal(&self) -> String {
         let profile_level_id_str = String::from_utf8(self.profile_level_id.to_vec()).unwrap();
@@ -269,8 +269,8 @@ mod tests {
     use super::H264Fmtp;
     use super::H265Fmtp;
     use super::Mpeg4Fmtp;
-    use crate::common::marshal_trait::Marshal;
-    use crate::common::marshal_trait::Unmarshal;
+    use crate::common::Marshal;
+    use crate::common::Unmarshal;
     use crate::protocol::rtsp::rtsp_utils;
 
     #[test]
