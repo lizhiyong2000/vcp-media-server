@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::{net::TcpSocket, signal};
 
 mod utils;
+mod protocol;
 use utils::logger;
 
 mod common;
@@ -20,7 +21,7 @@ use crate::server::EventSender;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    logger::setup_log();
+    let guard = logger::setup_log();
 
     info!("setup main");
 
@@ -42,5 +43,6 @@ async fn main() -> Result<()> {
     );
 
     signal::ctrl_c().await?;
+    drop(guard);
     Ok(())
 }

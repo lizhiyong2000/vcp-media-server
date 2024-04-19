@@ -5,13 +5,17 @@ use crate::common::Result;
 use log::info;
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{rtsp_session::RTSPServerSession, rtmp_session::RTMPServerSession, EventSender};
+use super::{rtsp::server_session::RTSPServerSession, rtmp::rtmp_session::RTMPServerSession, EventSender};
 
 
+use async_trait::async_trait;
+
+
+#[async_trait]
 pub trait TcpSession : Send + Sync{
 
     fn get_id(&self)->&String; 
-    fn do_session(&self);
+    async fn run(&mut self);
 }
 
 
@@ -61,15 +65,18 @@ impl TcpServer{
     }
 
 
-    pub fn new_session(&self, id:String, remote:SocketAddr, stream: TcpStream) -> Box<dyn TcpSession>{
-        match self.server_type {
+    pub fn new_session(&self, remote:SocketAddr, stream: TcpStream) -> Box<dyn TcpSession>{
+        let id = self.gen_session_id(remote);
+        let session:Box<dyn TcpSession> = match self.server_type {
             ServerType::RTSP => {
-                return Box::new(RTSPServerSession{id});
+                Box::new(RTSPServerSession::new(id, stream))
             },
             ServerType::RTMP => {
-                return Box::new(RTMPServerSession{id});
+                Box::new(RTMPServerSession{id})
             },
-        }
+        };
+
+        return session;
     }
 
     pub fn gen_session_id(&self, remote:SocketAddr)->String{
@@ -85,15 +92,15 @@ impl TcpServer{
             
             let (socket, remote_addr) = listener.accept().await?;
 
-            let session_id = self.gen_session_id(remote_addr);
+            // let session_id = self.gen_session_id(remote_addr);
 
-            let session = self.new_session(session_id, remote_addr, socket);
+            let mut session = self.new_session(remote_addr, socket);
 
             info!("server received connection from :{}, session id:{}", remote_addr, session.get_id());
             tokio::spawn(
                 async move {
                     // let session = TcpSession::new(server, remote_addr, socket);
-                    session.do_session();
+                    session.run().await;
 
                     info!("server end connection from :{}, session id:{}", remote_addr, session.get_id());
                 }

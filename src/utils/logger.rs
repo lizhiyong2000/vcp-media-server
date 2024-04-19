@@ -1,4 +1,5 @@
 use chrono::Local;
+use tracing_appender::non_blocking::WorkerGuard;
 // use tracing::{info, instrument};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -16,7 +17,7 @@ impl FormatTime for LocalTimer {
     }
 }
 
-pub(crate) fn setup_log() {
+pub(crate) fn setup_log() -> WorkerGuard {
     // 设置日志输出时的格式，例如，是否包含日志级别、是否包含日志来源位置、设置日志的时间格式
     // 参考: https://docs.rs/tracing-subscriber/0.3.3/tracing_subscriber/fmt/struct.SubscriberBuilder.html#method.with_timer
     let format = tracing_subscriber::fmt::format()
@@ -41,4 +42,6 @@ pub(crate) fn setup_log() {
                 .with_writer(std::io::stdout),
         )
         .init(); // 初始化并将SubScriber设置为全局SubScriber
+
+    return _guard;
 }

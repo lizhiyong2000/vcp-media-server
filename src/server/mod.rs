@@ -1,6 +1,6 @@
 pub mod tcp_server;
-mod rtmp_session;
-mod rtsp_session;
+pub mod rtmp;
+pub mod rtsp;
 pub mod message_hub;
 
 
