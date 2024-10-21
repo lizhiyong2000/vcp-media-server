@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use crate::common::Result;
+use vcp_media_common::Result;
 
 use log::info;
 use tokio::net::{TcpListener, TcpStream};

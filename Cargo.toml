@@ -1,3 +1,7 @@
+[workspace] 
+members = [ "lib/common", "lib/codec/h264", "lib/codec/flv", "lib/codec/mpegts", "lib/protocol/rtmp", "lib/protocol/rtp","lib/protocol/rtsp", "lib/protocol/sdp"]
+
+
 [package]
 name = "vcp-media-server"
 version = "0.1.0"
@@ -6,6 +10,20 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+
+vcp-media-common = { path = "./lib/common/" }
+vcp-media-rtmp = { path = "./lib/protocol/rtmp/" }
+vcp-media-rtsp = { path = "./lib/protocol/rtsp/" }
+vcp-media-rtp = { path = "./lib/protocol/rtp/" }
+vcp-media-sdp = { path = "./lib/protocol/sdp/" }
+# xwebrtc = { path = "../../protocol/webrtc/" }
+# httpflv = { path = "../../protocol/httpflv/" }
+# hls = { path = "../../protocol/hls/" }
+
+
+bytes = "1.6.0"
+failure = "0.1.8"
+byteorder = "1.5.0"
 serde_derive = "1.0"
 serde = { version = "1.0.101", optional = true, features = ["derive"] }
 tokio = { version = "1.26.0", features = ["full"] }
@@ -15,9 +33,6 @@ tracing-error = "0.2.0"
 log = "0.4.21"
 tracing-appender = "0.2.3"
 chrono = "0.4.37"
-bytes = "1.6.0"
-failure = "0.1.8"
-byteorder = "1.5.0"
 rand = "0.8.5"
 async-trait = "0.1.80"
 tokio-util = { version = "0.7.10", features = ["codec"] }

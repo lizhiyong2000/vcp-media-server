@@ -4,7 +4,7 @@ use md5;
 
 
 use super::errors::{AuthError, AuthErrorValue};
-use crate::scanf;
+use vcp_media_common::scanf;
 
 #[derive(Debug, Clone, Default)]
 pub enum AuthAlgorithm {

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="WEB_MODULE" version="4">
+  <component name="Go" enabled="true" />
+  <component name="NewModuleRootManager" inherit-compiler-output="true">
+    <exclude-output />
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/lib/codec/flv/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lib/codec/h264/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lib/codec/mpegts/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lib/common/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lib/protocol/rtmp/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lib/protocol/rtp/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lib/protocol/rtsp/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lib/protocol/rtsp/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/lib/protocol/rtsp/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/lib/protocol/sdp/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

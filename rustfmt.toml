@@ -1,0 +1,8 @@
+[lib]
+edition = "2018"
+[dependencies]
+rustfmt = "0.6"
+[formatter]
+max_width = 80
+imports_granularity = true
+group_imports = "StdExternalCrate"

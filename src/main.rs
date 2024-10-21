@@ -1,13 +1,11 @@
 use std::sync::Arc;
 
-use tokio::{net::TcpSocket, signal};
+use tokio::{signal};
 
-mod utils;
-mod protocol;
-use utils::logger;
+use vcp_media_common::log::logger;
 
 mod common;
-use common::Result;
+use vcp_media_common::Result;
 
 use log::{self, info};
 

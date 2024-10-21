@@ -6,44 +6,44 @@ use byteorder::BigEndian;
 use bytes::BytesMut;
 
 
-use crate::common::Marshal;
-use crate::common::Unmarshal;
-use crate::utils::bytesio::bytesio::TNetIO;
-use crate::utils::bytesio::bytesio::TcpIO;
-
-use crate::protocol::rtp::define::ANNEXB_NALU_START_CODE;
-use crate::common::Marshal as RtpMarshal;
-use crate::protocol::rtp::RtpPacket;
-use crate::protocol::rtsp::rtsp_range::RtspRange;
-
-use crate::protocol::rtp::errors::UnPackerError;
-use crate::protocol::sdp::Sdp;
-use crate::protocol::sdp::fmtp::Fmtp;
-use crate::protocol::rtsp::rtsp_codec;
-use crate::protocol::rtsp::rtsp_codec::RtspCodecInfo;
-use crate::protocol::rtsp::rtsp_track::RtspTrack;
-use crate::protocol::rtsp::rtsp_track::TrackType;
-use crate::protocol::rtsp::rtsp_transport::ProtocolType;
-use crate::protocol::rtsp::rtsp_transport::RtspTransport;
-
-use crate::common::http::HttpRequest as RtspRequest;
-use crate::common::http::HttpResponse as RtspResponse;
+use vcp_media_common::Marshal;
+use vcp_media_common::Unmarshal;
+use vcp_media_common::bytesio::bytesio::TNetIO;
+use vcp_media_common::bytesio::bytesio::TcpIO;
 
 
+use vcp_media_common::Marshal as RtpMarshal;
+use vcp_media_rtp::RtpPacket;
+use vcp_media_rtsp::rtsp_range::RtspRange;
 
 
-use crate::utils::bytesio::bytes_reader::BytesReader;
-use crate::utils::bytesio::bytes_writer::AsyncBytesWriter;
+use vcp_media_sdp::SessionDescription;
 
-use crate::utils::bytesio::bytes_writer::BytesWriter;
-use crate::utils::bytesio::bytesio::UdpIO;
+use vcp_media_rtsp::rtsp_codec;
+use vcp_media_rtsp::rtsp_codec::RtspCodecInfo;
+use vcp_media_rtsp::rtsp_track::RtspTrack;
+use vcp_media_rtsp::rtsp_track::TrackType;
+use vcp_media_rtsp::rtsp_transport::ProtocolType;
+use vcp_media_rtsp::rtsp_transport::RtspTransport;
+
+use vcp_media_common::http::HttpRequest as RtspRequest;
+use vcp_media_common::http::HttpResponse as RtspResponse;
+
+
+
+
+use vcp_media_common::bytesio::bytes_reader::BytesReader;
+use vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter;
+
+
+use vcp_media_common::bytesio::bytesio::UdpIO;
 use super::errors::SessionError;
-use super::errors::SessionErrorValue;
+
 use http;
 // use streamhub::define::DataSender;
 // use streamhub::define::MediaInfo;
 // use streamhub::define::VideoCodecType;
-use tokio::sync::oneshot;
+
 
 use async_trait::async_trait;
 
@@ -51,10 +51,10 @@ use super::define::rtsp_method_name;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use crate::common::uuid::{Uuid, RandomDigitCount};
 
-// use crate::common::auth::Auth;
+use vcp_media_common::uuid::{Uuid, RandomDigitCount};
+
+// use vcp_media_common::auth::Auth;
 // use streamhub::{
 //     define::{
 //         FrameData, Information, InformationSender, NotifyInfo, PublishType, PublisherInfo,
@@ -111,7 +111,7 @@ pub struct RTSPServerSession{
     writer: AsyncBytesWriter,
 
     tracks: HashMap<TrackType, RtspTrack>,
-    sdp: Sdp,
+    sdp: SessionDescription,
     pub session_id: Option<Uuid>,
 
     // stream_handler: Arc<RtspStreamHandler>,
@@ -158,7 +158,7 @@ impl RTSPServerSession {
             reader: BytesReader::new(BytesMut::default()),
             writer: AsyncBytesWriter::new(io),
             tracks: HashMap::new(),
-            sdp: Sdp::default(),
+            sdp: SessionDescription::default(),
             session_id: None,
             // stream_handler: Arc::new(RtspStreamHandler::new()),
         }
@@ -219,10 +219,10 @@ impl RTSPServerSession {
         let data = self.reader.get_remaining_bytes();
 
 
-        log::trace!("received rtsp message data, length {}", data.len());
+        log::debug!("received rtsp message data, length {}", data.len());
 
         if let Some(rtsp_request) = RtspRequest::unmarshal(std::str::from_utf8(&data)?) {
-            log::trace!("received rtsp request message:{}", rtsp_request);
+            log::info!("received rtsp request message:{}", rtsp_request);
 
             _= self.reader.read_bytes(rtsp_request.origin_length);
 
@@ -258,7 +258,7 @@ impl RTSPServerSession {
                 _ => {}
             }
         } else{
-            log::trace!("not a valid rtsp request message");
+            log::debug!("not a valid rtsp request message");
             let data = self.io.lock().await.read().await?;
             self.reader.extend_from_slice(&data[..]);
         }
@@ -323,7 +323,7 @@ impl RTSPServerSession {
         // }
 
         if let Some(request_body) = &rtsp_request.body {
-            if let Some(sdp) = Sdp::unmarshal(request_body) {
+            if let Some(sdp) = SessionDescription::unmarshal(request_body) {
                 self.sdp = sdp.clone();
                 // self.stream_handler.set_sdp(sdp).await;
             }
@@ -591,7 +591,7 @@ impl RTSPServerSession {
         // }
     }
 
-    pub fn unsubscribe_from_stream_hub(&mut self, stream_path: String) -> Result<(), SessionError> {
+    pub fn unsubscribe_from_stream_hub(&mut self, _stream_path: String) -> Result<(), SessionError> {
         // let identifier = StreamIdentifier::Rtsp { stream_path };
 
         // let subscribe_event = StreamHubEvent::UnSubscribe {
@@ -625,7 +625,7 @@ impl RTSPServerSession {
     }
 
     fn handle_teardown(&mut self, rtsp_request: &RtspRequest) -> Result<(), SessionError> {
-        let stream_path = &rtsp_request.uri.path;
+        let _stream_path = &rtsp_request.uri.path;
         // let unpublish_event = StreamHubEvent::UnPublish {
         //     identifier: StreamIdentifier::Rtsp {
         //         stream_path: stream_path.clone(),
@@ -773,16 +773,16 @@ impl RTSPServerSession {
 
 #[derive(Default)]
 pub struct RtspStreamHandler {
-    sdp: Mutex<Sdp>,
+    sdp: Mutex<SessionDescription>,
 }
 
 impl RtspStreamHandler {
     pub fn new() -> Self {
         Self {
-            sdp: Mutex::new(Sdp::default()),
+            sdp: Mutex::new(SessionDescription::default()),
         }
     }
-    pub async fn set_sdp(&self, sdp: Sdp) {
+    pub async fn set_sdp(&self, sdp: SessionDescription) {
         *self.sdp.lock().await = sdp;
     }
 }

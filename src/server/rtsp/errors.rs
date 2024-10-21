@@ -1,7 +1,7 @@
 use {
-    crate::protocol::rtp::errors::{PackerError, UnPackerError},
-    crate::utils::bytesio::bytes_errors::BytesReadError,
-    crate::utils::bytesio::{bytes_errors::BytesWriteError, bytesio_errors::BytesIOError},
+    vcp_media_rtp::errors::{PackerError, UnPackerError},
+    vcp_media_common::bytesio::bytes_errors::BytesReadError,
+    vcp_media_common::bytesio::{bytes_errors::BytesWriteError, bytesio_errors::BytesIOError},
     crate::common::errors::AuthError,
     failure::{Backtrace, Fail},
     std::fmt,
