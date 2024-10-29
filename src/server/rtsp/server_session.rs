@@ -224,7 +224,7 @@ impl RTSPServerSession {
         if let Some(rtsp_request) = RtspRequest::unmarshal(std::str::from_utf8(&data)?) {
             log::info!("received rtsp request message:{}", rtsp_request);
 
-            _= self.reader.read_bytes(rtsp_request.origin_length);
+            self.reader.read_bytes(rtsp_request.origin_length);
 
             match rtsp_request.method.as_str() {
                 rtsp_method_name::OPTIONS => {
@@ -655,48 +655,47 @@ impl RTSPServerSession {
 
     fn new_tracks(&mut self) -> Result<(), SessionError> {
         for media in &self.sdp.medias {
-            let media_control = if let Some(media_control_val) = media.attributes.get("control") {
-                media_control_val.clone()
-            } else {
-                String::from("")
-            };
+            let media_control = media.get_control();
 
-            let media_name = &media.media_type;
-            log::info!("media_name: {}", media_name);
-            match media_name.as_str() {
-                "audio" => {
-                    let codec_id = rtsp_codec::RTSP_CODEC_NAME_2_ID
-                        .get(&media.rtpmap.encoding_name.to_lowercase().as_str())
-                        .unwrap()
-                        .clone();
-                    let codec_info = RtspCodecInfo {
-                        codec_id,
-                        payload_type: media.rtpmap.payload_type as u8,
-                        sample_rate: media.rtpmap.clock_rate,
-                        channel_count: media.rtpmap.encoding_param.parse().unwrap(),
-                    };
+            if let Some(rtpmap) = &media.rtpmap{
+                let media_name = &media.media_type;
+                log::info!("media_name: {}", media_name);
+                match media_name.as_str() {
+                    "audio" => {
+                        let codec_id = rtsp_codec::RTSP_CODEC_NAME_2_ID
+                            .get(&rtpmap.encoding_name.to_lowercase().as_str())
+                            .unwrap()
+                            .clone();
+                        let codec_info = RtspCodecInfo {
+                            codec_id,
+                            payload_type: rtpmap.payload_type as u8,
+                            sample_rate: rtpmap.clock_rate,
+                            channel_count: rtpmap.encoding_param.parse().unwrap(),
+                        };
 
-                    log::info!("audio codec info: {:?}", codec_info);
+                        log::info!("audio codec info: {:?}", codec_info);
 
-                    let track = RtspTrack::new(TrackType::Audio, codec_info, media_control);
-                    self.tracks.insert(TrackType::Audio, track);
+                        let track = RtspTrack::new(TrackType::Audio, codec_info, media_control);
+                        self.tracks.insert(TrackType::Audio, track);
+                    }
+                    "video" => {
+                        let codec_id = rtsp_codec::RTSP_CODEC_NAME_2_ID
+                            .get(&rtpmap.encoding_name.to_lowercase().as_str())
+                            .unwrap()
+                            .clone();
+                        let codec_info = RtspCodecInfo {
+                            codec_id,
+                            payload_type: rtpmap.payload_type as u8,
+                            sample_rate: rtpmap.clock_rate,
+                            ..Default::default()
+                        };
+                        let track = RtspTrack::new(TrackType::Video, codec_info, media_control);
+                        self.tracks.insert(TrackType::Video, track);
+                    }
+                    _ => {}
                 }
-                "video" => {
-                    let codec_id = rtsp_codec::RTSP_CODEC_NAME_2_ID
-                        .get(&media.rtpmap.encoding_name.to_lowercase().as_str())
-                        .unwrap()
-                        .clone();
-                    let codec_info = RtspCodecInfo {
-                        codec_id,
-                        payload_type: media.rtpmap.payload_type as u8,
-                        sample_rate: media.rtpmap.clock_rate,
-                        ..Default::default()
-                    };
-                    let track = RtspTrack::new(TrackType::Video, codec_info, media_control);
-                    self.tracks.insert(TrackType::Video, track);
-                }
-                _ => {}
             }
+
         }
         Ok(())
     }
