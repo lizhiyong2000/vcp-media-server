@@ -323,7 +323,7 @@ impl RTSPServerSession {
         // }
 
         if let Some(request_body) = &rtsp_request.body {
-            if let Some(sdp) = SessionDescription::unmarshal(request_body) {
+            if let sdp = SessionDescription::unmarshal(request_body)? {
                 self.sdp = sdp.clone();
                 // self.stream_handler.set_sdp(sdp).await;
             }

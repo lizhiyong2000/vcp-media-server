@@ -9,6 +9,7 @@ use {
     // streamhub::errors::ChannelError,
     tokio::sync::oneshot::error::RecvError,
 };
+use vcp_media_sdp::errors::SdpError;
 
 #[derive(Debug)]
 pub struct SessionError {
@@ -41,6 +42,9 @@ pub enum SessionErrorValue {
     AuthError(#[cause] AuthError),
     #[fail(display = "Channel receive error")]
     ChannelRecvError,
+
+    #[fail(display = "SdpError: {}", _0)]
+    SdpError(#[cause] SdpError),
 }
 
 impl From<BytesIOError> for SessionError {
@@ -114,6 +118,17 @@ impl From<AuthError> for SessionError {
         }
     }
 }
+
+impl From<SdpError> for SessionError {
+    fn from(error: SdpError) -> Self {
+        SessionError {
+            value: SessionErrorValue::SdpError(error),
+        }
+    }
+}
+
+
+
 
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

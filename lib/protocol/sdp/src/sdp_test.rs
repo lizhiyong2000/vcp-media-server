@@ -1,9 +1,10 @@
 
 use vcp_media_common::{Marshal, Unmarshal};
 use super::SessionDescription;
+use std::error;
 
 #[test]
-fn test_one_format_for_each_media_absolute() {
+fn test_one_format_for_each_media_absolute(){
     let data2 =
 "v=0\r\n
 o=- 0 0 IN IP4 10.0.0.131\r\n
@@ -32,10 +33,15 @@ b=AS:8\r\n";
 
 
     if let Some(sdp) = SessionDescription::unmarshal(data2) {
-        println!("sdp : {sdp:?}");
-
         print!("sdp str : {}", sdp.marshal());
+        
+    }else {
+        assert!(
+            false,
+            "test_one_format_for_each_media_absolute sdp parse failed."
+        );
     }
+
 }
 
 
@@ -68,8 +74,7 @@ b=AS:8\r\n";
 
 
     if let Some(sdp) = SessionDescription::unmarshal(data2) {
-        println!("sdp : {sdp:?}");
-
+        // println!("sdp : {sdp:?}");
         print!("sdp str : {}", sdp.marshal());
     }
 }

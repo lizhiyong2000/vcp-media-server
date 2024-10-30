@@ -1,13 +1,18 @@
 pub mod fmtp;
 pub mod rtpmap;
 
+pub mod errors;
+
 #[cfg(test)]
 mod sdp_test;
+
 
 use vcp_media_common::{Marshal, Unmarshal};
 use rtpmap::RtpMap;
 use std::collections::HashMap;
 use std::time::Duration;
+use crate::errors::SdpError;
+use crate::errors::SdpErrorValue::SessionOriginError;
 use self::fmtp::Fmtp;
 
 
@@ -25,12 +30,17 @@ pub struct SessionOrigin {
 }
 
 
-impl Unmarshal<&str, Option<SessionOrigin>> for SessionOrigin {
+impl Unmarshal<&str, Result<Self, SdpError>> for SessionOrigin {
     //  o=- 946685052188730 1 IN IP4 0.0.0.0
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+    fn unmarshal(raw_data: &str) -> Result<Self, SdpError> {
         let mut origin = SessionOrigin::default();
 
         let parameters: Vec<&str> = raw_data.split(' ').collect();
+
+        if parameters.len() <6 {
+            return Err(SdpError::from(SessionOriginError))
+        }
+
         if let Some(t) = parameters.first() {
             origin.username = t.to_string();
         }
@@ -59,7 +69,7 @@ impl Unmarshal<&str, Option<SessionOrigin>> for SessionOrigin {
             origin.address = address.to_string();
         }
 
-        Some(origin)
+        Ok(origin)
     }
 }
 
@@ -77,9 +87,9 @@ pub struct SessionConnection {
     address:  String,
 }
 
-impl Unmarshal<&str, Option<SessionConnection>> for SessionConnection {
+impl Unmarshal<&str, Result<Self, SdpError>> for SessionConnection {
     //  c=IN IP4 0.0.0.0
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+    fn unmarshal(raw_data: &str) -> Result<Self, SdpError> {
         let mut connection = SessionConnection::default();
 
         let parameters: Vec<&str> = raw_data.split(' ').collect();
@@ -96,7 +106,7 @@ impl Unmarshal<&str, Option<SessionConnection>> for SessionConnection {
             connection.address = address.to_string();
         }
 
-        Some(connection)
+        Ok(connection)
     }
 }
 
@@ -112,9 +122,9 @@ pub struct SessionBandwidth {
     bandwidth: u16,
 }
 
-impl Unmarshal<&str, Option<SessionBandwidth>> for SessionBandwidth {
+impl Unmarshal<&str, Result<Self, SdpError>> for SessionBandwidth {
     //   b=AS:284\r\n\
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+    fn unmarshal(raw_data: &str) -> Result<Self, SdpError> {
         let mut sdp_bandwidth = SessionBandwidth::default();
 
         let parameters: Vec<&str> = raw_data.split(':').collect();
@@ -128,7 +138,7 @@ impl Unmarshal<&str, Option<SessionBandwidth>> for SessionBandwidth {
             }
         }
 
-        Some(sdp_bandwidth)
+        Ok(sdp_bandwidth)
     }
 }
 
@@ -148,7 +158,7 @@ pub struct SessionTimeDescription {
 
 // impl Unmarshal<&str, Option<crate::SessionTimeDescription>> for crate::SessionTimeDescription {
 //     //   b=AS:284\r\n\
-//     fn unmarshal(raw_data: &str) -> Option<Self> {
+//     fn unmarshal(raw_data: &str) -> Result<Self, SdpError> {
 //         let mut time = crate::SessionTimeDescription::default();
 //
 //         // let parameters: Vec<&str> = raw_data.split(':').collect();
@@ -180,9 +190,9 @@ pub struct SessionTiming {
 }
 
 
-impl Unmarshal<&str, Option<crate::SessionTiming>> for crate::SessionTiming {
+impl Unmarshal<&str, Result<Self, SdpError>> for crate::SessionTiming {
     //   b=AS:284\r\n\
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+    fn unmarshal(raw_data: &str) -> Result<Self, SdpError> {
         let mut time = crate::SessionTiming::default();
 
         let parameters: Vec<&str> = raw_data.split(' ').collect();
@@ -198,7 +208,7 @@ impl Unmarshal<&str, Option<crate::SessionTiming>> for crate::SessionTiming {
             }
         }
 
-        Some(time)
+        Ok(time)
     }
 }
 
@@ -216,9 +226,9 @@ pub struct SessionRepeat {
 }
 
 
-impl Unmarshal<&str, Option<crate::SessionRepeat>> for crate::SessionRepeat {
+impl Unmarshal<&str, Result<Self, SdpError>> for crate::SessionRepeat {
     //   b=AS:284\r\n\
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+    fn unmarshal(raw_data: &str) -> Result<Self, SdpError> {
         let mut repeat = crate::SessionRepeat::default();
 
         let parameters: Vec<&str> = raw_data.split(' ').collect();
@@ -234,7 +244,7 @@ impl Unmarshal<&str, Option<crate::SessionRepeat>> for crate::SessionRepeat {
             }
         }
 
-        Some(repeat)
+        Ok(repeat)
     }
 }
 
@@ -329,10 +339,10 @@ impl SessionMediaInfo{
 
 
 
-impl Unmarshal<&str, Option<SessionMediaInfo>> for SessionMediaInfo {
+impl Unmarshal<&str, Result<Self, SdpError>> for SessionMediaInfo {
     //m=audio 11704 RTP/AVP 96 97 98 0 8 18 101 99 100 */
     //m=video 20003 RTP/AVP 97
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+    fn unmarshal(raw_data: &str) -> Result<Self, SdpError> {
         let mut sdp_media = SessionMediaInfo::default();
         let parameters: Vec<&str> = raw_data.split(' ').collect();
 
@@ -359,7 +369,7 @@ impl Unmarshal<&str, Option<SessionMediaInfo>> for SessionMediaInfo {
             cur_param_idx += 1;
         }
 
-        Some(sdp_media)
+        Ok(sdp_media)
     }
 }
 
@@ -489,8 +499,8 @@ pub struct SessionDescription {
     pub medias: Vec<SessionMediaInfo>,
 }
 
-impl Unmarshal<&str, Option<SessionDescription>>  for SessionDescription {
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+impl Unmarshal<&str, Result<Self, SdpError>>  for SessionDescription {
+    fn unmarshal(raw_data: &str) -> Result<Self, SdpError> {
         let mut sdp = SessionDescription {
             raw_string: raw_data.to_string(),
             ..Default::default()
@@ -534,7 +544,7 @@ impl Unmarshal<&str, Option<SessionDescription>>  for SessionDescription {
                 }
                 "o" => {
                     // sdp.origin = kv[1].to_string();
-                    if let Some(origin)= SessionOrigin::unmarshal(kv[1]){
+                    if let origin = SessionOrigin::unmarshal(kv[1])?{
                         sdp.origin = origin;
                     }
                 }
@@ -543,7 +553,7 @@ impl Unmarshal<&str, Option<SessionDescription>>  for SessionDescription {
                 }
 
                 "c" => {
-                    if let Some(connection)= SessionConnection::unmarshal(kv[1]){
+                    if let connection= SessionConnection::unmarshal(kv[1])?{
                         if let Some(cur_media) = sdp.medias.last_mut() {
                             cur_media.connection = Some(connection);
                         } else {
@@ -554,7 +564,7 @@ impl Unmarshal<&str, Option<SessionDescription>>  for SessionDescription {
 
 
                 "b" => {
-                    if let Some(bandwith) = SessionBandwidth::unmarshal(kv[1]){
+                    if let bandwith = SessionBandwidth::unmarshal(kv[1])?{
                         if let Some(cur_media) = sdp.medias.last_mut() {
                             cur_media.bandwidth.push(bandwith);
                         } else {
@@ -575,7 +585,7 @@ impl Unmarshal<&str, Option<SessionDescription>>  for SessionDescription {
 
                 "t" => {
                     // sdp.timing = kv[1].to_string();
-                    if let Some(timing) = SessionTiming::unmarshal(kv[1]) {
+                    if let timing = SessionTiming::unmarshal(kv[1])? {
                         sdp.time_descriptions.push(SessionTimeDescription{
                             timing,
                             repeats: vec![],
@@ -585,7 +595,7 @@ impl Unmarshal<&str, Option<SessionDescription>>  for SessionDescription {
 
                 "r" => {
                     // sdp.timing = kv[1].to_string();
-                    if let Some(repeat) = SessionRepeat::unmarshal(kv[1]) {
+                    if let repeat = SessionRepeat::unmarshal(kv[1])? {
                         if let Some(cur_timing) = sdp.time_descriptions.last_mut() {
                             cur_timing.repeats.push(repeat);
                         } else {
@@ -595,7 +605,7 @@ impl Unmarshal<&str, Option<SessionDescription>>  for SessionDescription {
                 }
 
                 "m" => {
-                    if let Some(sdp_media) = SessionMediaInfo::unmarshal(kv[1]) {
+                    if let sdp_media = SessionMediaInfo::unmarshal(kv[1])?{
                         sdp.medias.push(sdp_media);
                     }
                 }
@@ -655,7 +665,7 @@ impl Unmarshal<&str, Option<SessionDescription>>  for SessionDescription {
             }
         }
 
-        Some(sdp)
+        Ok(sdp)
     }
 }
 
