@@ -2,7 +2,6 @@ extern crate byteorder;
 extern crate bytes;
 
 extern crate chrono;
-extern crate failure;
 extern crate hmac;
 extern crate rand;
 extern crate sha2;

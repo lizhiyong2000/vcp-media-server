@@ -1,6 +1,6 @@
 use {
     super::{
-        bytes_errors::{BytesReadError, BytesReadErrorValue},
+        bytes_errors::{BytesReadError},
         bytesio::TNetIO,
     },
     byteorder::{ByteOrder, ReadBytesExt},
@@ -31,18 +31,14 @@ impl BytesReader {
 
     pub fn read_bytes(&mut self, bytes_num: usize) -> Result<BytesMut, BytesReadError> {
         if self.buffer.len() < bytes_num {
-            return Err(BytesReadError {
-                value: BytesReadErrorValue::NotEnoughBytes,
-            });
+            return Err(BytesReadError::NotEnoughBytes);
         }
         Ok(self.buffer.split_to(bytes_num))
     }
 
     pub fn advance_bytes(&mut self, bytes_num: usize) -> Result<BytesMut, BytesReadError> {
         if self.buffer.len() < bytes_num {
-            return Err(BytesReadError {
-                value: BytesReadErrorValue::NotEnoughBytes,
-            });
+            return Err(BytesReadError::NotEnoughBytes);
         }
 
         //here maybe optimised
@@ -125,9 +121,7 @@ impl BytesReader {
 
     pub fn get(&self, index: usize) -> Result<u8, BytesReadError> {
         if index >= self.len() {
-            return Err(BytesReadError {
-                value: BytesReadErrorValue::IndexOutofRange,
-            });
+            return Err(BytesReadError::IndexOutofRange);
         }
 
         Ok(*self.buffer.get(index).unwrap())

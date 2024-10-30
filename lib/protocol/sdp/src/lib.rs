@@ -12,7 +12,7 @@ use rtpmap::RtpMap;
 use std::collections::HashMap;
 use std::time::Duration;
 use crate::errors::SdpError;
-use crate::errors::SdpErrorValue::SessionOriginError;
+use crate::errors::SdpError::SessionOriginError;
 use self::fmtp::Fmtp;
 
 

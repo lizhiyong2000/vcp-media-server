@@ -1,5 +1,5 @@
 use {
-    super::errors::{MpegAacError, MpegErrorValue},
+    super::errors::{MpegError},
     bytes::BytesMut,
     vcp_media_common::bytesio::{
         bits_reader::BitsReader, bits_writer::BitsWriter, bytes_reader::BytesReader,
@@ -31,7 +31,7 @@ impl Mpeg4Aac {
         object_type: u8,
         sampling_frequency: u32,
         channel_configuration: u8,
-    ) -> Result<Self, MpegAacError> {
+    ) -> Result<Self, MpegError> {
         let sampling_frequency_index = match sampling_frequency {
             96000 => 0,
             88200 => 1,
@@ -47,9 +47,7 @@ impl Mpeg4Aac {
             8000 => 11,
             7350 => 12,
             _ => {
-                return Err(MpegAacError {
-                    value: MpegErrorValue::NotSupportedSamplingFrequency,
-                });
+                return Err(MpegError::NotSupportedSamplingFrequency);
             }
         };
 
@@ -65,7 +63,7 @@ impl Mpeg4Aac {
     // 00010 0011 0010 000
     // 2   3  2
     //https://wiki.multimedia.cx/index.php?title=MPEG-4_Audio#Audio_Specific_Config
-    pub fn gen_audio_specific_config(&self) -> Result<BytesMut, MpegAacError> {
+    pub fn gen_audio_specific_config(&self) -> Result<BytesMut, MpegError> {
         let mut writer = BytesWriter::default();
         writer.write_u8(self.object_type << 3 | (self.sampling_frequency_index >> 1))?;
         writer.write_u8(
@@ -103,7 +101,7 @@ impl Mpeg4AacProcessor {
         self
     }
 
-    pub fn audio_specific_config_load(&mut self) -> Result<&mut Self, MpegAacError> {
+    pub fn audio_specific_config_load(&mut self) -> Result<&mut Self, MpegError> {
         //11 88 56 E5
         let byte_0 = self.bytes_reader.read_u8()?;
         self.mpeg4_aac.object_type = (byte_0 >> 3) & 0x1F;
@@ -129,7 +127,7 @@ impl Mpeg4AacProcessor {
         Ok(self)
     }
 
-    pub fn audio_specific_config_load2(&mut self) -> Result<(), MpegAacError> {
+    pub fn audio_specific_config_load2(&mut self) -> Result<(), MpegError> {
         let remain_bytes = self.bytes_reader.extract_remaining_bytes();
         // self.bits_reader.extend_from_bytesmut(remain_bytes);
         self.bits_reader.extend_data(remain_bytes);
@@ -178,9 +176,7 @@ impl Mpeg4AacProcessor {
 
                 match ep_config {
                     2 | 3 => {
-                        return Err(MpegAacError {
-                            value: MpegErrorValue::ShouldNotComeHere,
-                        });
+                        return Err( MpegError::ShouldNotComeHere);
                     }
 
                     _ => {}
@@ -237,7 +233,7 @@ impl Mpeg4AacProcessor {
         Ok(())
     }
 
-    pub fn celp_specific_config_load(&mut self) -> Result<(), MpegAacError> {
+    pub fn celp_specific_config_load(&mut self) -> Result<(), MpegError> {
         let excitation_mode: u64;
 
         if self.bits_reader.read_n_bits(1)? > 0 {
@@ -265,7 +261,7 @@ impl Mpeg4AacProcessor {
 
         Ok(())
     }
-    pub fn ga_specific_config_load(&mut self) -> Result<(), MpegAacError> {
+    pub fn ga_specific_config_load(&mut self) -> Result<(), MpegError> {
         self.bits_reader.read_n_bits(1)?;
 
         if self.bits_reader.read_n_bits(1)? > 0 {
@@ -305,13 +301,13 @@ impl Mpeg4AacProcessor {
         &mut self,
         writer: &mut BitsWriter,
         read_len: usize,
-    ) -> Result<u64, MpegAacError> {
+    ) -> Result<u64, MpegError> {
         let data = self.bits_reader.read_n_bits(read_len)?;
         writer.write_n_bits(data, read_len)?;
         Ok(data)
     }
 
-    pub fn pce_load(&mut self) -> Result<u8, MpegAacError> {
+    pub fn pce_load(&mut self) -> Result<u8, MpegError> {
         let mut cpe: u64 = 0;
         let mut tag: u64 = 0;
 
@@ -406,7 +402,7 @@ impl Mpeg4AacProcessor {
         Ok(rv as u8)
     }
 
-    pub fn get_audio_object_type(&mut self) -> Result<u8, MpegAacError> {
+    pub fn get_audio_object_type(&mut self) -> Result<u8, MpegError> {
         let mut audio_object_type: u64;
 
         audio_object_type = self.bits_reader.read_n_bits(5)?;
@@ -417,7 +413,7 @@ impl Mpeg4AacProcessor {
         Ok(audio_object_type as u8)
     }
 
-    pub fn get_sampling_frequency(&mut self) -> Result<u8, MpegAacError> {
+    pub fn get_sampling_frequency(&mut self) -> Result<u8, MpegError> {
         let mut sampling_frequency_index: u64;
 
         sampling_frequency_index = self.bits_reader.read_n_bits(4)?;
@@ -428,7 +424,7 @@ impl Mpeg4AacProcessor {
         Ok(sampling_frequency_index as u8)
     }
 
-    pub fn adts_save(&mut self) -> Result<(), MpegAacError> {
+    pub fn adts_save(&mut self) -> Result<(), MpegError> {
         let id = 0; // 0-MPEG4/1-MPEG2
         let len = (self.bytes_reader.len() + 7) as u32;
         self.bytes_writer.write_u8(0xFF)?; //0

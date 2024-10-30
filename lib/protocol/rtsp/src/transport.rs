@@ -1,7 +1,7 @@
 use vcp_media_common::{Marshal, Unmarshal};
 use crate::errors::RtspError;
 use super::utils::scanf;
-use crate::errors::RtspErrorValue::*;
+use crate::errors::RtspError::*;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 

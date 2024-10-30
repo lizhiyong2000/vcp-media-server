@@ -1,7 +1,7 @@
 use vcp_media_common::{Marshal, Unmarshal};
 use base64::{engine::general_purpose, DecodeError, Engine as _};
 use bytes::{BufMut, BytesMut};
-use crate::errors::{SdpError, SdpErrorValue};
+use crate::errors::{SdpError};
 // pub trait Fmtp: TMsgConverter {}
 
 #[derive(Debug, Clone, Default)]
@@ -20,14 +20,14 @@ impl Unmarshal<&str, Result<Self, SdpError>> for H264Fmtp {
         let eles: Vec<&str> = raw_data.splitn(2, ' ').collect();
         if eles.len() < 2 {
             log::warn!("H264FmtpSdp parse err: {}", raw_data);
-            return Err(SdpError::from(SdpErrorValue::SdpFormatParametersError));
+            return Err(SdpError::from(SdpError::SdpFormatParametersError));
         }
 
         if let Ok(payload_type) = eles[0].parse::<u16>() {
             h264_fmtp.payload_type = payload_type;
         }else{
             log::warn!("H264FmtpSdp parse err: {}", raw_data);
-            return Err(SdpError::from(SdpErrorValue::SdpPayloadTypeError));
+            return Err(SdpError::from(SdpError::SdpPayloadTypeError));
         }
 
         let parameters: Vec<&str> = eles[1].split(';').collect();

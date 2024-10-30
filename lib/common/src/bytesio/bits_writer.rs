@@ -1,6 +1,6 @@
 use {
     super::{
-        bits_errors::{BitError, BitErrorValue},
+        bits_errors::{BitError},
         bytes_writer::BytesWriter,
     },
     bytes::BytesMut,
@@ -41,9 +41,7 @@ impl BitsWriter {
 
     pub fn write_8bit(&mut self, b: u8) -> Result<(), BitError> {
         if self.cur_bit_num != 0 {
-            return Err(BitError {
-                value: BitErrorValue::CannotWrite8Bit,
-            });
+            return Err(BitError::CannotWrite8Bit);
         }
 
         self.writer.write_u8(b)?;
@@ -65,9 +63,7 @@ impl BitsWriter {
     // 0x02 4
     pub fn write_n_bits(&mut self, data: u64, bit_num: usize) -> Result<(), BitError> {
         if bit_num > 64 {
-            return Err(BitError {
-                value: BitErrorValue::TooBig,
-            });
+            return Err(BitError::TooBig);
         }
         let mut bit_num_mut = bit_num;
         let mut data_mut = data;

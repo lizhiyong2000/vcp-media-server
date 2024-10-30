@@ -3,7 +3,7 @@ use md5;
 // use serde_derive::Deserialize;
 
 
-use super::errors::{AuthError, AuthErrorValue};
+use super::errors::{AuthError};
 use vcp_media_common::scanf;
 
 #[derive(Debug, Clone, Default)]
@@ -57,7 +57,7 @@ impl Auth {
             || !is_pull && (self.auth_type == AuthType::Push)
         {
             let mut auth_err_reason: String = String::from("there is no token str found.");
-            let mut err: AuthErrorValue = AuthErrorValue::NoTokenFound;
+            let mut err: AuthError = AuthError::NoTokenFound;
 
             /*Here we should do auth and it must be successful. */
             if let Some(query_val) = query {
@@ -76,7 +76,7 @@ impl Auth {
                         return Ok(());
                     }
                     auth_err_reason = format!("token is not correct: {}", token);
-                    err = AuthErrorValue::TokenIsNotCorrect;
+                    err = AuthError::TokenIsNotCorrect;
                 }
             }
 
@@ -87,7 +87,7 @@ impl Auth {
                 is_pull,
                 auth_err_reason,
             );
-            return Err(AuthError { value: err });
+            return Err(err);
         }
         Ok(())
     }

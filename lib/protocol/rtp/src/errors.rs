@@ -1,97 +1,27 @@
 use {
-    failure::{Backtrace, Fail},
+    thiserror::Error,
     std::fmt,
 };
 
 use vcp_media_common::bytesio::bytes_errors::BytesReadError;
 use vcp_media_common::bytesio::bytes_errors::BytesWriteError;
 
-#[derive(Debug)]
-pub struct PackerError {
-    pub value: PackerErrorValue,
+
+#[derive(Debug, Error)]
+pub enum PackerError {
+    #[error("bytes read error: {}", _0)]
+    BytesReadError(#[from] BytesReadError),
+    #[error("bytes write error: {}", _0)]
+    BytesWriteError(#[from] BytesWriteError),
 }
 
-impl Fail for PackerError {
-    fn cause(&self) -> Option<&dyn Fail> {
-        self.value.cause()
-    }
 
-    fn backtrace(&self) -> Option<&Backtrace> {
-        self.value.backtrace()
-    }
+#[derive(Debug, Error)]
+pub enum UnPackerError {
+    #[error("bytes read error: {}", _0)]
+    BytesReadError(#[from] BytesReadError),
+    #[error("bytes write error: {}", _0)]
+    BytesWriteError(#[from] BytesWriteError),
 }
 
-impl fmt::Display for PackerError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(&self.value, f)
-    }
-}
 
-#[derive(Debug, Fail)]
-pub enum PackerErrorValue {
-    #[fail(display = "bytes read error: {}", _0)]
-    BytesReadError(BytesReadError),
-    #[fail(display = "bytes write error: {}", _0)]
-    BytesWriteError(#[cause] BytesWriteError),
-}
-
-impl From<BytesReadError> for PackerError {
-    fn from(error: BytesReadError) -> Self {
-        PackerError {
-            value: PackerErrorValue::BytesReadError(error),
-        }
-    }
-}
-
-impl From<BytesWriteError> for PackerError {
-    fn from(error: BytesWriteError) -> Self {
-        PackerError {
-            value: PackerErrorValue::BytesWriteError(error),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct UnPackerError {
-    pub value: UnPackerErrorValue,
-}
-
-#[derive(Debug, Fail)]
-pub enum UnPackerErrorValue {
-    #[fail(display = "bytes read error: {}", _0)]
-    BytesReadError(BytesReadError),
-    #[fail(display = "bytes write error: {}", _0)]
-    BytesWriteError(#[cause] BytesWriteError),
-}
-
-impl From<BytesReadError> for UnPackerError {
-    fn from(error: BytesReadError) -> Self {
-        UnPackerError {
-            value: UnPackerErrorValue::BytesReadError(error),
-        }
-    }
-}
-
-impl From<BytesWriteError> for UnPackerError {
-    fn from(error: BytesWriteError) -> Self {
-        UnPackerError {
-            value: UnPackerErrorValue::BytesWriteError(error),
-        }
-    }
-}
-
-impl fmt::Display for UnPackerError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(&self.value, f)
-    }
-}
-
-impl Fail for UnPackerError {
-    fn cause(&self) -> Option<&dyn Fail> {
-        self.value.cause()
-    }
-
-    fn backtrace(&self) -> Option<&Backtrace> {
-        self.value.backtrace()
-    }
-}

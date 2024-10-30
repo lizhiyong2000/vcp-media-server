@@ -12,7 +12,7 @@ use tokio::net::UdpSocket;
 use tokio_util::codec::BytesCodec;
 use tokio_util::codec::Framed;
 
-use super::bytesio_errors::{BytesIOError, BytesIOErrorValue};
+use super::bytesio_errors::{BytesIOError};
 
 pub enum NetType {
     TCP,
@@ -146,9 +146,7 @@ impl TNetIO for UdpIO {
     async fn read_timeout(&mut self, duration: Duration) -> Result<BytesMut, BytesIOError> {
         match tokio::time::timeout(duration, self.read()).await {
             Ok(data) => data,
-            Err(err) => Err(BytesIOError {
-                value: BytesIOErrorValue::TimeoutError(err),
-            }),
+            Err(err) => Err(BytesIOError::TimeoutError(err)),
         }
     }
 
@@ -191,9 +189,7 @@ impl TNetIO for TcpIO {
     async fn read_timeout(&mut self, duration: Duration) -> Result<BytesMut, BytesIOError> {
         match tokio::time::timeout(duration, self.read()).await {
             Ok(data) => data,
-            Err(err) => Err(BytesIOError {
-                value: BytesIOErrorValue::TimeoutError(err),
-            }),
+            Err(err) => Err( BytesIOError::TimeoutError(err)),
         }
     }
 
@@ -203,13 +199,9 @@ impl TNetIO for TcpIO {
         match message {
             Some(data) => match data {
                 Ok(bytes) => Ok(bytes),
-                Err(err) => Err(BytesIOError {
-                    value: BytesIOErrorValue::IOError(err),
-                }),
+                Err(err) => Err(BytesIOError::IOError(err)),
             },
-            None => Err(BytesIOError {
-                value: BytesIOErrorValue::NoneReturn,
-            }),
+            None => Err(BytesIOError::NoneReturn),
         }
     }
 }

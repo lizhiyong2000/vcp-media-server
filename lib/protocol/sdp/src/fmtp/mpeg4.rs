@@ -1,7 +1,7 @@
 use vcp_media_common::{Marshal, Unmarshal};
 use base64::{engine::general_purpose, Engine as _};
 use bytes::{BufMut, BytesMut};
-use crate::errors::{SdpError, SdpErrorValue};
+use crate::errors::{SdpError};
 
 #[derive(Debug, Clone, Default)]
 pub struct Mpeg4Fmtp {
@@ -21,14 +21,14 @@ impl Unmarshal<&str, Result<Self, SdpError>> for Mpeg4Fmtp {
         let eles: Vec<&str> = raw_data.splitn(2, ' ').collect();
         if eles.len() < 2 {
             log::warn!("Mpeg4FmtpSdp parse err: {}", raw_data);
-            return Err(SdpError::from(SdpErrorValue::SdpFormatParametersError));
+            return Err(SdpError::from(SdpError::SdpFormatParametersError));
         }
 
         if let Ok(payload_type) = eles[0].parse::<u16>() {
             mpeg4_fmtp.payload_type = payload_type;
         }else{
             log::warn!("Mepg4FmtpSdp parse err: {}", raw_data);
-            return Err(SdpError::from(SdpErrorValue::SdpPayloadTypeError));
+            return Err(SdpError::from(SdpError::SdpPayloadTypeError));
         }
 
         let parameters: Vec<&str> = eles[1].split(';').collect();

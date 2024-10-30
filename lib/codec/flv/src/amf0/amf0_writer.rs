@@ -1,5 +1,5 @@
 use {
-    super::{amf0_markers, errors::Amf0WriteErrorValue, Amf0ValueType, Amf0WriteError},
+    super::{amf0_markers, errors::Amf0WriteError, Amf0ValueType},
     byteorder::BigEndian,
     bytes::BytesMut,
     vcp_media_common::bytesio::bytes_writer::BytesWriter,
@@ -50,9 +50,7 @@ impl Amf0Writer {
 
     pub fn write_string(&mut self, value: &String) -> Result<(), Amf0WriteError> {
         if value.len() > (u16::max_value() as usize) {
-            return Err(Amf0WriteError {
-                value: Amf0WriteErrorValue::NormalStringTooLong,
-            });
+            return Err(Amf0WriteError::NormalStringTooLong);
         }
 
         self.writer.write_u8(amf0_markers::STRING)?;

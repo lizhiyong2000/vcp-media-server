@@ -6,9 +6,7 @@ use tokio::task::LocalEnterGuard;
 use std::fmt::{self, Display};
 
 use crate::{Marshal, Unmarshal};
-use crate::http::errors::{HttpError, HttpErrorValue};
-// use crate::http::errors::HttpErrorValue::UriUnknownSchemeError;
-// use crate::http::errors::HttpErrorValue::UnknownUriSchemeError;
+use crate::http::errors::{HttpError};
 
 #[derive(Debug, Clone, Default)]
 pub enum Schema {
@@ -69,7 +67,7 @@ impl Unmarshal<&str, Result<Self, HttpError>> for Uri {
         } else {
             log::warn!("cannot judge the schema: {}", url);
             uri.schema = Schema::UNKNOWN;
-            // return Err(HttpErrorValue::UriUnknownSchemeError(url.to_string()))
+            // return Err(HttpError::UriUnknownSchemeError(url.to_string()))
         }
 
         let path_with_query = match uri.schema {
@@ -94,11 +92,11 @@ impl Unmarshal<&str, Result<Self, HttpError>> for Uri {
                         path_with_query
                     } else {
                         log::error!("cannot find split '/' for host:port and path?query.");
-                        return Err(HttpError::from(HttpErrorValue::RequestUriPathEmptyError(url.to_string())))
+                        return Err(HttpError::from(HttpError::RequestUriPathEmptyError(url.to_string())))
                     }
                 } else {
                     log::error!("cannot find RTSP prefix.");
-                    return Err(HttpError::from(HttpErrorValue::RequestUriSchemePrefixError(url.to_string())))
+                    return Err(HttpError::from(HttpError::RequestUriSchemePrefixError(url.to_string())))
                 };
                 rtsp_path_with_query
             }
@@ -208,7 +206,7 @@ impl Unmarshal<&str, Result<Self, HttpError>> for HttpRequest {
                         }
                     } else {
                         log::error!("cannot get a Uri.");
-                        return Err(HttpError::from(HttpErrorValue::RequestUriNotFoundError));
+                        return Err(HttpError::from(HttpError::RequestUriNotFoundError));
                     }
                 }
                 /* version */
@@ -236,7 +234,7 @@ impl Unmarshal<&str, Result<Self, HttpError>> for HttpRequest {
             }
             idx + 4
         } else {
-            return Err(HttpError::from(HttpErrorValue::RequestUriNotFoundError));
+            return Err(HttpError::from(HttpError::RequestUriNotFoundError));
         };
         log::trace!(
             "header_end_idx is: {} {}",
@@ -252,7 +250,7 @@ impl Unmarshal<&str, Result<Self, HttpError>> for HttpRequest {
                     
                     if request_data.len() - header_end_idx < len as usize{
                         log::debug!("request body length error");
-                        return Err(HttpError::from(HttpErrorValue::RequestContentLengthError));
+                        return Err(HttpError::from(HttpError::RequestContentLengthError));
                     }
                     http_request.body_length = Some(len);
                     http_request.body = Some(request_data[header_end_idx..header_end_idx + len as usize].to_string());
@@ -263,7 +261,7 @@ impl Unmarshal<&str, Result<Self, HttpError>> for HttpRequest {
                     // http_request.body = Some(request_data[header_end_idx..].to_string());
                 }else{
                     log::debug!("request body length error");
-                    return Err(HttpError::from(HttpErrorValue::RequestContentLengthError));
+                    return Err(HttpError::from(HttpError::RequestContentLengthError));
                 }
             }
         }
@@ -351,7 +349,7 @@ impl Unmarshal<&str, Result<Self, HttpError>> for HttpResponse {
             }
             idx + 4
         } else {
-            return Err(HttpError::from(HttpErrorValue::ResponseHeadersError));
+            return Err(HttpError::from(HttpError::ResponseHeadersError));
         };
 
         if request_data.len() > header_end_idx {

@@ -7,7 +7,8 @@ edition = "2021"
 
 [dependencies]
 bytes = "1.6.0"
-failure = "0.1.8"
+anyhow = "1.0.91"
+thiserror = "1.0.65"
 byteorder = "1.5.0"
 serde_derive = "1.0"
 serde = { version = "1.0.101", optional = true, features = ["derive"] }
@@ -30,3 +31,4 @@ md5 = "0.7.0"
 http = "1.1.0"
 
 vcp-media-common = { path = "../../common/" }
+

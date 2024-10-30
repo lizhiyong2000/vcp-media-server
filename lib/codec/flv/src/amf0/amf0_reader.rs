@@ -1,5 +1,5 @@
 use {
-    super::{amf0_markers, errors::Amf0ReadErrorValue, Amf0ReadError, Amf0ValueType},
+    super::{amf0_markers, errors::Amf0ReadError, Amf0ValueType},
     byteorder::BigEndian,
     // bytes::BytesMut,
     vcp_media_common::bytesio::bytes_reader::BytesReader,
@@ -48,18 +48,14 @@ impl Amf0Reader {
             amf0_markers::NULL => self.read_null(),
             amf0_markers::ECMA_ARRAY => self.read_ecma_array(),
             amf0_markers::LONG_STRING => self.read_long_string(),
-            _ => Err(Amf0ReadError {
-                value: Amf0ReadErrorValue::UnknownMarker { marker: markers },
-            }),
+            _ => Err(Amf0ReadError::UnknownMarker { marker: markers }),
         }
     }
     pub fn read_with_type(&mut self, specified_marker: u8) -> Result<Amf0ValueType, Amf0ReadError> {
         let marker = self.reader.advance_u8()?;
 
         if marker != specified_marker {
-            return Err(Amf0ReadError {
-                value: Amf0ReadErrorValue::WrongType,
-            });
+            return Err(Amf0ReadError::WrongType);
         }
 
         self.read_any()

@@ -1,12 +1,11 @@
 use {
-    super::{define::h264_nal_type, errors::Mpeg4AvcHevcError},
+    super::{define::h264_nal_type, errors::MpegError},
     byteorder::BigEndian,
     bytes::BytesMut,
     vcp_media_common::bytesio::{bytes_reader::BytesReader, bytes_writer::BytesWriter},
     std::vec::Vec,
 };
 
-use super::errors::MpegErrorValue;
 use vcp_media_h264::sps::SpsParser;
 
 const H264_START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
@@ -145,7 +144,7 @@ impl Mpeg4AvcProcessor {
     pub fn decoder_configuration_record_load(
         &mut self,
         bytes_reader: &mut BytesReader,
-    ) -> Result<&mut Self, Mpeg4AvcHevcError> {
+    ) -> Result<&mut Self, MpegError> {
         /*version */
         bytes_reader.read_u8()?;
         /*avc profile*/
@@ -177,9 +176,7 @@ impl Mpeg4AvcProcessor {
             /*parse SPS data to get video resolution(widthxheight) */
             let nal_type = sps_reader.read_u8()?;
             if (nal_type & 0x1f) != h264_nal_type::H264_NAL_SPS {
-                return Err(Mpeg4AvcHevcError {
-                    value: MpegErrorValue::SPSNalunitTypeNotCorrect,
-                });
+                return Err(MpegError::SPSNalunitTypeNotCorrect);
             }
             let mut sps_parser = SpsParser::new(sps_reader);
             (self.mpeg4_avc.width, self.mpeg4_avc.height) = sps_parser.parse()?;
@@ -228,7 +225,7 @@ impl Mpeg4AvcProcessor {
     pub fn h264_mp4toannexb(
         &mut self,
         bytes_reader: &mut BytesReader,
-    ) -> Result<BytesMut, Mpeg4AvcHevcError> {
+    ) -> Result<BytesMut, MpegError> {
         let mut bytes_writer = BytesWriter::new();
 
         let mut sps_pps_flag = false;
@@ -261,7 +258,7 @@ impl Mpeg4AvcProcessor {
         Ok(bytes_writer.extract_current_bytes())
     }
 
-    pub fn read_nalu_size(&mut self, bytes_reader: &mut BytesReader) -> Result<u32, Mpeg4AvcHevcError> {
+    pub fn read_nalu_size(&mut self, bytes_reader: &mut BytesReader) -> Result<u32, MpegError> {
         let mut size: u32 = 0;
 
         for _ in 0..self.mpeg4_avc.nalu_length {
@@ -274,7 +271,7 @@ impl Mpeg4AvcProcessor {
         &mut self,
         writer: &mut BytesWriter,
         length: usize,
-    ) -> Result<(), Mpeg4AvcHevcError> {
+    ) -> Result<(), MpegError> {
         let nalu_length = self.mpeg4_avc.nalu_length;
         for i in 0..nalu_length {
             let shift = (nalu_length - i - 1) * 8;
@@ -284,7 +281,7 @@ impl Mpeg4AvcProcessor {
         Ok(())
     }
 
-    pub fn nalus_to_mpeg4avc(&mut self, nalus: Vec<BytesMut>) -> Result<BytesMut, Mpeg4AvcHevcError> {
+    pub fn nalus_to_mpeg4avc(&mut self, nalus: Vec<BytesMut>) -> Result<BytesMut, MpegError> {
         let mut bytes_writer = BytesWriter::new();
 
         for nalu in nalus {
@@ -296,7 +293,7 @@ impl Mpeg4AvcProcessor {
         Ok(bytes_writer.extract_current_bytes())
     }
 
-    pub fn decoder_configuration_record_save(&mut self) -> Result<BytesMut, Mpeg4AvcHevcError> {
+    pub fn decoder_configuration_record_save(&mut self) -> Result<BytesMut, MpegError> {
         let mut bytes_writer = BytesWriter::new();
 
         bytes_writer.write_u8(1)?;

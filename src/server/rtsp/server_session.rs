@@ -34,7 +34,7 @@ use vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter;
 
 
 use vcp_media_common::bytesio::bytesio::UdpIO;
-use super::errors::{RtspSessionError, RtspSessionErrorValue};
+use super::errors::{RtspSessionError};
 
 use http;
 // use streamhub::define::DataSender;
@@ -57,7 +57,7 @@ use vcp_media_common::uuid::{Uuid, RandomDigitCount};
 //         FrameData, Information, InformationSender, NotifyInfo, PublishType, PublisherInfo,
 //         StreamHubEvent, StreamHubEventSender, SubscribeType, SubscriberInfo, TStreamHandler,
 //     },
-//     errors::{ChannelError, ChannelErrorValue},
+//     errors::{ChannelError, ChannelError},
 //     statistics::StreamStatistics,
 //     stream::StreamIdentifier,
 //     utils::{RandomDigitCount, Uuid},
@@ -289,7 +289,7 @@ impl RTSPServerSession {
 
         // if self.event_producer.send(request_event).is_err() {
         //     return Err(SessionError {
-        //         value: SessionErrorValue::StreamHubEventSendErr,
+        //         value: SessionError::StreamHubEventSendErr,
         //     });
         // }
 
@@ -342,7 +342,7 @@ impl RTSPServerSession {
 
         // if self.event_producer.send(publish_event).is_err() {
         //     return Err(SessionError {
-        //         value: SessionErrorValue::StreamHubEventSendErr,
+        //         value: SessionError::StreamHubEventSendErr,
         //     });
         // }
 
@@ -534,7 +534,7 @@ impl RTSPServerSession {
 
         // if self.event_producer.send(publish_event).is_err() {
         //     return Err(SessionError {
-        //         value: SessionErrorValue::StreamHubEventSendErr,
+        //         value: SessionError::StreamHubEventSendErr,
         //     });
         // }
 
@@ -581,7 +581,7 @@ impl RTSPServerSession {
 
         //         if retry_times > 10 {
         //             return Err(SessionError {
-        //                 value: SessionErrorValue::CannotReceiveFrameData,
+        //                 value: SessionError::CannotReceiveFrameData,
         //             });
         //         }
         //     }
@@ -618,11 +618,11 @@ impl RTSPServerSession {
 
                 return Ok(());
             } else {
-                return Err(RtspSessionError::from(RtspSessionErrorValue::RecordRangeError));
+                return Err(RtspSessionError::RecordRangeError);
             }
         }
 
-        Err(RtspSessionError::from(RtspSessionErrorValue::RecordRangeError))
+        Err(RtspSessionError::RecordRangeError)
 
 
     }
@@ -641,7 +641,7 @@ impl RTSPServerSession {
         //     Err(_) => {
         //         log::error!("unpublish_to_channels error.stream_name: {}", stream_path);
         //         Err(SessionError {
-        //             value: SessionErrorValue::StreamHubEventSendErr,
+        //             value: SessionError::StreamHubEventSendErr,
         //         })
         //     }
         //     Ok(()) => {
@@ -800,7 +800,7 @@ impl RtspStreamHandler {
 //             DataSender::Frame { sender } => sender,
 //             DataSender::Packet { sender: _ } => {
 //                 return Err(ChannelError {
-//                     value: ChannelErrorValue::NotCorrectDataSenderType,
+//                     value: ChannelError::NotCorrectDataSenderType,
 //                 });
 //             }
 //         };

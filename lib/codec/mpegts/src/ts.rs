@@ -2,7 +2,7 @@ use {
     super::{
         define,
         define::{epat_pid, epes_stream_id, ts},
-        errors::{MpegTsError, MpegTsErrorValue},
+        errors::{MpegTsError, MpegTsError},
         pat, pes,
         pes::PesMuxer,
         pmt, utils,
@@ -349,7 +349,7 @@ impl TsMuxer {
         // }
 
         Err(MpegTsError {
-            value: MpegTsErrorValue::StreamNotFound,
+            value: MpegTsError::StreamNotFound,
         })
     }
 
@@ -371,7 +371,7 @@ impl TsMuxer {
 
         if pmt.streams.len() == 4 {
             return Err(MpegTsError {
-                value: MpegTsErrorValue::StreamCountExeceed,
+                value: MpegTsError::StreamCountExeceed,
             });
         }
 
@@ -405,14 +405,14 @@ impl TsMuxer {
         for cur_pmt in self.pat.pmt.iter() {
             if cur_pmt.program_number == program_number {
                 return Err(MpegTsError {
-                    value: MpegTsErrorValue::ProgramNumberExists,
+                    value: MpegTsError::ProgramNumberExists,
                 });
             }
         }
 
         if self.pat.pmt.len() == 4 {
             return Err(MpegTsError {
-                value: MpegTsErrorValue::PmtCountExeceed,
+                value: MpegTsError::PmtCountExeceed,
             });
         }
         let mut cur_pmt = pmt::Pmt::new(); //&mut self.pat.pmt[self.pat.pmt_count];

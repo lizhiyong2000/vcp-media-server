@@ -32,9 +32,7 @@ impl EventMessagesReader {
             }
 
             _ => {
-                Err(errors::EventMessagesError {
-                    value: errors::EventMessagesErrorValue::UnknowEventMessageType,
-                })
+                Err(errors::EventMessagesError::UnknowEventMessageType)
             }
         }
     }

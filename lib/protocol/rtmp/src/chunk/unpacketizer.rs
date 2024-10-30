@@ -1,7 +1,7 @@
 use {
     super::{
         define,
-        errors::{UnpackError, UnpackErrorValue},
+        errors::{UnpackError},
         ChunkBasicHeader, ChunkInfo, ChunkMessageHeader, ExtendTimestampType,
     },
     crate::messages::define::msg_type_id,
@@ -150,7 +150,7 @@ impl ChunkUnpacketizer {
                     }
                 }
                 Err(err) => {
-                    if let UnpackErrorValue::CannotParse = err.value {
+                    if let UnpackError::CannotParse = err {
                         return Err(err);
                     }
                     break;
@@ -161,9 +161,7 @@ impl ChunkUnpacketizer {
         if !chunks.is_empty() {
             Ok(UnpackResult::Chunks(chunks))
         } else {
-            Err(UnpackError {
-                value: UnpackErrorValue::EmptyChunks,
-            })
+            Err(UnpackError::EmptyChunks)
         }
     }
 
@@ -307,9 +305,7 @@ impl ChunkUnpacketizer {
                         );
 
                         if self.parse_error_number > PARSE_ERROR_NUMVER {
-                            return Err(UnpackError {
-                                value: UnpackErrorValue::CannotParse,
-                            });
+                            return Err(UnpackError::CannotParse);
                         }
                         self.parse_error_number += 1;
                     } else {

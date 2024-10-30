@@ -13,7 +13,8 @@ edition = "2018"
 [dependencies]
 byteorder = "1.4.2"
 bytes = "1.0.0"
-failure = "0.1.8"
+anyhow = "1.0.91"
+thiserror = "1.0.65"
 serde = { version = "1.0", features = ["derive", "rc"] }
 log = "0.4"
 indexmap = "2.2.6"

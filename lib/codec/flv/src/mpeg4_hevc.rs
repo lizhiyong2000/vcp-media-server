@@ -1,4 +1,4 @@
-use {super::errors::Mpeg4AvcHevcError, byteorder::BigEndian, vcp_media_common::bytesio::bytes_reader::BytesReader};
+use {super::errors::MpegError, byteorder::BigEndian, vcp_media_common::bytesio::bytes_reader::BytesReader};
 #[allow(dead_code)]
 #[derive(Default)]
 
@@ -31,7 +31,7 @@ impl Mpeg4HevcProcessor {
     pub fn decoder_configuration_record_load(
         &mut self,
         bytes_reader: &mut BytesReader,
-    ) -> Result<&mut Self, Mpeg4AvcHevcError> {
+    ) -> Result<&mut Self, MpegError> {
         self.mpeg4_hevc.configuration_version = bytes_reader.read_u8()?;
         let byte_1 = bytes_reader.read_u8()?;
         self.mpeg4_hevc.general_profile_space = (byte_1 >> 6) & 0x03;

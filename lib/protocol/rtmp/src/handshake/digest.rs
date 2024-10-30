@@ -2,7 +2,7 @@ use {
     super::{
         define,
         define::SchemaVersion,
-        errors::{DigestError, DigestErrorValue},
+        errors::{DigestError},
     },
     bytes::BytesMut,
     vcp_media_common::bytesio::bytes_reader::BytesReader,
@@ -74,9 +74,7 @@ impl DigestProcessor {
                 digest_offset += 12;
             }
             SchemaVersion::Unknown => {
-                return Err(DigestError {
-                    value: DigestErrorValue::UnknowSchema,
-                });
+                return Err(DigestError::UnknowSchema);
             }
         }
 
@@ -113,9 +111,7 @@ impl DigestProcessor {
         let result = mac.finalize().into_bytes();
 
         if result.len() != define::RTMP_DIGEST_LENGTH {
-            return Err(DigestError {
-                value: DigestErrorValue::DigestLengthNotCorrect,
-            });
+            return Err(DigestError::DigestLengthNotCorrect);
         }
 
         let mut rv = BytesMut::new();
@@ -134,8 +130,6 @@ impl DigestProcessor {
             return Ok(digest_data);
         }
 
-        Err(DigestError {
-            value: DigestErrorValue::CannotGenerate,
-        })
+        Err(DigestError::CannotGenerate)
     }
 }

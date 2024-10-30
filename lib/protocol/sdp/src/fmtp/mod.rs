@@ -9,7 +9,7 @@ use bytes::{BufMut, BytesMut};
 use h264::H264Fmtp;
 use h265::H265Fmtp;
 use mpeg4::Mpeg4Fmtp;
-use crate::errors::{SdpError, SdpErrorValue};
+use crate::errors::{SdpError};
 
 #[derive(Debug, Clone)]
 pub enum Fmtp {
@@ -37,7 +37,7 @@ impl Fmtp {
 
             }
             _ => {
-                return Err(SdpError::from(SdpErrorValue::SdpUnknownCodecError(codec.to_string())));
+                return Err(SdpError::from(SdpError::SdpUnknownCodecError(codec.to_string())));
             }
         }
     }

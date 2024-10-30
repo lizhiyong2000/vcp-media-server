@@ -1,6 +1,6 @@
 use {
     super::{
-        bytes_errors::{BytesWriteError, BytesWriteErrorValue},
+        bytes_errors::{BytesWriteError},
         bytesio::TNetIO,
     },
     byteorder::{ByteOrder, WriteBytesExt},
@@ -33,9 +33,7 @@ impl BytesWriter {
 
     pub fn or_u8_at(&mut self, position: usize, byte: u8) -> Result<(), BytesWriteError> {
         if position > self.bytes.len() {
-            return Err(BytesWriteError {
-                value: BytesWriteErrorValue::OutofIndex,
-            });
+            return Err(BytesWriteError::OutofIndex);
         }
         self.bytes[position] |= byte;
 
@@ -44,9 +42,7 @@ impl BytesWriter {
 
     pub fn add_u8_at(&mut self, position: usize, byte: u8) -> Result<(), BytesWriteError> {
         if position > self.bytes.len() {
-            return Err(BytesWriteError {
-                value: BytesWriteErrorValue::OutofIndex,
-            });
+            return Err(BytesWriteError::OutofIndex);
         }
         self.bytes[position] += byte;
 
@@ -55,9 +51,7 @@ impl BytesWriter {
 
     pub fn write_u8_at(&mut self, position: usize, byte: u8) -> Result<(), BytesWriteError> {
         if position > self.bytes.len() {
-            return Err(BytesWriteError {
-                value: BytesWriteErrorValue::OutofIndex,
-            });
+            return Err(BytesWriteError::OutofIndex);
         }
         self.bytes[position] = byte;
 
@@ -221,9 +215,7 @@ impl AsyncBytesWriter {
                 self.bytes_writer.bytes.clear();
             }
             Err(_) => {
-                return Err(BytesWriteError {
-                    value: BytesWriteErrorValue::Timeout,
-                })
+                return Err(BytesWriteError::Timeout);
             }
         }
 

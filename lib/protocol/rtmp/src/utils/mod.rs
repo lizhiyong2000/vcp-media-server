@@ -3,7 +3,6 @@ pub mod print;
 
 use vcp_media_common::scanf;
 use errors::RtmpUrlParseError;
-use errors::RtmpUrlParseErrorValue;
 use indexmap::IndexMap;
 
 #[derive(Debug, Clone, Default)]
@@ -43,9 +42,7 @@ impl RtmpUrlParser {
             let remove_header_left = &self.url[idx + 7..];
             let url_parts: Vec<&str> = remove_header_left.split('/').collect();
             if url_parts.len() != 3 {
-                return Err(RtmpUrlParseError {
-                    value: RtmpUrlParseErrorValue::Notvalid,
-                });
+                return Err(RtmpUrlParseError::Notvalid);
             }
 
             self.host_with_port = url_parts[0].to_string();
@@ -56,9 +53,7 @@ impl RtmpUrlParser {
             (self.stream_name, self.query) =
                 Self::parse_stream_name_with_query(&self.stream_name_with_query);
         } else {
-            return Err(RtmpUrlParseError {
-                value: RtmpUrlParseErrorValue::Notvalid,
-            });
+            return Err(RtmpUrlParseError::Notvalid);
         }
 
         Ok(())
