@@ -1,10 +1,14 @@
+mod errors;
+
 use crate::scanf;
 use indexmap::IndexMap;
 use tokio::task::LocalEnterGuard;
 use std::fmt::{self, Display};
 
 use crate::{Marshal, Unmarshal};
-
+use crate::http::errors::{HttpError, HttpErrorValue};
+// use crate::http::errors::HttpErrorValue::UriUnknownSchemeError;
+// use crate::http::errors::HttpErrorValue::UnknownUriSchemeError;
 
 #[derive(Debug, Clone, Default)]
 pub enum Schema {
@@ -41,7 +45,7 @@ pub struct Uri {
     pub query: Option<String>,
 }
 
-impl Unmarshal<&str, Option<Uri>> for Uri {
+impl Unmarshal<&str, Result<Self, HttpError>> for Uri {
     /*
     RTSP HTTP header : "ANNOUNCE rtsp://127.0.0.1:5544/stream RTSP/1.0\r\n\
     the uri rtsp://127.0.0.1:5544/stream is standard with schema://host:port/path?query.
@@ -54,7 +58,7 @@ impl Unmarshal<&str, Option<Uri>> for Uri {
     In this function, for Webrtc we only parse path?query, host:port will be parsed in the HTTPRequest
     unmarshal method.
     */
-    fn unmarshal(url: &str) -> Option<Self> {
+    fn unmarshal(url: &str) ->  Result<Self, HttpError> {
         let mut uri = Uri::default();
 
         /*first judge the correct schema */
@@ -65,6 +69,7 @@ impl Unmarshal<&str, Option<Uri>> for Uri {
         } else {
             log::warn!("cannot judge the schema: {}", url);
             uri.schema = Schema::UNKNOWN;
+            // return Err(HttpErrorValue::UriUnknownSchemeError(url.to_string()))
         }
 
         let path_with_query = match uri.schema {
@@ -89,11 +94,11 @@ impl Unmarshal<&str, Option<Uri>> for Uri {
                         path_with_query
                     } else {
                         log::error!("cannot find split '/' for host:port and path?query.");
-                        return None;
+                        return Err(HttpError::from(HttpErrorValue::RequestUriPathEmptyError(url.to_string())))
                     }
                 } else {
                     log::error!("cannot find RTSP prefix.");
-                    return None;
+                    return Err(HttpError::from(HttpErrorValue::RequestUriSchemePrefixError(url.to_string())))
                 };
                 rtsp_path_with_query
             }
@@ -108,7 +113,7 @@ impl Unmarshal<&str, Option<Uri>> for Uri {
             uri.query = Some(path_data[1].to_string());
         }
 
-        Some(uri)
+        Ok(uri)
     }
 }
 
@@ -167,8 +172,8 @@ pub fn parse_content_length(request_data: &str) -> Option<u32> {
     length_str.trim().parse().ok()
 }
 
-impl Unmarshal<&str, Option<HttpRequest>> for HttpRequest {
-    fn unmarshal(request_data: &str) -> Option<Self> {
+impl Unmarshal<&str, Result<Self, HttpError>> for HttpRequest {
+    fn unmarshal(request_data: &str) -> Result<Self, HttpError> {
         let mut http_request = HttpRequest::default();
 
         log::trace!("request data, len:{}\n{}", request_data.len(), request_data);
@@ -187,7 +192,7 @@ impl Unmarshal<&str, Option<HttpRequest>> for HttpRequest {
                 }
                 /* url */
                 if let Some(url) = fields.next() {
-                    if let Some(uri) = Uri::unmarshal(url) {
+                    if let uri = Uri::unmarshal(url)? {
                         http_request.uri = uri;
 
                         if let Some(query) = &http_request.uri.query {
@@ -203,7 +208,7 @@ impl Unmarshal<&str, Option<HttpRequest>> for HttpRequest {
                         }
                     } else {
                         log::error!("cannot get a Uri.");
-                        return None;
+                        return Err(HttpError::from(HttpErrorValue::RequestUriNotFoundError));
                     }
                 }
                 /* version */
@@ -231,7 +236,7 @@ impl Unmarshal<&str, Option<HttpRequest>> for HttpRequest {
             }
             idx + 4
         } else {
-            return None;
+            return Err(HttpError::from(HttpErrorValue::RequestUriNotFoundError));
         };
         log::trace!(
             "header_end_idx is: {} {}",
@@ -247,7 +252,7 @@ impl Unmarshal<&str, Option<HttpRequest>> for HttpRequest {
                     
                     if request_data.len() - header_end_idx < len as usize{
                         log::debug!("request body length error");
-                        return None;
+                        return Err(HttpError::from(HttpErrorValue::RequestContentLengthError));
                     }
                     http_request.body_length = Some(len);
                     http_request.body = Some(request_data[header_end_idx..header_end_idx + len as usize].to_string());
@@ -258,7 +263,7 @@ impl Unmarshal<&str, Option<HttpRequest>> for HttpRequest {
                     // http_request.body = Some(request_data[header_end_idx..].to_string());
                 }else{
                     log::debug!("request body length error");
-                    return None;
+                    return Err(HttpError::from(HttpErrorValue::RequestContentLengthError));
                 }
             }
         }
@@ -268,7 +273,7 @@ impl Unmarshal<&str, Option<HttpRequest>> for HttpRequest {
             
         // }
 
-        Some(http_request)
+        Ok(http_request)
     }
 }
 
@@ -314,8 +319,8 @@ pub struct HttpResponse {
     pub body: Option<String>,
 }
 
-impl Unmarshal<&str, Option<HttpResponse>> for HttpResponse {
-    fn unmarshal(request_data: &str) -> Option<Self> {
+impl Unmarshal<&str, Result<Self, HttpError>> for HttpResponse {
+    fn unmarshal(request_data: &str) -> Result<Self, HttpError> {
         let mut http_response = HttpResponse::default();
         let header_end_idx = if let Some(idx) = request_data.find("\r\n\r\n") {
             let data_except_body = &request_data[..idx];
@@ -346,7 +351,7 @@ impl Unmarshal<&str, Option<HttpResponse>> for HttpResponse {
             }
             idx + 4
         } else {
-            return None;
+            return Err(HttpError::from(HttpErrorValue::ResponseHeadersError));
         };
 
         if request_data.len() > header_end_idx {
@@ -354,7 +359,7 @@ impl Unmarshal<&str, Option<HttpResponse>> for HttpResponse {
             http_response.body = Some(request_data[header_end_idx..].to_string());
         }
 
-        Some(http_response)
+        Ok(http_response)
     }
 }
 

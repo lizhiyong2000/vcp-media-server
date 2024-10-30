@@ -1,7 +1,7 @@
 use vcp_media_common::{Marshal, Unmarshal};
-use base64::{engine::general_purpose, Engine as _};
+use base64::{engine::general_purpose, DecodeError, Engine as _};
 use bytes::{BufMut, BytesMut};
-
+use crate::errors::{SdpError, SdpErrorValue};
 // pub trait Fmtp: TMsgConverter {}
 
 #[derive(Debug, Clone, Default)]
@@ -14,17 +14,20 @@ pub struct H264Fmtp {
 }
 
 // a=fmtp:96 packetization-mode=1; sprop-parameter-sets=Z2QAFqyyAUBf8uAiAAADAAIAAAMAPB4sXJA=,aOvDyyLA; profile-level-id=640016
-impl Unmarshal<&str, Option<H264Fmtp>> for H264Fmtp {
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+impl Unmarshal<&str, Result<Self, SdpError>> for H264Fmtp {
+    fn unmarshal(raw_data: &str) -> Result<Self, SdpError> {
         let mut h264_fmtp = H264Fmtp::default();
         let eles: Vec<&str> = raw_data.splitn(2, ' ').collect();
         if eles.len() < 2 {
             log::warn!("H264FmtpSdp parse err: {}", raw_data);
-            return None;
+            return Err(SdpError::from(SdpErrorValue::SdpFormatParametersError));
         }
 
         if let Ok(payload_type) = eles[0].parse::<u16>() {
             h264_fmtp.payload_type = payload_type;
+        }else{
+            log::warn!("H264FmtpSdp parse err: {}", raw_data);
+            return Err(SdpError::from(SdpErrorValue::SdpPayloadTypeError));
         }
 
         let parameters: Vec<&str> = eles[1].split(';').collect();
@@ -42,10 +45,34 @@ impl Unmarshal<&str, Option<H264Fmtp>> for H264Fmtp {
                 }
                 "sprop-parameter-sets" => {
                     let spspps: Vec<&str> = kv[1].split(',').collect();
-                    let sps = general_purpose::STANDARD.decode(spspps[0]).unwrap();
-                    h264_fmtp.sps.put(&sps[..]);
-                    let pps = general_purpose::STANDARD.decode(spspps[1]).unwrap();
-                    h264_fmtp.pps.put(&pps[..]);
+                    if spspps.len() < 2 {
+                        log::warn!("H264FmtpSdp parse sprop-parameter-sets err: {}", kv[1]);
+                        continue;
+                    }
+
+                    let sps = general_purpose::STANDARD.decode(spspps[0]);
+                    match sps {
+                        Ok(sps) => {
+                            h264_fmtp.sps.put(&sps[..]);
+                        }
+                        _ => {
+                            log::warn!("H264FmtpSdp parse sps err: {}", spspps[0]);
+                        }
+
+                    }
+
+                    let pps = general_purpose::STANDARD.decode(spspps[1]);
+
+                    match pps {
+                        Ok(pps) => {
+                            h264_fmtp.pps.put(&pps[..]);
+                        }
+                        _ => {
+                            log::warn!("H264FmtpSdp parse key=value err: {}", spspps[1]);
+                        }
+
+                    }
+
                 }
                 "profile-level-id" => {
                     h264_fmtp.profile_level_id = kv[1].into();
@@ -56,7 +83,7 @@ impl Unmarshal<&str, Option<H264Fmtp>> for H264Fmtp {
             }
         }
 
-        Some(h264_fmtp)
+        Ok(h264_fmtp)
     }
 }
 

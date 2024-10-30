@@ -14,30 +14,27 @@ use vcp_media_common::bytesio::bytesio::TcpIO;
 
 use vcp_media_common::Marshal as RtpMarshal;
 use vcp_media_rtp::RtpPacket;
-use vcp_media_rtsp::rtsp_range::RtspRange;
+use vcp_media_rtsp::range::RtspRange;
 
 
 use vcp_media_sdp::SessionDescription;
 
-use vcp_media_rtsp::rtsp_codec;
-use vcp_media_rtsp::rtsp_codec::RtspCodecInfo;
-use vcp_media_rtsp::rtsp_track::RtspTrack;
-use vcp_media_rtsp::rtsp_track::TrackType;
-use vcp_media_rtsp::rtsp_transport::ProtocolType;
-use vcp_media_rtsp::rtsp_transport::RtspTransport;
+use vcp_media_rtsp::codec;
+use vcp_media_rtsp::codec::RtspCodecInfo;
+use vcp_media_rtsp::track::RtspTrack;
+use vcp_media_rtsp::track::TrackType;
+use vcp_media_rtsp::transport::ProtocolType;
+use vcp_media_rtsp::transport::RtspTransport;
 
 use vcp_media_common::http::HttpRequest as RtspRequest;
 use vcp_media_common::http::HttpResponse as RtspResponse;
-
-
-
 
 use vcp_media_common::bytesio::bytes_reader::BytesReader;
 use vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter;
 
 
 use vcp_media_common::bytesio::bytesio::UdpIO;
-use super::errors::SessionError;
+use super::errors::{RtspSessionError, RtspSessionErrorValue};
 
 use http;
 // use streamhub::define::DataSender;
@@ -84,7 +81,7 @@ impl InterleavedBinaryData {
     // sign (24 hexadecimal), followed by a one-byte channel identifier,
     // followed by the length of the encapsulated binary data as a binary,
     // two-byte integer in network byte order
-    fn new(reader: &mut BytesReader) -> Result<Option<Self>, SessionError> {
+    fn new(reader: &mut BytesReader) -> Result<Option<Self>, RtspSessionError> {
         let is_dollar_sign = reader.advance_u8()? == 0x24;
         log::debug!("dollar sign: {}", is_dollar_sign);
         if is_dollar_sign {
@@ -164,7 +161,7 @@ impl RTSPServerSession {
         }
     }
 
-    pub async fn handle_session(&mut self) -> Result<(), SessionError> {
+    pub async fn handle_session(&mut self) -> Result<(), RtspSessionError> {
         loop {
             while self.reader.len() < 4 {
                 let data = self.io.lock().await.read().await?;
@@ -193,7 +190,7 @@ impl RTSPServerSession {
         &mut self,
         channel_identifier: u8,
         length: usize,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), RtspSessionError> {
         let mut cur_reader = BytesReader::new(self.reader.read_bytes(length)?);
 
         for track in self.tracks.values_mut() {
@@ -213,7 +210,7 @@ impl RTSPServerSession {
 
     //publish stream: OPTIONS->ANNOUNCE->SETUP->RECORD->TEARDOWN
     //subscribe stream: OPTIONS->DESCRIBE->SETUP->PLAY->TEARDOWN
-    async fn on_rtsp_message(&mut self) -> Result<(), SessionError> {
+    async fn on_rtsp_message(&mut self) -> Result<(), RtspSessionError> {
         // let data = self.reader.extract_remaining_bytes();
 
         let data = self.reader.get_remaining_bytes();
@@ -221,7 +218,7 @@ impl RTSPServerSession {
 
         log::debug!("received rtsp message data, length {}", data.len());
 
-        if let Some(rtsp_request) = RtspRequest::unmarshal(std::str::from_utf8(&data)?) {
+        if let Ok(rtsp_request) = RtspRequest::unmarshal(std::str::from_utf8(&data)?) {
             log::info!("received rtsp request message:{}", rtsp_request);
 
             self.reader.read_bytes(rtsp_request.origin_length);
@@ -266,7 +263,7 @@ impl RTSPServerSession {
         Ok(())
     }
 
-    async fn handle_options(&mut self, rtsp_request: &RtspRequest) -> Result<(), SessionError> {
+    async fn handle_options(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let status_code = http::StatusCode::OK;
         let mut response = Self::gen_response(status_code, rtsp_request);
         let public_str = rtsp_method_name::ARRAY.join(",");
@@ -276,7 +273,7 @@ impl RTSPServerSession {
         Ok(())
     }
 
-    async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<(), SessionError> {
+    async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let status_code = http::StatusCode::OK;
 
         // The sender is used for sending sdp information from the server session to client session
@@ -316,7 +313,7 @@ impl RTSPServerSession {
         Ok(())
     }
 
-    async fn handle_announce(&mut self, rtsp_request: &RtspRequest) -> Result<(), SessionError> {
+    async fn handle_announce(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         // if let Some(auth) = &self.auth {
         //     let stream_name = rtsp_request.uri.path.clone();
         //     auth.authenticate(&stream_name, &rtsp_request.uri.query, false)?;
@@ -380,7 +377,7 @@ impl RTSPServerSession {
         Ok(())
     }
 
-    async fn handle_setup(&mut self, rtsp_request: &RtspRequest) -> Result<(), SessionError> {
+    async fn handle_setup(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let status_code = http::StatusCode::OK;
         let mut response = Self::gen_response(status_code, rtsp_request);
 
@@ -396,7 +393,7 @@ impl RTSPServerSession {
 
                 let transport = RtspTransport::unmarshal(transport_data);
 
-                if let Some(mut trans) = transport {
+                if let Ok(mut trans) = transport {
                     let mut rtp_server_port: Option<u16> = None;
                     let mut rtcp_server_port: Option<u16> = None;
 
@@ -467,7 +464,7 @@ impl RTSPServerSession {
         Ok(())
     }
 
-    async fn handle_play(&mut self, rtsp_request: &RtspRequest) -> Result<(), SessionError> {
+    async fn handle_play(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         // if let Some(auth) = &self.auth {
         //     let stream_name = rtsp_request.uri.path.clone();
         //     auth.authenticate(&stream_name, &rtsp_request.uri.query, true)?;
@@ -591,7 +588,7 @@ impl RTSPServerSession {
         // }
     }
 
-    pub fn unsubscribe_from_stream_hub(&mut self, _stream_path: String) -> Result<(), SessionError> {
+    pub fn unsubscribe_from_stream_hub(&mut self, _stream_path: String) -> Result<(), RtspSessionError> {
         // let identifier = StreamIdentifier::Rtsp { stream_path };
 
         // let subscribe_event = StreamHubEvent::UnSubscribe {
@@ -605,9 +602,9 @@ impl RTSPServerSession {
         Ok(())
     }
 
-    async fn handle_record(&mut self, rtsp_request: &RtspRequest) -> Result<(), SessionError> {
+    async fn handle_record(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         if let Some(range_str) = rtsp_request.headers.get(&String::from("Range")) {
-            if let Some(range) = RtspRange::unmarshal(range_str) {
+            if let Ok(range) = RtspRange::unmarshal(range_str) {
                 let status_code = http::StatusCode::OK;
                 let mut response = Self::gen_response(status_code, rtsp_request);
                 response
@@ -618,13 +615,19 @@ impl RTSPServerSession {
                     .insert("Session".to_string(), self.session_id.unwrap().to_string());
 
                 self.send_response(&response).await?;
+
+                return Ok(());
+            } else {
+                return Err(RtspSessionError::from(RtspSessionErrorValue::RecordRangeError));
             }
         }
 
-        Ok(())
+        Err(RtspSessionError::from(RtspSessionErrorValue::RecordRangeError))
+
+
     }
 
-    fn handle_teardown(&mut self, rtsp_request: &RtspRequest) -> Result<(), SessionError> {
+    fn handle_teardown(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let _stream_path = &rtsp_request.uri.path;
         // let unpublish_event = StreamHubEvent::UnPublish {
         //     identifier: StreamIdentifier::Rtsp {
@@ -653,7 +656,7 @@ impl RTSPServerSession {
         Ok(())
     }
 
-    fn new_tracks(&mut self) -> Result<(), SessionError> {
+    fn new_tracks(&mut self) -> Result<(), RtspSessionError> {
         for media in &self.sdp.medias {
             let media_control = media.get_control();
 
@@ -662,7 +665,7 @@ impl RTSPServerSession {
                 log::info!("media_name: {}", media_name);
                 match media_name.as_str() {
                     "audio" => {
-                        let codec_id = rtsp_codec::RTSP_CODEC_NAME_2_ID
+                        let codec_id = codec::RTSP_CODEC_NAME_2_ID
                             .get(&rtpmap.encoding_name.to_lowercase().as_str())
                             .unwrap()
                             .clone();
@@ -679,7 +682,7 @@ impl RTSPServerSession {
                         self.tracks.insert(TrackType::Audio, track);
                     }
                     "video" => {
-                        let codec_id = rtsp_codec::RTSP_CODEC_NAME_2_ID
+                        let codec_id = codec::RTSP_CODEC_NAME_2_ID
                             .get(&rtpmap.encoding_name.to_lowercase().as_str())
                             .unwrap()
                             .clone();
@@ -759,7 +762,7 @@ impl RTSPServerSession {
     //     }
     // }
 
-    async fn send_response(&mut self, response: &RtspResponse) -> Result<(), SessionError> {
+    async fn send_response(&mut self, response: &RtspResponse) -> Result<(), RtspSessionError> {
 
         log::debug!("send response:==========================\n{}=============", response);
 

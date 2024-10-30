@@ -1,5 +1,7 @@
 use vcp_media_common::{Marshal, Unmarshal};
-use super::rtsp_utils::scanf;
+use crate::errors::RtspError;
+use super::utils::scanf;
+use crate::errors::RtspErrorValue::*;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 
@@ -25,11 +27,17 @@ pub struct RtspTransport {
     pub ssrc: Option<u32>,
 }
 
-impl Unmarshal<&str, Option<RtspTransport>> for RtspTransport {
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+impl Unmarshal<&str, Result<Self, RtspError>> for RtspTransport {
+    fn unmarshal(raw_data: &str) -> Result<Self, RtspError> {
         let mut rtsp_transport = RtspTransport::default();
 
         let param_parts: Vec<&str> = raw_data.split(';').collect();
+
+        if param_parts.len() < 2 {
+            return Err(RtspError::from(RtspTransportError));
+        }
+
+
         for part in param_parts {
             let kv: Vec<&str> = part.split('=').collect();
             match kv[0] {
@@ -97,7 +105,7 @@ impl Unmarshal<&str, Option<RtspTransport>> for RtspTransport {
             }
         }
 
-        Some(rtsp_transport)
+        Ok(rtsp_transport)
     }
 }
 

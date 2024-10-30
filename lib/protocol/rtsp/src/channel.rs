@@ -42,8 +42,8 @@ use vcp_media_rtp::utils::TPacker;
 use vcp_media_rtp::utils::TUnPacker;
 
 
-use super::rtsp_codec::RtspCodecId;
-use super::rtsp_codec::RtspCodecInfo;
+use super::codec::RtspCodecId;
+use super::codec::RtspCodecInfo;
 
 
 

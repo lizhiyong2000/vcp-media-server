@@ -12,12 +12,12 @@ use {
 use vcp_media_sdp::errors::SdpError;
 
 #[derive(Debug)]
-pub struct SessionError {
-    pub value: SessionErrorValue,
+pub struct RtspSessionError {
+    pub value: RtspSessionErrorValue,
 }
 
 #[derive(Debug, Fail)]
-pub enum SessionErrorValue {
+pub enum RtspSessionErrorValue {
     #[fail(display = "net io error: {}", _0)]
     BytesIOError(#[cause] BytesIOError),
     #[fail(display = "bytes read error: {}", _0)]
@@ -44,53 +44,67 @@ pub enum SessionErrorValue {
     ChannelRecvError,
 
     #[fail(display = "SdpError: {}", _0)]
-    SdpError(#[cause] SdpError),
+    SdpParseError(#[cause] SdpError),
+
+    #[fail(display = "RecordRangeError")]
+    RecordRangeError,
 }
 
-impl From<BytesIOError> for SessionError {
+
+impl From<RtspSessionErrorValue> for RtspSessionError {
+    fn from(error: RtspSessionErrorValue) -> Self {
+        RtspSessionError {
+            value: error,
+        }
+    }
+
+
+}
+
+impl From<BytesIOError> for RtspSessionError {
     fn from(error: BytesIOError) -> Self {
-        SessionError {
-            value: SessionErrorValue::BytesIOError(error),
+        RtspSessionError {
+            value: RtspSessionErrorValue::BytesIOError(error),
         }
     }
 }
 
-impl From<BytesReadError> for SessionError {
+impl From<BytesReadError> for RtspSessionError {
     fn from(error: BytesReadError) -> Self {
-        SessionError {
-            value: SessionErrorValue::BytesReadError(error),
+        RtspSessionError {
+            value: RtspSessionErrorValue::BytesReadError(error),
         }
     }
 }
 
-impl From<BytesWriteError> for SessionError {
+impl From<BytesWriteError> for RtspSessionError {
     fn from(error: BytesWriteError) -> Self {
-        SessionError {
-            value: SessionErrorValue::BytesWriteError(error),
+        RtspSessionError {
+            value: RtspSessionErrorValue::BytesWriteError(error),
         }
     }
 }
 
-impl From<Utf8Error> for SessionError {
+impl From<Utf8Error> for RtspSessionError {
     fn from(error: Utf8Error) -> Self {
-        SessionError {
-            value: SessionErrorValue::Utf8Error(error),
+        RtspSessionError {
+            value: RtspSessionErrorValue::Utf8Error(error),
         }
     }
 }
 
-impl From<PackerError> for SessionError {
+impl From<PackerError> for RtspSessionError {
     fn from(error: PackerError) -> Self {
-        SessionError {
-            value: SessionErrorValue::PackerError(error),
+        RtspSessionError {
+            value: RtspSessionErrorValue::PackerError(error),
         }
     }
 }
 
-impl From<UnPackerError> for SessionError {
+impl From<UnPackerError> for RtspSessionError {
     fn from(error: UnPackerError) -> Self {
-        SessionError {
-            value: SessionErrorValue::UnPackerError(error),
+        RtspSessionError {
+            value: RtspSessionErrorValue::UnPackerError(error),
         }
     }
 }
@@ -103,26 +117,26 @@ impl From<UnPackerError> for SessionError {
 //     }
 // }
 
-impl From<RecvError> for SessionError {
+impl From<RecvError> for RtspSessionError {
     fn from(error: RecvError) -> Self {
-        SessionError {
-            value: SessionErrorValue::RecvError(error),
+        RtspSessionError {
+            value: RtspSessionErrorValue::RecvError(error),
         }
     }
 }
 
-impl From<AuthError> for SessionError {
+impl From<AuthError> for RtspSessionError {
     fn from(error: AuthError) -> Self {
-        SessionError {
-            value: SessionErrorValue::AuthError(error),
+        RtspSessionError {
+            value: RtspSessionErrorValue::AuthError(error),
         }
     }
 }
 
-impl From<SdpError> for SessionError {
+impl From<SdpError> for RtspSessionError {
     fn from(error: SdpError) -> Self {
-        SessionError {
-            value: SessionErrorValue::SdpError(error),
+        RtspSessionError {
+            value: RtspSessionErrorValue::SdpParseError(error),
         }
     }
 }
@@ -130,13 +144,13 @@ impl From<SdpError> for SessionError {
 
 
 
-impl fmt::Display for SessionError {
+impl fmt::Display for RtspSessionError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(&self.value, f)
     }
 }
 
-impl Fail for SessionError {
+impl Fail for RtspSessionError {
     fn cause(&self) -> Option<&dyn Fail> {
         self.value.cause()
     }

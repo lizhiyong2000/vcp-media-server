@@ -1,7 +1,7 @@
 use vcp_media_common::{Marshal, Unmarshal};
 use base64::{engine::general_purpose, Engine as _};
 use bytes::{BufMut, BytesMut};
-
+use crate::errors::{SdpError, SdpErrorValue};
 
 #[derive(Debug, Clone, Default)]
 pub struct H265Fmtp {
@@ -13,18 +13,21 @@ pub struct H265Fmtp {
 
 
 
-impl Unmarshal<&str, Option<H265Fmtp>> for H265Fmtp {
+impl Unmarshal<&str, Result<Self, SdpError>> for H265Fmtp {
     //"a=fmtp:96 sprop-vps=QAEMAf//AWAAAAMAkAAAAwAAAwA/ugJA; sprop-sps=QgEBAWAAAAMAkAAAAwAAAwA/oAUCAXHy5bpKTC8BAQAAAwABAAADAA8I; sprop-pps=RAHAc8GJ"
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+    fn unmarshal(raw_data: &str) -> Result<Self, SdpError> {
         let mut h265_fmtp = H265Fmtp::default();
         let eles: Vec<&str> = raw_data.splitn(2, ' ').collect();
         if eles.len() < 2 {
             log::warn!("H265FmtpSdp parse err: {}", raw_data);
-            return None;
+            return Err(SdpError::from(SdpErrorValue::SdpFormatParametersError));
         }
 
         if let Ok(payload_type) = eles[0].parse::<u16>() {
             h265_fmtp.payload_type = payload_type;
+        }else{
+            log::warn!("H265FmtpSdp parse err: {}", raw_data);
+            return Err(SdpError::from(SdpErrorValue::SdpPayloadTypeError));
         }
 
         let parameters: Vec<&str> = eles[1].split(';').collect();
@@ -51,7 +54,7 @@ impl Unmarshal<&str, Option<H265Fmtp>> for H265Fmtp {
             }
         }
 
-        Some(h265_fmtp)
+        Ok(h265_fmtp)
     }
 }
 

@@ -1,4 +1,5 @@
 use vcp_media_common::{Marshal, Unmarshal};
+use crate::errors::SdpError;
 
 #[derive(Debug, Clone, Default)]
 pub struct RtpMap {
@@ -8,14 +9,18 @@ pub struct RtpMap {
     pub encoding_param: String,
 }
 
-impl Unmarshal<&str, Option<RtpMap>> for RtpMap {
+impl Unmarshal<&str, Result<Self, SdpError>> for RtpMap {
     // a=rtpmap:96 H264/90000\r\n\
     // a=rtpmap:97 MPEG4-GENERIC/48000/2\r\n\
 
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+    fn unmarshal(raw_data: &str) -> Result<Self, SdpError> {
         let mut rtpmap = RtpMap::default();
 
         let parts: Vec<&str> = raw_data.split(' ').collect();
+
+        if parts.len() < 2 {
+
+        }
 
         if let Some(part_0) = parts.first() {
             if let Ok(payload_type) = part_0.parse::<u16>() {
@@ -40,7 +45,7 @@ impl Unmarshal<&str, Option<RtpMap>> for RtpMap {
             }
         }
 
-        Some(rtpmap)
+        Ok(rtpmap)
     }
 }
 

@@ -9,7 +9,7 @@ use bytes::{BufMut, BytesMut};
 use h264::H264Fmtp;
 use h265::H265Fmtp;
 use mpeg4::Mpeg4Fmtp;
-
+use crate::errors::{SdpError, SdpErrorValue};
 
 #[derive(Debug, Clone)]
 pub enum Fmtp {
@@ -19,26 +19,27 @@ pub enum Fmtp {
 }
 
 impl Fmtp {
-    pub fn new(codec: &str, raw_data: &str) -> Option<Fmtp> {
+    pub fn new(codec: &str, raw_data: &str) -> Result<Fmtp, SdpError> {
         match codec.to_lowercase().as_str() {
             "h264" => {
-                if let Some(h264_fmtp) = H264Fmtp::unmarshal(raw_data) {
-                    return Some(Fmtp::H264(h264_fmtp));
-                }
+                let h264_fmtp = H264Fmtp::unmarshal(raw_data)?;
+                    return Ok(Fmtp::H264(h264_fmtp));
+
             }
             "h265" => {
-                if let Some(h265_fmtp) = H265Fmtp::unmarshal(raw_data) {
-                    return Some(Fmtp::H265(h265_fmtp));
-                }
+                let h265_fmtp = H265Fmtp::unmarshal(raw_data)?;
+                    return Ok(Fmtp::H265(h265_fmtp));
+
             }
             "mpeg4-generic" => {
-                if let Some(mpeg4_fmtp) = Mpeg4Fmtp::unmarshal(raw_data) {
-                    return Some(Fmtp::Mpeg4(mpeg4_fmtp));
-                }
+                let mpeg4_fmtp = Mpeg4Fmtp::unmarshal(raw_data)?;
+                    return Ok(Fmtp::Mpeg4(mpeg4_fmtp));
+
             }
-            _ => {}
+            _ => {
+                return Err(SdpError::from(SdpErrorValue::SdpUnknownCodecError(codec.to_string())));
+            }
         }
-        None
     }
 
     pub fn marshal(&self) -> String {

@@ -1,6 +1,7 @@
 use vcp_media_common::{Marshal, Unmarshal};
-
-use super::rtsp_utils;
+use crate::errors::RtspError;
+use crate::errors::RtspErrorValue::*;
+use super::utils;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum RtspRangeType {
@@ -16,13 +17,14 @@ pub struct RtspRange {
     end: Option<i64>,
 }
 
-impl Unmarshal<&str, Option<RtspRange>> for RtspRange {
-    fn unmarshal(raw_data: &str) -> Option<Self> {
+impl Unmarshal<&str, Result<Self, RtspError>> for RtspRange {
+    fn unmarshal(raw_data: &str) -> Result<Self, RtspError> {
         let mut rtsp_range = RtspRange::default();
 
         let kv: Vec<&str> = raw_data.splitn(2, '=').collect();
         if kv.len() < 2 {
-            return None;
+            return Err(RtspError::from(RtspRangeError));
+
         }
 
         match kv[0] {
@@ -53,7 +55,7 @@ impl Unmarshal<&str, Option<RtspRange>> for RtspRange {
 
                 let get_npt_time = |range_time: &str| -> i64 {
                     if let (Some(hour), Some(minute), Some(second), mill) =
-                        rtsp_utils::scanf!(range_time, |c| c == ':' || c == '.', i64, i64, i64, i64)
+                        utils::scanf!(range_time, |c| c == ':' || c == '.', i64, i64, i64, i64)
                     {
                         let mut result = (hour * 3600 + minute * 60 + second) * 1000;
                         if let Some(m) = mill {
@@ -83,7 +85,7 @@ impl Unmarshal<&str, Option<RtspRange>> for RtspRange {
             }
         }
 
-        Some(rtsp_range)
+        Ok(rtsp_range)
     }
 }
 

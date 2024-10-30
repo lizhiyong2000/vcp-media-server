@@ -631,7 +631,7 @@ impl Unmarshal<&str, Result<Self, SdpError>>  for SessionDescription {
                         if attribute.len() == 2 {
                             match attr_name {
                                 "rtpmap" => {
-                                    if let Some(rtpmap) = RtpMap::unmarshal(attr_value) {
+                                    if let Ok(rtpmap) = RtpMap::unmarshal(attr_value) {
                                         cur_media.rtpmap = Some(rtpmap);
                                         continue;
                                     }
@@ -640,7 +640,7 @@ impl Unmarshal<&str, Result<Self, SdpError>>  for SessionDescription {
 
                                     if let Some(rtpmap) = &cur_media.rtpmap{
 
-                                        if let Some(fmtp) = Fmtp::new(rtpmap.encoding_name.as_str(), attr_value){
+                                        if let Ok(fmtp) = Fmtp::new(rtpmap.encoding_name.as_str(), attr_value){
                                             cur_media.fmtp.push(fmtp);
                                         }
 

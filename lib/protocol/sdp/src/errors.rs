@@ -23,6 +23,15 @@ pub enum SdpErrorValue {
     SPSNalunitTypeNotCorrect,
     #[fail(display = "not supported sampling frequency")]
     NotSupportedSamplingFrequency,
+
+    #[fail(display = "the sps nal unit type is not correct")]
+    SdpFormatParametersError,
+
+    #[fail(display = "the sps nal unit type is not correct")]
+    SdpPayloadTypeError,
+
+    #[fail(display = "the sdp codec {} not supported", _0)]
+    SdpUnknownCodecError(String),
 }
 
 
