@@ -12,7 +12,8 @@ pub mod range;
 pub mod track;
 pub mod transport;
 pub mod utils;
-mod errors;
+pub mod errors;
+pub mod session;
 // pub mod sdp;
 // pub mod session;
 

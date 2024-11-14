@@ -3,6 +3,7 @@ pub mod log;
 pub mod http;
 pub mod macros;
 pub mod uuid;
+pub mod server;
 
 use std::error;
 
