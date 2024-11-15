@@ -1,13 +1,11 @@
-use {
-    super::{
-        define::CHUNK_SIZE, errors::PackError, ChunkBasicHeader, ChunkHeader, ChunkInfo,
-        ChunkMessageHeader, ExtendTimestampType,
-    },
-    byteorder::{BigEndian, LittleEndian},
-    vcp_media_common::bytesio::{bytes_writer::AsyncBytesWriter, bytesio::TNetIO},
-    std::{collections::HashMap, sync::Arc},
-    tokio::sync::Mutex,
+use super::{
+    define::CHUNK_SIZE, errors::PackError, ChunkBasicHeader, ChunkHeader, ChunkInfo,
+    ChunkMessageHeader, ExtendTimestampType,
 };
+use byteorder::{BigEndian, LittleEndian};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Mutex;
+use vcp_media_common::bytesio::{bytes_writer::AsyncBytesWriter, bytesio::TNetIO};
 
 #[derive(Eq, PartialEq, Debug)]
 pub enum PackResult {

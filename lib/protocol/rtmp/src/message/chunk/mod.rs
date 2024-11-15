@@ -3,6 +3,7 @@ pub mod errors;
 pub mod packetizer;
 pub mod unpacketizer;
 
+// mod chunk;
 // pub use chunk::{ChunkBasicHeader, ChunkHeader, ChunkInfo, ChunkMessageHeader};
 
 use bytes::BytesMut;

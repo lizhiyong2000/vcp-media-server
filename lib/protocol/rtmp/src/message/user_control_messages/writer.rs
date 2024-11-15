@@ -1,6 +1,6 @@
 use {
     super::{define, errors::EventMessagesError},
-    crate::messages::define::msg_type_id,
+    crate::message::messages::define::msg_type_id,
     byteorder::BigEndian,
     vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter,
 };

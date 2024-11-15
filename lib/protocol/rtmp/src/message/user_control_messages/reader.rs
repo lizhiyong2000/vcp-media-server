@@ -1,6 +1,6 @@
 use {
     super::{define, errors},
-    crate::messages::define as message_define,
+    crate::message::messages::define as message_define,
     byteorder::BigEndian,
     vcp_media_common::bytesio::bytes_reader::BytesReader,
 };

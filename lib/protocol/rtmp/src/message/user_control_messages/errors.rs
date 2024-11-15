@@ -15,6 +15,6 @@ pub enum EventMessagesError {
     BytesWriteError(#[from] BytesWriteError),
     #[error("bytes read error: {}", _0)]
     BytesReadError(#[from] BytesReadError),
-    #[error("unknow event message type")]
+    #[error("unknow event session type")]
     UnknowEventMessageType,
 }

@@ -89,7 +89,7 @@ impl DigestProcessor {
     *                |
                      /
                      digest offset
-        pice together the left part and right part to get the raw message.
+        pice together the left part and right part to get the raw session.
      */
     fn cook_raw_message(
         &mut self,

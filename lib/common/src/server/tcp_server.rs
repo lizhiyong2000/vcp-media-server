@@ -62,22 +62,15 @@ where T: TcpSession + 'static
 
     async fn start(&mut self) -> Result<(), SessionError> {
         let listener = TcpListener::bind(self.socket_addr.clone()).await?;
-
         info!("{} server started listen at:{}", self.session_type(), self.socket_addr);
 
         loop {
-
             let (socket, remote_addr) = listener.accept().await?;
-
-            // let session_id = self.gen_session_id(remote_addr);
-
             if let Some(mut session) = self.session_alloc.new_tcp_session(socket, remote_addr){
                 info!("server received connection from :{}, session id:{}", remote_addr, session.id());
                 tokio::spawn(
                     async move {
-                        // let session = TcpSession::new(server, remote_addr, socket);
                         session.run().await;
-
                         info!("server end connection from :{}, session id:{}", remote_addr, session.id());
                     }
                 );

@@ -3,7 +3,7 @@ use {
         define::{msg_type_id, RtmpMessageData},
         errors::MessageError,
     },
-    crate::{
+    crate::message::{
         chunk::ChunkInfo,
         protocol_control_messages::reader::ProtocolControlMessageReader,
         user_control_messages::reader::EventMessagesReader,
@@ -134,8 +134,8 @@ impl MessageParser {
 mod tests {
 
     use super::MessageParser;
-    use crate::chunk::unpacketizer::ChunkUnpacketizer;
-    use crate::chunk::unpacketizer::UnpackResult;
+    use crate::message::chunk::unpacketizer::ChunkUnpacketizer;
+    use crate::message::chunk::unpacketizer::UnpackResult;
 
     #[test]
     fn test_message_parse() {

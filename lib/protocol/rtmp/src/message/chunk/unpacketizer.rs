@@ -1,15 +1,16 @@
-use {
-    super::{
-        define,
-        errors::{UnpackError},
-        ChunkBasicHeader, ChunkInfo, ChunkMessageHeader, ExtendTimestampType,
-    },
-    crate::messages::define::msg_type_id,
-    byteorder::{BigEndian, LittleEndian},
-    bytes::{BufMut, BytesMut},
-    vcp_media_common::bytesio::bytes_reader::BytesReader,
-    std::{cmp::min, collections::HashMap, fmt, vec::Vec},
+use super::{
+    define,
+    errors::UnpackError,
+    ChunkBasicHeader, ChunkInfo, ChunkMessageHeader, ExtendTimestampType,
 };
+use crate::message::messages::define::msg_type_id;
+use vcp_media_common::bytesio::bytes_reader::BytesReader;
+
+
+use byteorder::{BigEndian, LittleEndian};
+use bytes::{BufMut, BytesMut};
+use std::{cmp::min, collections::HashMap, fmt, vec::Vec};
+
 
 const PARSE_ERROR_NUMVER: usize = 5;
 
@@ -37,19 +38,19 @@ impl fmt::Display for ChunkReadState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ChunkReadState::ReadBasicHeader => {
-                write!(f, "ReadBasicHeader",)
+                write!(f, "ReadBasicHeader", )
             }
             ChunkReadState::ReadMessageHeader => {
-                write!(f, "ReadMessageHeader",)
+                write!(f, "ReadMessageHeader", )
             }
             ChunkReadState::ReadExtendedTimestamp => {
-                write!(f, "ReadExtendedTimestamp",)
+                write!(f, "ReadExtendedTimestamp", )
             }
             ChunkReadState::ReadMessagePayload => {
-                write!(f, "ReadMessagePayload",)
+                write!(f, "ReadMessagePayload", )
             }
             ChunkReadState::Finish => {
-                write!(f, "Finish",)
+                write!(f, "Finish", )
             }
         }
     }
@@ -68,12 +69,12 @@ pub struct ChunkUnpacketizer {
 
     //https://doc.rust-lang.org/stable/rust-by-example/scope/lifetime/fn.html
     //https://zhuanlan.zhihu.com/p/165976086
-    //We use this member to generate a complete message:
+    //We use this member to generate a complete session:
     // - basic_header:   the 2 fields will be updated from each chunk.
     // - message_header: whose fields need to be updated for current chunk
     //                   depends on the format id from basic header.
     //                   Each field can inherit the value from the previous chunk.
-    // - payload:        If the message's payload size is longger than the max chunk size,
+    // - payload:        If the session's payload size is longger than the max chunk size,
     //                   the whole payload will be splitted into several chunks.
     //
     pub current_chunk_info: ChunkInfo,
@@ -208,7 +209,7 @@ impl ChunkUnpacketizer {
      * 5.3.1.1. Chunk Basic Header
      * The Chunk Basic Header encodes the chunk stream ID and the chunk
      * type(represented by fmt field in the figure below). Chunk type
-     * determines the format of the encoded message header. Chunk Basic
+     * determines the format of the encoded session header. Chunk Basic
      * Header field may be 1, 2, or 3 bytes, depending on the chunk stream
      * ID.
      *
@@ -275,9 +276,9 @@ impl ChunkUnpacketizer {
         }
 
         //todo
-        //Only when the csid is changed, we restore the chunk message header
-        //One AV message may be splitted into serval chunks, the csid
-        //will be updated when one av message's chunks are completely
+        //Only when the csid is changed, we restore the chunk session header
+        //One AV session may be splitted into serval chunks, the csid
+        //will be updated when one av session's chunks are completely
         //sent/received??
         if csid != self.current_chunk_info.basic_header.chunk_stream_id {
             log::trace!(
@@ -287,8 +288,8 @@ impl ChunkUnpacketizer {
                 byte
             );
             //If the chunk stream id is changed, then we should
-            //restore the cached chunk message header used for
-            //getting the correct message header fields.
+            //restore the cached chunk session header used for
+            //getting the correct session header fields.
             match self.chunk_message_headers.get_mut(&csid) {
                 Some(header) => {
                     self.current_chunk_info.message_header = header.clone();
@@ -369,11 +370,11 @@ impl ChunkUnpacketizer {
              0                   1                   2                   3
              0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            |                timestamp(3bytes)              |message length |
+            |                timestamp(3bytes)              |session length |
             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            | message length (cont)(3bytes) |message type id| msg stream id |
+            | session length (cont)(3bytes) |session type id| msg stream id |
             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            |       message stream id (cont) (4bytes)       |
+            |       session stream id (cont) (4bytes)       |
             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
             *****************************************************************/
             0 => {
@@ -423,9 +424,9 @@ impl ChunkUnpacketizer {
              0                   1                   2                   3
              0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            |                timestamp(3bytes)              |message length |
+            |                timestamp(3bytes)              |session length |
             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-            | message length (cont)(3bytes) |message type id|
+            | session length (cont)(3bytes) |session type id|
             +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
             *****************************************************************/
             1 => {
@@ -457,7 +458,7 @@ impl ChunkUnpacketizer {
                             break;
                         }
                         _ => {
-                            log::error!("error happend when read chunk message header");
+                            log::error!("error happend when read chunk session header");
                             break;
                         }
                     }
@@ -529,7 +530,7 @@ impl ChunkUnpacketizer {
             let (cur_abs_timestamp, is_overflow) = timestamp.overflowing_add(timestamp_delta);
             if is_overflow {
                 log::warn!(
-                    "The current timestamp is overflow, current basic header: {:?}, current message header: {:?}, payload len: {}, abs timestamp: {}",
+                    "The current timestamp is overflow, current basic header: {:?}, current session header: {:?}, payload len: {}, abs timestamp: {}",
                     self.current_chunk_info.basic_header,
                     self.current_chunk_info.message_header,
                     self.current_chunk_info.payload.len(),
@@ -603,7 +604,6 @@ impl ChunkUnpacketizer {
 
 #[cfg(test)]
 mod tests {
-
     use super::ChunkInfo;
     use super::ChunkUnpacketizer;
     use super::UnpackResult;

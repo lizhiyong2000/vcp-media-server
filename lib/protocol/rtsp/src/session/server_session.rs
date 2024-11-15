@@ -2,13 +2,13 @@
 
 use super::define::rtsp_method_name;
 use super::errors::RtspSessionError;
-use crate::codec;
-use crate::codec::RtspCodecInfo;
-use crate::range::RtspRange;
-use crate::track::RtspTrack;
-use crate::track::TrackType;
-use crate::transport::ProtocolType;
-use crate::transport::RtspTransport;
+use crate::message::codec;
+use crate::message::codec::RtspCodecInfo;
+use crate::message::range::RtspRange;
+use crate::message::track::RtspTrack;
+use crate::message::track::TrackType;
+use crate::message::transport::ProtocolType;
+use crate::message::transport::RtspTransport;
 
 
 use async_trait::async_trait;
@@ -17,6 +17,7 @@ use bytes::BytesMut;
 use http;
 use log::info;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -69,13 +70,14 @@ impl InterleavedBinaryData {
 
 pub struct RTSPServerSession {
     id: String,
+    remote_addr: SocketAddr,
     io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
     reader: BytesReader,
     writer: AsyncBytesWriter,
 
     tracks: HashMap<TrackType, RtspTrack>,
     sdp: SessionDescription,
-    pub session_id: Option<Uuid>,
+    session_id: Option<Uuid>,
 
     // stream_handler: Arc<RtspStreamHandler>,
     // event_producer: StreamHubEventSender,
@@ -87,7 +89,7 @@ pub struct RTSPServerSession {
 #[async_trait]
 impl NetworkSession for RTSPServerSession {
     fn id(&self) -> String {
-        todo!()
+        return self.id.clone();
     }
 
     fn session_type() -> String {
@@ -95,22 +97,24 @@ impl NetworkSession for RTSPServerSession {
     }
 
     async fn run(&mut self) {
-        todo!()
+        if let Ok(res) = self.handle_session().await {
+            info!("{} session {} ended.", RTSPServerSession::session_type(), self.id())
+        }
     }
 }
 
-// #[async_trait]
 impl TcpSession for RTSPServerSession {
-    fn from_tcp_socket(sock: TcpStream) -> Self {
-        todo!()
+    fn from_tcp_socket(sock: TcpStream, remote: SocketAddr) -> Self {
+        let id = Uuid::new(RandomDigitCount::Zero).to_string();
+        Self::new(id, sock, remote)
     }
 }
-
 
 impl RTSPServerSession {
     pub fn new(
         id: String,
         stream: TcpStream,
+        remote: SocketAddr,
         // event_producer: StreamHubEventSender,
         // auth: Option<Auth>,
     ) -> Self {
@@ -125,12 +129,13 @@ impl RTSPServerSession {
         let io = Arc::new(Mutex::new(net_io));
 
         Self {
-            id: id,
+            id,
             io: io.clone(),
             reader: BytesReader::new(BytesMut::default()),
             writer: AsyncBytesWriter::new(io),
             tracks: HashMap::new(),
             sdp: SessionDescription::default(),
+            remote_addr: remote,
             session_id: None,
             // stream_handler: Arc::new(RtspStreamHandler::new()),
         }
@@ -191,10 +196,10 @@ impl RTSPServerSession {
         let data = self.reader.get_remaining_bytes();
 
 
-        log::debug!("received rtsp message data, length {}", data.len());
+        log::debug!("received rtsp session data, length {}", data.len());
 
         if let Ok(rtsp_request) = RtspRequest::unmarshal(std::str::from_utf8(&data)?) {
-            log::info!("received rtsp request message:{}", rtsp_request);
+            log::info!("received rtsp request session:{}", rtsp_request);
 
             self.reader.read_bytes(rtsp_request.origin_length);
 
@@ -230,7 +235,7 @@ impl RTSPServerSession {
                 _ => {}
             }
         } else {
-            log::debug!("not a valid rtsp request message");
+            log::debug!("not a valid rtsp request session");
             let data = self.io.lock().await.read().await?;
             self.reader.extend_from_slice(&data[..]);
         }

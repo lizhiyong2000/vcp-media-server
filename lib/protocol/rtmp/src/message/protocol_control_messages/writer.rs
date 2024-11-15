@@ -1,5 +1,5 @@
 use {
-    super::errors::ControlMessagesError, crate::messages::define::msg_type_id,
+    super::errors::ControlMessagesError, crate::message::messages::define::msg_type_id,
     byteorder::BigEndian, vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter,
 };
 

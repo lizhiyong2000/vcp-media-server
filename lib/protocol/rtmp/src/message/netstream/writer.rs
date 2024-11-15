@@ -1,6 +1,6 @@
 use {
     super::errors::NetStreamError,
-    crate::{
+    crate::message::{
         chunk::{define as chunk_define, packetizer::ChunkPacketizer, ChunkInfo},
         messages::define as messages_define,
     },

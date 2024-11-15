@@ -3,7 +3,6 @@ pub mod tcp_server;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use async_trait::async_trait;
-use std::error;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -24,17 +23,17 @@ pub trait NetworkSession : Send + Sync{
 
 
 pub trait TcpSession: NetworkSession{
-    fn session_type()->String{
-        return "TCP".to_string()
-    }
-    fn from_tcp_socket(sock: tokio::net::TcpStream) -> Self;
+    // fn session_type()->String{
+    //     return "TCP".to_string()
+    // }
+    fn from_tcp_socket(sock: tokio::net::TcpStream, remote: SocketAddr) -> Self;
 }
 
 pub trait UdpSession: NetworkSession{
-    fn session_type()->String{
-        return "UDP".to_string()
-    }
-    fn from_udp_socket(sock: tokio::net::UdpSocket) -> Self;
+    // fn session_type()->String{
+    //     return "UDP".to_string()
+    // }
+    fn from_udp_socket(sock: tokio::net::UdpSocket, remote: SocketAddr) -> Self;
 }
 
 
@@ -66,13 +65,13 @@ impl<T:NetworkSession> Default for SessionAlloc<T> {
 
 impl<T> SessionAlloc<T> where T: TcpSession{
     pub fn new_tcp_session(&self, sock: tokio::net::TcpStream, remote: SocketAddr) -> Option<T>{
-        return Some(T::from_tcp_socket(sock))
+        return Some(T::from_tcp_socket(sock, remote))
     }
 }
 
 impl<T> SessionAlloc<T> where T: UdpSession{
-    pub fn new_udp_session(&self, sock: tokio::net::UdpSocket) -> Option<T>{
-        return Some(T::from_udp_socket(sock))
+    pub fn new_udp_session(&self, sock: tokio::net::UdpSocket, remote: SocketAddr) -> Option<T>{
+        return Some(T::from_udp_socket(sock, remote))
     }
 }
 

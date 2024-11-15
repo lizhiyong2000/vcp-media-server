@@ -1,6 +1,6 @@
 use {
     super::errors::ProtocolControlMessageReaderError,
-    crate::messages::define::SetPeerBandwidthProperties, byteorder::BigEndian,
+    crate::message::messages::define::SetPeerBandwidthProperties, byteorder::BigEndian,
     vcp_media_common::bytesio::bytes_reader::BytesReader,
 };
 
