@@ -478,7 +478,7 @@ mod tests {
         a=rtpmap:97 rtx/90000\r\n\
         a=fmtp:97 apt=96\r\n";
 
-        if let Some(parser) = HttpRequest::unmarshal(request) {
+        if let Ok(parser) = HttpRequest::unmarshal(request) {
             println!(" parser: {parser:?}");
             let marshal_result = parser.marshal();
             print!("marshal result: =={marshal_result}==");
@@ -628,7 +628,7 @@ mod tests {
             println!("content length is : {l}");
         }
 
-        if let Some(parser) = HttpRequest::unmarshal(request) {
+        if let Ok(parser) = HttpRequest::unmarshal(request) {
             println!(" parser: {parser:?}");
             let marshal_result = parser.marshal();
             print!("marshal result: =={marshal_result}==");
@@ -690,7 +690,7 @@ mod tests {
         a=rtpmap:97 rtx/90000\r\n\
         a=fmtp:97 apt=96\r\n";
 
-        if let Some(parser) = HttpResponse::unmarshal(response) {
+        if let Ok(parser) = HttpResponse::unmarshal(response) {
             println!(" parser: {parser:?}");
             let marshal_result = parser.marshal();
             print!("marshal result: =={marshal_result}==");
@@ -755,7 +755,7 @@ mod tests {
         User-Agent: Lavf58.76.100\r\n\
         \r\n";
 
-        if let Some(parser) = HttpRequest::unmarshal(data1) {
+        if let Ok(parser) = HttpRequest::unmarshal(data1) {
             println!(" parser: {parser:?}");
             let marshal_result = parser.marshal();
             print!("marshal result: =={marshal_result}==");
@@ -785,7 +785,7 @@ mod tests {
         a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3; config=119056E500\r\n\
         a=control:streamid=1\r\n";
 
-        if let Some(parser) = HttpRequest::unmarshal(data2) {
+        if let Ok(parser) = HttpRequest::unmarshal(data2) {
             println!(" parser: {parser:?}");
             let marshal_result = parser.marshal();
             print!("marshal result: =={marshal_result}==");

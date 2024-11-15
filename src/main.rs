@@ -12,9 +12,11 @@ use log::{self, info};
 
 mod server;
 
-use server::tcp_server::{TcpServer, ServerType};
+// use server::tcp_server::{TcpServer, ServerType};
 use server::message_hub::MessageHub;
-
+use vcp_media_common::server::NetworkServer;
+use vcp_media_common::server::tcp_server::TcpServer;
+use vcp_media_rtsp::session::server_session::RTSPServerSession;
 use crate::server::EventSender;
 
 #[tokio::main]
@@ -28,15 +30,21 @@ async fn main() -> Result<()> {
     let es1 = event_sender.clone();
     let es2 = event_sender.clone();
 
-    tokio::spawn(async{
-        let rtsp_server = TcpServer::new(ServerType::RTSP, "0.0.0.0:8554".to_string(), es1);
-        rtsp_server.start().await;
-    }
-    );
+    // tokio::spawn(async{
+    //     let rtsp_server = TcpServer::new(ServerType::RTSP, "0.0.0.0:8554".to_string(), es1);
+    //     rtsp_server.start().await;
+    // }
+    // );
+    //
+    // tokio::spawn(async{
+    //     let rtmp_server = TcpServer::new(ServerType::RTMP, "0.0.0.0:1935".to_string(), es2);
+    //     rtmp_server.start().await;
+    // }
+    // );
 
     tokio::spawn(async{
-        let rtmp_server = TcpServer::new(ServerType::RTMP, "0.0.0.0:1935".to_string(), es2);
-        rtmp_server.start().await;
+        let mut rtsp_server: TcpServer<RTSPServerSession> = TcpServer::new("0.0.0.0:1935".to_string());
+        rtsp_server.start().await;
     }
     );
 

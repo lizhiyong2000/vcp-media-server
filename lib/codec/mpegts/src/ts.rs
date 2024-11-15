@@ -2,7 +2,7 @@ use {
     super::{
         define,
         define::{epat_pid, epes_stream_id, ts},
-        errors::{MpegTsError, MpegTsError},
+        errors::{MpegTsError},
         pat, pes,
         pes::PesMuxer,
         pmt, utils,
@@ -348,9 +348,7 @@ impl TsMuxer {
         //     pmt_index += 1;
         // }
 
-        Err(MpegTsError {
-            value: MpegTsError::StreamNotFound,
-        })
+        Err(MpegTsError::StreamNotFound)
     }
 
     pub fn add_stream(&mut self, codecid: u8, extra_data: BytesMut) -> Result<u16, MpegTsError> {
@@ -370,9 +368,7 @@ impl TsMuxer {
         let pmt = &mut self.pat.pmt[pmt_index];
 
         if pmt.streams.len() == 4 {
-            return Err(MpegTsError {
-                value: MpegTsError::StreamCountExeceed,
-            });
+            return Err(MpegTsError::StreamCountExeceed);
         }
 
         let mut cur_stream = pes::Pes::new(); //&mut pmt.streams[pmt.stream_count];
@@ -404,16 +400,12 @@ impl TsMuxer {
     pub fn add_program(&mut self, program_number: u16, info: BytesMut) -> Result<(), MpegTsError> {
         for cur_pmt in self.pat.pmt.iter() {
             if cur_pmt.program_number == program_number {
-                return Err(MpegTsError {
-                    value: MpegTsError::ProgramNumberExists,
-                });
+                return Err(MpegTsError::ProgramNumberExists);
             }
         }
 
         if self.pat.pmt.len() == 4 {
-            return Err(MpegTsError {
-                value: MpegTsError::PmtCountExeceed,
-            });
+            return Err( MpegTsError::PmtCountExeceed);
         }
         let mut cur_pmt = pmt::Pmt::new(); //&mut self.pat.pmt[self.pat.pmt_count];
 

@@ -17,21 +17,21 @@ pub enum SessionError {
 pub trait NetworkSession : Send + Sync{
 
     fn id(&self)->String;
-    fn session_type(&self)->String;
+    fn session_type()->String;
 
     async fn run(&mut self);
 }
 
 
 pub trait TcpSession: NetworkSession{
-    fn session_type(&self)->String{
+    fn session_type()->String{
         return "TCP".to_string()
     }
     fn from_tcp_socket(sock: tokio::net::TcpStream) -> Self;
 }
 
 pub trait UdpSession: NetworkSession{
-    fn session_type(&self)->String{
+    fn session_type()->String{
         return "UDP".to_string()
     }
     fn from_udp_socket(sock: tokio::net::UdpSocket) -> Self;
@@ -49,6 +49,10 @@ impl<T> SessionAlloc<T> where T: NetworkSession{
     // pub fn new() -> Self{
     //     return SessionAlloc
     // }
+    
+    pub fn session_type(&self) -> String{
+        return T::session_type();
+    }
 }
 
 impl<T:NetworkSession> Default for SessionAlloc<T> {

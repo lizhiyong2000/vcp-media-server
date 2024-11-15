@@ -8,13 +8,13 @@ use {
 #[derive(Debug, Error)]
 pub enum MpegTsError {
     #[error("bytes read error")]
-    BytesReadError(BytesReadError),
+    BytesReadError(#[from] BytesReadError),
 
     #[error("bytes write error")]
-    BytesWriteError(BytesWriteError),
+    BytesWriteError(#[from] BytesWriteError),
 
     #[error("io error")]
-    IOError(Error),
+    IOError(#[from] Error),
 
     #[error("program number exists")]
     ProgramNumberExists,
@@ -28,47 +28,4 @@ pub enum MpegTsError {
     #[error("stream not found")]
     StreamNotFound,
 }
-#[derive(Debug)]
-pub struct MpegTsError {
-    pub value: MpegTsError,
-}
 
-impl From<BytesReadError> for MpegTsError {
-    fn from(error: BytesReadError) -> Self {
-        MpegTsError {
-            value: MpegTsError::BytesReadError(error),
-        }
-    }
-}
-
-impl From<BytesWriteError> for MpegTsError {
-    fn from(error: BytesWriteError) -> Self {
-        MpegTsError {
-            value: MpegTsError::BytesWriteError(error),
-        }
-    }
-}
-
-impl From<Error> for MpegTsError {
-    fn from(error: Error) -> Self {
-        MpegTsError {
-            value: MpegTsError::IOError(error),
-        }
-    }
-}
-
-impl fmt::Display for MpegTsError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(&self.value, f)
-    }
-}
-
-impl Fail for MpegTsError {
-    fn cause(&self) -> Option<&dyn Fail> {
-        self.value.cause()
-    }
-
-    fn backtrace(&self) -> Option<&Backtrace> {
-        self.value.backtrace()
-    }
-}

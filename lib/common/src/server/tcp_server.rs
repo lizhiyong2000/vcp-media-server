@@ -37,6 +37,15 @@ where T: TcpSession
     }
 }
 
+
+impl<T>  TcpServer<T>
+where T: TcpSession + 'static
+{
+    pub fn session_type(&self) -> String {
+        return self.session_alloc.session_type()
+    }
+}
+
 #[async_trait]
 impl<'a, T> NetworkServer<'a, T> for TcpServer<T>
 where T: TcpSession + 'static
@@ -54,7 +63,7 @@ where T: TcpSession + 'static
     async fn start(&mut self) -> Result<(), SessionError> {
         let listener = TcpListener::bind(self.socket_addr.clone()).await?;
 
-        info!("server started listen at:{}", self.socket_addr);
+        info!("{} server started listen at:{}", self.session_type(), self.socket_addr);
 
         loop {
 

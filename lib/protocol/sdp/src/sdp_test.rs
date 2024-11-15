@@ -32,7 +32,7 @@ m=application 42508 RTP/AVP 107\r\n
 b=AS:8\r\n";
 
 
-    if let Some(sdp) = SessionDescription::unmarshal(data2) {
+    if let Ok(sdp) = SessionDescription::unmarshal(data2) {
         print!("sdp str : {}", sdp.marshal());
         
     }else {
@@ -73,7 +73,7 @@ m=application 42508 RTP/AVP 107\r\n
 b=AS:8\r\n";
 
 
-    if let Some(sdp) = SessionDescription::unmarshal(data2) {
+    if let Ok(sdp) = SessionDescription::unmarshal(data2) {
         // println!("sdp : {sdp:?}");
         print!("sdp str : {}", sdp.marshal());
     }

@@ -1,74 +1,41 @@
-
 // use super::rtsp_codec;
 
-
-use byteorder::BigEndian;
-use bytes::BytesMut;
-
-
-use vcp_media_common::Marshal;
-use vcp_media_common::Unmarshal;
-use vcp_media_common::bytesio::bytesio::TNetIO;
-use vcp_media_common::bytesio::bytesio::TcpIO;
-
-
-use vcp_media_common::Marshal as RtpMarshal;
-use vcp_media_rtp::RtpPacket;
-use crate::range::RtspRange;
-
-
-use vcp_media_sdp::SessionDescription;
-
+use super::define::rtsp_method_name;
+use super::errors::RtspSessionError;
 use crate::codec;
 use crate::codec::RtspCodecInfo;
+use crate::range::RtspRange;
 use crate::track::RtspTrack;
 use crate::track::TrackType;
 use crate::transport::ProtocolType;
 use crate::transport::RtspTransport;
 
-use vcp_media_common::http::HttpRequest as RtspRequest;
-use vcp_media_common::http::HttpResponse as RtspResponse;
-
-use vcp_media_common::bytesio::bytes_reader::BytesReader;
-use vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter;
-
-
-use vcp_media_common::bytesio::bytesio::UdpIO;
-use super::errors::{RtspSessionError};
-
-use http;
-// use streamhub::define::DataSender;
-// use streamhub::define::MediaInfo;
-// use streamhub::define::VideoCodecType;
-
 
 use async_trait::async_trait;
-
-use super::define::rtsp_method_name;
-
+use byteorder::BigEndian;
+use bytes::BytesMut;
+use http;
+use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-use vcp_media_common::uuid::{Uuid, RandomDigitCount};
-
-// use vcp_media_common::auth::Auth;
-// use streamhub::{
-//     define::{
-//         FrameData, Information, InformationSender, NotifyInfo, PublishType, PublisherInfo,
-//         StreamHubEvent, StreamHubEventSender, SubscribeType, SubscriberInfo, TStreamHandler,
-//     },
-//     errors::{ChannelError, ChannelError},
-//     statistics::StreamStatistics,
-//     stream::StreamIdentifier,
-//     utils::{RandomDigitCount, Uuid},
-// };
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use vcp_media_common::bytesio::bytes_reader::BytesReader;
+use vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter;
+use vcp_media_common::bytesio::bytesio::TNetIO;
+use vcp_media_common::bytesio::bytesio::TcpIO;
+use vcp_media_common::bytesio::bytesio::UdpIO;
+use vcp_media_common::http::HttpRequest as RtspRequest;
+use vcp_media_common::http::HttpResponse as RtspResponse;
 use vcp_media_common::server::NetworkSession;
-
-use log::info;
 use vcp_media_common::server::TcpSession;
+use vcp_media_common::uuid::{RandomDigitCount, Uuid};
+use vcp_media_common::Marshal;
+use vcp_media_common::Marshal as RtpMarshal;
+use vcp_media_common::Unmarshal;
+use vcp_media_rtp::RtpPacket;
+use vcp_media_sdp::SessionDescription;
 
 pub struct InterleavedBinaryData {
     channel_identifier: u8,
@@ -100,8 +67,7 @@ impl InterleavedBinaryData {
 }
 
 
-
-pub struct RTSPServerSession{
+pub struct RTSPServerSession {
     id: String,
     io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
     reader: BytesReader,
@@ -124,8 +90,8 @@ impl NetworkSession for RTSPServerSession {
         todo!()
     }
 
-    fn session_type(&self) -> String {
-        todo!()
+    fn session_type() -> String {
+        return "RTSP".to_string()
     }
 
     async fn run(&mut self) {
@@ -134,16 +100,7 @@ impl NetworkSession for RTSPServerSession {
 }
 
 // #[async_trait]
-impl TcpSession for RTSPServerSession{
-    // async fn run(&mut self) {
-    //     info!("RTSPServerSession");
-    //     self.handle_session().await;
-    // }
-    //
-    // fn get_id(&self)->&String {
-    //     return &self.id;
-    // }
-
+impl TcpSession for RTSPServerSession {
     fn from_tcp_socket(sock: TcpStream) -> Self {
         todo!()
     }
@@ -152,7 +109,7 @@ impl TcpSession for RTSPServerSession{
 
 impl RTSPServerSession {
     pub fn new(
-        id:String,
+        id: String,
         stream: TcpStream,
         // event_producer: StreamHubEventSender,
         // auth: Option<Auth>,
@@ -272,7 +229,7 @@ impl RTSPServerSession {
 
                 _ => {}
             }
-        } else{
+        } else {
             log::debug!("not a valid rtsp request message");
             let data = self.io.lock().await.read().await?;
             self.reader.extend_from_slice(&data[..]);
@@ -562,32 +519,32 @@ impl RTSPServerSession {
         // loop {
         //     if let Some(frame_data) = receiver.recv().await {
         //         match frame_data {
-                //     FrameData::Audio {
-                //         timestamp,
-                //         mut data,
-                //     } => {
-                //         if let Some(audio_track) = self.tracks.get_mut(&TrackType::Audio) {
-                //             audio_track
-                //                 .rtp_channel
-                //                 .lock()
-                //                 .await
-                //                 .on_frame(&mut data, timestamp)
-                //                 .await?;
-                //         }
-                //     }
-                //     FrameData::Video {
-                //         timestamp,
-                //         mut data,
-                //     } => {
-                //         if let Some(video_track) = self.tracks.get_mut(&TrackType::Video) {
-                //             video_track
-                //                 .rtp_channel
-                //                 .lock()
-                //                 .await
-                //                 .on_frame(&mut data, timestamp)
-                //                 .await?;
-                //         }
-                //     }
+        //     FrameData::Audio {
+        //         timestamp,
+        //         mut data,
+        //     } => {
+        //         if let Some(audio_track) = self.tracks.get_mut(&TrackType::Audio) {
+        //             audio_track
+        //                 .rtp_channel
+        //                 .lock()
+        //                 .await
+        //                 .on_frame(&mut data, timestamp)
+        //                 .await?;
+        //         }
+        //     }
+        //     FrameData::Video {
+        //         timestamp,
+        //         mut data,
+        //     } => {
+        //         if let Some(video_track) = self.tracks.get_mut(&TrackType::Video) {
+        //             video_track
+        //                 .rtp_channel
+        //                 .lock()
+        //                 .await
+        //                 .on_frame(&mut data, timestamp)
+        //                 .await?;
+        //         }
+        //     }
         //             _ => {}
         //         }
         //     } else {
@@ -641,8 +598,6 @@ impl RTSPServerSession {
         }
 
         Err(RtspSessionError::RecordRangeError)
-
-
     }
 
     fn handle_teardown(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
@@ -678,7 +633,7 @@ impl RTSPServerSession {
         for media in &self.sdp.medias {
             let media_control = media.get_control();
 
-            if let Some(rtpmap) = &media.rtpmap{
+            if let Some(rtpmap) = &media.rtpmap {
                 let media_name = &media.media_type;
                 log::info!("media_name: {}", media_name);
                 match media_name.as_str() {
@@ -716,7 +671,6 @@ impl RTSPServerSession {
                     _ => {}
                 }
             }
-
         }
         Ok(())
     }
@@ -781,7 +735,6 @@ impl RTSPServerSession {
     // }
 
     async fn send_response(&mut self, response: &RtspResponse) -> Result<(), RtspSessionError> {
-
         log::debug!("send response:==========================\n{}=============", response);
 
         self.writer.write(response.marshal().as_bytes())?;

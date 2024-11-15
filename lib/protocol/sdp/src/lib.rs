@@ -772,7 +772,7 @@ mod tests {
         // a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3; config=119056E500：音频流的格式参数，如编码方式、采样长度、索引长度等。
         // a=control:streamid=1：指定音频流的流ID。
 
-        if let Some(sdp) = SessionDescription::unmarshal(data2) {
+        if let Ok(sdp) = SessionDescription::unmarshal(data2) {
             println!("sdp : {sdp:?}");
 
             println!("sdp str : {}", sdp.marshal());
