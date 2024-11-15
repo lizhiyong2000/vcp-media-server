@@ -27,29 +27,8 @@ async fn main() -> Result<()> {
     let es1 = event_sender.clone();
     let es2 = event_sender.clone();
 
-    tokio::spawn(
-        async {
-            let mut rtsp_server: TcpServer<RTSPServerSession> = TcpServer::new("0.0.0.0:8554".to_string());
-            if let Ok(res) = rtsp_server.start().await{
-                info!("{} server end running.", rtsp_server.session_type());
-            }else {
-                info!("{} server failed to run!", rtsp_server.session_type());
-            }
-        }
-    );
 
-    tokio::spawn(
-        async {
-            let mut rtmp_server: TcpServer<RTMPServerSession> = TcpServer::new("0.0.0.0:1935".to_string());
-            if let Ok(res) = rtmp_server.start().await{
-                info!("{} server end running.", rtmp_server.session_type());
-            }else {
-                info!("{} server failed to run!", rtmp_server.session_type());
-            }
-        }
-    );
-
-    let manager = ServiceManager::new("./config.toml");
+    let manager:ServiceManager = ServiceManager::new("./config.toml");
     manager.start_service().await;
 
 
