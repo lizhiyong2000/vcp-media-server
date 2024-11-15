@@ -7,7 +7,7 @@ use vcp_media_common::log::logger;
 use vcp_media_common::server::tcp_server::TcpServer;
 use vcp_media_common::server::NetworkServer;
 use vcp_media_common::Result;
-use vcp_media_rtmp::session::rtmp_session::RTMPServerSession;
+use vcp_media_rtmp::session::server_session::RTMPServerSession;
 use vcp_media_rtsp::session::server_session::RTSPServerSession;
 
 use log::{self, info};
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
 
     tokio::spawn(
         async {
-            let mut rtmp_server: TcpServer<RTMPServerSession> = TcpServer::new("0.0.0.0:8554".to_string());
+            let mut rtmp_server: TcpServer<RTMPServerSession> = TcpServer::new("0.0.0.0:1935".to_string());
             if let Ok(res) = rtmp_server.start().await{
                 info!("{} server end running.", rtmp_server.session_type());
             }else {

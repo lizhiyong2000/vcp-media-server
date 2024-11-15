@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use byteorder::BigEndian;
 use bytes::BytesMut;
 use http;
-use log::info;
+use log::{error, info};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -93,12 +93,16 @@ impl NetworkSession for RTSPServerSession {
     }
 
     fn session_type() -> String {
-        return "RTSP".to_string()
+        return "RTSP".to_string();
     }
 
     async fn run(&mut self) {
-        if let Ok(res) = self.handle_session().await {
-            info!("{} session {} ended.", RTSPServerSession::session_type(), self.id())
+        let res = self.handle_session().await;
+        match res{
+            Ok(_) => info!("{} session {} ended.", RTSPServerSession::session_type(), self.id()),
+            Err(e) => {
+                error!("{} session {} error:{}", RTSPServerSession::session_type(), self.id(), e)
+            }
         }
     }
 }
@@ -199,8 +203,7 @@ impl RTSPServerSession {
         log::debug!("received rtsp session data, length {}", data.len());
 
         if let Ok(rtsp_request) = RtspRequest::unmarshal(std::str::from_utf8(&data)?) {
-            log::info!("received rtsp request session:{}", rtsp_request);
-
+            info!("received rtsp request session:{}", rtsp_request);
             self.reader.read_bytes(rtsp_request.origin_length);
 
             match rtsp_request.method.as_str() {
@@ -235,7 +238,7 @@ impl RTSPServerSession {
                 _ => {}
             }
         } else {
-            log::debug!("not a valid rtsp request session");
+            log::debug!("not a valid rtsp request message");
             let data = self.io.lock().await.read().await?;
             self.reader.extend_from_slice(&data[..]);
         }
@@ -670,6 +673,9 @@ impl RTSPServerSession {
                             sample_rate: rtpmap.clock_rate,
                             ..Default::default()
                         };
+
+                        log::info!("video codec info: {:?}", codec_info);
+
                         let track = RtspTrack::new(TrackType::Video, codec_info, media_control);
                         self.tracks.insert(TrackType::Video, track);
                     }
@@ -740,7 +746,7 @@ impl RTSPServerSession {
     // }
 
     async fn send_response(&mut self, response: &RtspResponse) -> Result<(), RtspSessionError> {
-        log::debug!("send response:==========================\n{}=============", response);
+        info!("send response:==========================\n{}=============", response);
 
         self.writer.write(response.marshal().as_bytes())?;
         self.writer.flush().await?;

@@ -4,7 +4,6 @@ use {
     vcp_media_common::bytesio::{bytes_errors::BytesWriteError, bytesio_errors::BytesIOError},
     // crate::common::errors::AuthError,
     thiserror::Error,
-    std::fmt,
     std::str::Utf8Error,
     // streamhub::errors::ChannelError,
     tokio::sync::oneshot::error::RecvError,
