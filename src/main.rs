@@ -1,5 +1,6 @@
 mod common;
 mod server;
+mod manager;
 
 use crate::server::message_hub::MessageHub;
 use crate::server::EventSender;
@@ -13,7 +14,7 @@ use vcp_media_rtsp::session::server_session::RTSPServerSession;
 use log::{self, info};
 use std::sync::Arc;
 use tokio::signal;
-
+use crate::manager::service::ServiceManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,6 +48,9 @@ async fn main() -> Result<()> {
             }
         }
     );
+
+    let manager = ServiceManager::new("./config.toml");
+    manager.start_service().await;
 
 
     signal::ctrl_c().await?;

@@ -26,7 +26,7 @@ anyhow = "1.0.91"
 thiserror = "1.0.65"
 byteorder = "1.5.0"
 serde_derive = "1.0"
-serde = { version = "1.0.101", optional = true, features = ["derive"] }
+serde = { version = "1.0.101", features = ["std", "derive"] }
 tokio = { version = "1.26.0", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3.18"
@@ -44,3 +44,7 @@ hex = "0.4.3"
 indexmap = "2.2.6"
 md5 = "0.7.0"
 http = "1.1.0"
+axum = "0.7.7"
+
+#[features]
+#serde = ["dep:serde"]
