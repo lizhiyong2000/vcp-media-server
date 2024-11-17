@@ -2,6 +2,7 @@ pub mod tcp_server;
 
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -11,12 +12,16 @@ pub enum SessionError {
     SocketIOError(#[from] std::io::Error),
 }
 
+pub trait ServerSessionHandler{}
+
 
 #[async_trait]
 pub trait NetworkSession : Send + Sync{
 
     fn id(&self)->String;
-    fn session_type()->String;
+    fn session_type(&self)->String;
+
+    // fn set_handler(&mut self, handler: Box<dyn ServerSessionHandler>);
 
     async fn run(&mut self);
 }
@@ -27,6 +32,11 @@ pub trait TcpSession: NetworkSession{
     //     return "TCP".to_string()
     // }
     fn from_tcp_socket(sock: tokio::net::TcpStream, remote: SocketAddr) -> Self;
+}
+
+#[async_trait]
+pub trait ServerHandler :Send+Sync {
+    async fn on_session_created(&mut self, session: &mut Box<dyn NetworkSession>) -> Result<(), SessionError>;
 }
 
 pub trait UdpSession: NetworkSession{
@@ -49,9 +59,9 @@ impl<T> SessionAlloc<T> where T: NetworkSession{
     //     return SessionAlloc
     // }
     
-    pub fn session_type(&self) -> String{
-        return T::session_type();
-    }
+    // pub fn session_type(&self) -> String{
+    //     return T::session_type();
+    // }
 }
 
 impl<T:NetworkSession> Default for SessionAlloc<T> {
@@ -88,7 +98,7 @@ where SessionType: NetworkSession
 pub trait NetworkServer<'a, T> : SessionManager<T>
 where T: TcpSession + 'static
 {
-    fn new(address: String) -> Self;
+    fn new(address: String, handler: Option<Box<dyn ServerHandler>>) -> Self;
     async fn start(&mut self) -> Result<(), SessionError>;
 
 }

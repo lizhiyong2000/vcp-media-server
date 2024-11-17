@@ -5,6 +5,7 @@ use vcp_media_common::server::tcp_server::TcpServer;
 use vcp_media_common::server::NetworkServer;
 use vcp_media_rtmp::session::server_session::RTMPServerSession;
 use vcp_media_rtsp::session::server_session::RTSPServerSession;
+use crate::server::rtsp_server::RtspServer;
 
 pub struct ServiceManager {
     config: Config,
@@ -20,7 +21,7 @@ impl ServiceManager {
         return ServiceManager { config: cfg };
     }
 
-    pub async fn start_service(&self) {
+    pub async fn start_service(&mut self) {
         tokio::spawn(async {
             Self::start_api_service("0.0.0.0:3000".to_string()).await;
         });
@@ -49,7 +50,7 @@ impl ServiceManager {
     }
 
     async fn start_rtsp_service(addr: String) {
-        let mut rtsp_server: TcpServer<RTSPServerSession> = TcpServer::new(addr);
+        let mut rtsp_server = RtspServer::new(addr);
         let res = rtsp_server.start().await;
         match res {
             Ok(_) => info!("{} server end running.", rtsp_server.session_type()),
@@ -58,7 +59,7 @@ impl ServiceManager {
     }
 
     async fn start_rtmp_service(addr: String) {
-        let mut rtmp_server: TcpServer<RTMPServerSession> = TcpServer::new(addr);
+        let mut rtmp_server: TcpServer<RTMPServerSession> = TcpServer::new(addr, None);
         let res = rtmp_server.start().await;
         match res {
             Ok(_) => info!("{} server end running.", rtmp_server.session_type()),

@@ -44,5 +44,8 @@ pub enum RtspSessionError {
 
     #[error("RecordRangeError")]
     RecordRangeError,
+
+    #[error("NoHandlerError")]
+    NoSessionHandlerError,
 }
 

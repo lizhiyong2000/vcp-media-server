@@ -11,7 +11,7 @@ use crate::session::errors::SessionError;
 use vcp_media_common::bytesio::bytes_reader::BytesReader;
 use vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter;
 use vcp_media_common::bytesio::bytesio::{TNetIO, TcpIO};
-use vcp_media_common::server::{tcp_server, NetworkSession, TcpSession};
+use vcp_media_common::server::{tcp_server, NetworkSession, ServerSessionHandler, TcpSession};
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
 use vcp_media_flv::amf0::Amf0ValueType;
 
@@ -70,16 +70,20 @@ impl NetworkSession for RTMPServerSession {
         return self.id.clone();
     }
 
-    fn session_type() -> String {
+    fn session_type(&self) -> String {
         return "RTMP".to_string();
     }
+
+    // fn set_handler(&mut self, handler: Box<dyn ServerSessionHandler>) {
+    //     todo!()
+    // }
 
     async fn run(&mut self) {
         let res = self.handle_session().await;
         match res {
-            Ok(_) => info!("{} session {} ended.", RTMPServerSession::session_type(), self.id()),
+            Ok(_) => info!("{} session {} ended.", self.session_type(), self.id()),
             Err(e) => {
-                error!("{} session {} error:{}", RTMPServerSession::session_type(), self.id(), e)
+                error!("{} session {} error:{}", self.session_type(), self.id(), e)
             }
         }
     }
