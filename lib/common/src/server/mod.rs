@@ -21,7 +21,7 @@ pub trait ServerSessionHandler{
 pub trait NetworkSession : Send + Sync{
 
     fn id(&self)->String;
-    fn session_type(&self)->String;
+    fn session_type()->String;
     async fn run(&mut self);
 }
 

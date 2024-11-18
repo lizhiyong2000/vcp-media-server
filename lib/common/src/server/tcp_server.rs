@@ -42,7 +42,7 @@ impl<T>  TcpServer<T>
 where T: TcpSession + 'static
 {
     pub fn session_type(&self) -> String {
-        return "".to_string();
+        return T::session_type();
     }
 
     pub async fn notify_session_created(&self, session: Arc<Box<T>>){

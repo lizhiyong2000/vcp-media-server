@@ -70,7 +70,7 @@ impl NetworkSession for RTMPServerSession {
         return self.id.clone();
     }
 
-    fn session_type(&self) -> String {
+    fn session_type() -> String {
         return "RTMP".to_string();
     }
 
@@ -81,9 +81,9 @@ impl NetworkSession for RTMPServerSession {
     async fn run(&mut self) {
         let res = self.handle_session().await;
         match res {
-            Ok(_) => info!("{} session {} ended.", self.session_type(), self.id()),
+            Ok(_) => info!("{} session {} ended.", Self::session_type(), self.id()),
             Err(e) => {
-                error!("{} session {} error:{}", self.session_type(), self.id(), e)
+                error!("{} session {} error:{}", Self::session_type(), self.id(), e)
             }
         }
     }
