@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc};
 use async_trait::async_trait;
@@ -14,11 +16,11 @@ use vcp_media_rtsp::message::range::RtspRange;
 use vcp_media_rtsp::message::transport::{ProtocolType, RtspTransport};
 use vcp_media_rtsp::session::define::rtsp_method_name;
 use vcp_media_rtsp::session::errors::RtspSessionError;
-use vcp_media_rtsp::session::server_session::{RTSPServerSession, RtspServerSessionHandler};
+use vcp_media_rtsp::session::server_session::{RTSPServerSession, RTSPServerSessionContext, RtspServerSessionHandler};
 
 use vcp_media_common::http::HttpRequest as RtspRequest;
 use vcp_media_common::http::HttpResponse as RtspResponse;
-use vcp_media_common::server::{NetworkServer, NetworkSession, ServerHandler, SessionError};
+use vcp_media_common::server::{NetworkServer, NetworkSession, TcpServerHandler, SessionError, TcpSession};
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
 use vcp_media_rtsp::message::codec;
 use vcp_media_rtsp::message::codec::RtspCodecInfo;
@@ -26,57 +28,17 @@ use vcp_media_rtsp::message::track::{RtspTrack, TrackType};
 use vcp_media_sdp::SessionDescription;
 
 
-pub struct RtspServerHandler;
-#[async_trait]
-impl ServerHandler for RtspServerHandler {
-    async fn on_session_created(&mut self, session_id: String) -> Result<(), SessionError> {
-        info!("Session {} created", session_id);
-        Ok(())
-    }
-}
-
-
-pub struct RtspServer {
-    tcp_server: TcpServer<RTSPServerSession>,
-}
-
-
-impl RtspServer {
-    pub fn new(addr:String) -> Self{
-        let server_handler = Box::new(
-            RtspServerHandler
-        );
-        let mut rtsp_server: TcpServer<RTSPServerSession> = TcpServer::new(addr, Some(server_handler));
-
-        let res = Self{
-            tcp_server: rtsp_server,
-        };
-        res
-
-    }
-
-    pub fn session_type(&self) -> String{
-        self.tcp_server.session_type()
-    }
-
-    pub async fn start(&mut self) -> Result<(), SessionError> {
-        self.tcp_server.start().await
-    }
-}
-
-
-
 pub struct VcpRtspServerSessionHandler {
-    session: Arc<Mutex<RTSPServerSession>>,
+    // session: Option<Arc<Mutex<RTSPServerSession>>>,
     tracks: HashMap<TrackType, RtspTrack>,
     sdp: SessionDescription,
     session_id: Option<Uuid>,
 }
 impl VcpRtspServerSessionHandler {
 
-    pub fn new(session: Arc<Mutex<RTSPServerSession>> ) -> Self {
+    pub fn new() -> Self {
         Self{
-            session,
+            // session:None,
             tracks: HashMap::new(),
             sdp: SessionDescription::default(),
             session_id: None,
@@ -159,9 +121,10 @@ impl VcpRtspServerSessionHandler {
     //     self.session.lock().get_io()
     // }
 
-    pub async fn send_response(&mut self, response: &RtspResponse) -> Result<(), RtspSessionError> {
-        self.session.lock().await.send_response(response).await
-    }
+    // pub async fn send_response(&mut self, response: &RtspResponse) -> Result<(), RtspSessionError> {
+    //     // if let Some(session) = self.session.unwrap().lock();
+    //     self.session.unwrap().lock().await.send_response(response).await
+    // }
 
     pub fn unsubscribe_from_stream_hub(&mut self, _stream_path: String) -> Result<(), RtspSessionError> {
         // let identifier = StreamIdentifier::Rtsp { stream_path };
@@ -180,17 +143,17 @@ impl VcpRtspServerSessionHandler {
 
 #[async_trait]
 impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
-    async fn handle_options(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
+    async fn handle_options(&mut self, session: &mut RTSPServerSessionContext,rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let status_code = http::StatusCode::OK;
         let mut response = Self::gen_response(status_code, rtsp_request);
         let public_str = rtsp_method_name::ARRAY.join(",");
         response.headers.insert("Public".to_string(), public_str);
-        self.send_response(&response).await?;
+        session.send_response(&response).await?;
 
         Ok(())
     }
 
-    async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
+    async fn handle_describe(&mut self, session: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let status_code = http::StatusCode::OK;
 
         // The sender is used for sending sdp information from the server session to client session
@@ -225,12 +188,12 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         response
             .headers
             .insert("Content-Type".to_string(), "application/sdp".to_string());
-        self.send_response(&response).await?;
+        session.send_response(&response).await?;
 
         Ok(())
     }
 
-    async fn handle_announce(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
+    async fn handle_announce(&mut self, session: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         // if let Some(auth) = &self.auth {
         //     let stream_name = rtsp_request.uri.path.clone();
         //     auth.authenticate(&stream_name, &rtsp_request.uri.query, false)?;
@@ -289,12 +252,12 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
 
         let status_code = http::StatusCode::OK;
         let response = Self::gen_response(status_code, rtsp_request);
-        self.send_response(&response).await?;
+        session.send_response(&response).await?;
 
         Ok(())
     }
 
-    async fn handle_setup(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
+    async fn handle_setup(&mut self, session: &mut RTSPServerSessionContext,rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let status_code = http::StatusCode::OK;
         let mut response = Self::gen_response(status_code, rtsp_request);
 
@@ -318,7 +281,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
                         ProtocolType::TCP => {
                             // track.create_packer(self.io.clone()).await;
 
-                            let io = self.session.lock().await.get_io();
+                            let io = session.get_io();
 
                             track.create_packer(io).await;
 
@@ -381,12 +344,12 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
             break;
         }
 
-        self.send_response(&response).await?;
+        session.send_response(&response).await?;
 
         Ok(())
     }
 
-    async fn handle_play(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
+    async fn handle_play(&mut self, session: &mut RTSPServerSessionContext,rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         // if let Some(auth) = &self.auth {
         //     let stream_name = rtsp_request.uri.path.clone();
         //     auth.authenticate(&stream_name, &rtsp_request.uri.query, true)?;
@@ -440,7 +403,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         let status_code = http::StatusCode::OK;
         let response = Self::gen_response(status_code, rtsp_request);
 
-        self.send_response(&response).await?;
+        session.send_response(&response).await?;
 
         Ok(())
 
@@ -511,7 +474,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
     }
 
 
-    async fn handle_record(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
+    async fn handle_record(&mut self, session: &mut RTSPServerSessionContext,rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         if let Some(range_str) = rtsp_request.headers.get(&String::from("Range")) {
             if let Ok(range) = RtspRange::unmarshal(range_str) {
                 let status_code = http::StatusCode::OK;
@@ -523,7 +486,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
                     .headers
                     .insert("Session".to_string(), self.session_id.unwrap().to_string());
 
-                self.send_response(&response).await?;
+                session.send_response(&response).await?;
 
                 return Ok(());
             } else {
@@ -534,7 +497,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         Err(RtspSessionError::RecordRangeError)
     }
 
-    async fn handle_teardown(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
+    async fn handle_teardown(&mut self, session: &mut RTSPServerSessionContext,rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let _stream_path = &rtsp_request.uri.path;
         // let unpublish_event = StreamHubEvent::UnPublish {
         //     identifier: StreamIdentifier::Rtsp {
@@ -564,6 +527,66 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
     }
 
 }
+
+pub struct RtspServerHandler{
+}
+
+impl RtspServerHandler
+{
+    pub fn new() -> Self {
+        Self{}
+    }
+}
+
+#[async_trait]
+impl TcpServerHandler<RTSPServerSession> for RtspServerHandler
+{
+    async fn on_create_session(&mut self, sock: tokio::net::TcpStream, remote: SocketAddr) -> Result<RTSPServerSession, SessionError> {
+        // info!("Session {} created", session_id);
+        let id = Uuid::new(RandomDigitCount::Zero).to_string();
+
+        Ok(RTSPServerSession::new(id, sock, remote, Some(Box::new(VcpRtspServerSessionHandler::new()))))
+    }
+
+    async fn on_session_created(&mut self, session_id: String) -> Result<(), SessionError> {
+        info!("Session {} created", session_id);
+        Ok(())
+    }
+
+}
+
+
+pub struct RtspServer {
+    tcp_server: TcpServer<RTSPServerSession>,
+}
+
+
+impl RtspServer {
+    pub fn new(addr:String) -> Self{
+        let server_handler = Box::new(
+            RtspServerHandler::new()
+        );
+        let mut rtsp_server: TcpServer<RTSPServerSession> = TcpServer::new(addr, Some(server_handler));
+
+        let res = Self{
+            tcp_server: rtsp_server,
+        };
+        res
+
+    }
+
+    pub fn session_type(&self) -> String{
+        self.tcp_server.session_type()
+    }
+
+    pub async fn start(&mut self) -> Result<(), SessionError> {
+        self.tcp_server.start().await
+    }
+}
+
+
+
+
 
 
 // fn get_subscriber_info(&mut self) -> SubscriberInfo {

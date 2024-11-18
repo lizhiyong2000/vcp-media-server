@@ -36,8 +36,11 @@ pub trait TcpSession: NetworkSession{
 }
 
 #[async_trait]
-pub trait ServerHandler :Send+Sync {
+pub trait TcpServerHandler<SessionType>:Send+Sync
+where SessionType:TcpSession{
+    async fn on_create_session(&mut self, sock: tokio::net::TcpStream, remote: SocketAddr) -> Result<SessionType, SessionError>;
     async fn on_session_created(&mut self, session_id:String) -> Result<(), SessionError>;
+
 }
 
 pub trait UdpSession: NetworkSession{
@@ -99,7 +102,7 @@ where SessionType: NetworkSession
 pub trait NetworkServer<'a, T> : SessionManager<T>
 where T: TcpSession + 'static
 {
-    fn new(address: String, handler: Option<Box<dyn ServerHandler>>) -> Self;
+    fn new(address: String, handler: Option<Box<dyn TcpServerHandler<T>>>) -> Self;
     async fn start(&mut self) -> Result<(), SessionError>;
 
 }
