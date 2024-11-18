@@ -5,11 +5,12 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc};
 use async_trait::async_trait;
 use byteorder::BigEndian;
-use log::info;
+use log::{debug, info};
 use tokio::sync::Mutex;
 use vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter;
 use vcp_media_common::bytesio::bytesio::{TNetIO, UdpIO};
 use vcp_media_common::{Marshal, Unmarshal};
+use vcp_media_common::bytesio::bytes_reader::BytesReader;
 use vcp_media_common::server::tcp_server::TcpServer;
 use vcp_media_rtp::RtpPacket;
 use vcp_media_rtsp::message::range::RtspRange;
@@ -143,7 +144,25 @@ impl VcpRtspServerSessionHandler {
 
 #[async_trait]
 impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
-    async fn handle_options(&mut self, session: &mut RTSPServerSessionContext,rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
+    async fn handle_rtp_over_rtsp_message(&mut self, session: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError> {
+        let mut cur_reader = BytesReader::new(session.reader.read_bytes(length)?);
+
+        for track in self.tracks.values_mut() {
+            if let Some(interleaveds) = track.transport.interleaved {
+                let rtp_identifier = interleaveds[0];
+                let rtcp_identifier = interleaveds[1];
+
+                if channel_identifier == rtp_identifier {
+                    track.on_rtp(&mut cur_reader).await?;
+                } else if channel_identifier == rtcp_identifier {
+                    track.on_rtcp(&mut cur_reader, session.io.clone()).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_options(&mut self, session: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let status_code = http::StatusCode::OK;
         let mut response = Self::gen_response(status_code, rtsp_request);
         let public_str = rtsp_method_name::ARRAY.join(",");
@@ -183,7 +202,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
 
         let mut response = Self::gen_response(status_code, rtsp_request);
         let sdp = self.sdp.marshal();
-        log::debug!("sdp: {}", sdp);
+        debug!("sdp: {}", sdp);
         response.body = Some(sdp);
         response
             .headers

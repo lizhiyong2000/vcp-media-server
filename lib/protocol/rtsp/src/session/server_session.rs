@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use byteorder::BigEndian;
 use bytes::BytesMut;
 use http;
-use log::{error, info};
+use log::{debug, error, info};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -46,6 +46,8 @@ pub struct InterleavedBinaryData {
 #[async_trait]
 pub trait RtspServerSessionHandler : Send + Sync {
 
+    async fn handle_rtp_over_rtsp_message(  &mut self, session: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>;
+
     async fn handle_options(&mut self, session: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError>;
 
     async fn handle_describe(&mut self, session: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> ;
@@ -69,13 +71,13 @@ impl InterleavedBinaryData {
     // two-byte integer in network byte order
     fn new(reader: &mut BytesReader) -> Result<Option<Self>, RtspSessionError> {
         let is_dollar_sign = reader.advance_u8()? == 0x24;
-        log::debug!("dollar sign: {}", is_dollar_sign);
+        info!("Interleaved dollar sign: {}", is_dollar_sign);
         if is_dollar_sign {
             reader.read_u8()?;
             let channel_identifier = reader.read_u8()?;
-            log::debug!("channel_identifier: {}", channel_identifier);
+            info!("Interleaved channel_identifier: {}", channel_identifier);
             let length = reader.read_u16::<BigEndian>()?;
-            log::debug!("length: {}", length);
+            info!("Interleaved length: {}", length);
             return Ok(Some(InterleavedBinaryData {
                 channel_identifier,
                 length,
@@ -86,9 +88,9 @@ impl InterleavedBinaryData {
 }
 
 pub struct RTSPServerSessionContext{
-    io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
-    reader: BytesReader,
-    writer: BytesWriter,
+    pub io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
+    pub reader: BytesReader,
+    pub writer: BytesWriter,
 }
 
 
@@ -254,8 +256,15 @@ impl RTSPServerSession {
         channel_identifier: u8,
         length: usize,
     ) -> Result<(), RtspSessionError> {
-        // let mut cur_reader = BytesReader::new(self.reader.read_bytes(length)?);
 
+        if let Some(handler) = self.session_handler.as_mut(){
+            handler.handle_rtp_over_rtsp_message(&mut self.context.clone(), channel_identifier, length).await
+        }else {
+            Err(RtspSessionError::NoSessionHandlerError)
+        }
+
+        // let mut cur_reader = BytesReader::new(self.reader.read_bytes(length)?);
+        //
         // for track in self.tracks.values_mut() {
         //     if let Some(interleaveds) = track.transport.interleaved {
         //         let rtp_identifier = interleaveds[0];
@@ -268,7 +277,7 @@ impl RTSPServerSession {
         //         }
         //     }
         // }
-        Ok(())
+        // Ok(())
     }
 
     //publish stream: OPTIONS->ANNOUNCE->SETUP->RECORD->TEARDOWN
@@ -279,7 +288,7 @@ impl RTSPServerSession {
         let data = self.reader.get_remaining_bytes();
 
 
-        log::debug!("received rtsp session data, length {}", data.len());
+        info!("received rtsp session data, length {}", data.len());
 
         if let Ok(rtsp_request) = RtspRequest::unmarshal(std::str::from_utf8(&data)?) {
             info!("received rtsp request session:{}", rtsp_request);
@@ -315,7 +324,7 @@ impl RTSPServerSession {
                 _ => {}
             }
         } else {
-            log::debug!("not a valid rtsp request message");
+            info!("not a valid rtsp request message");
             let data = self.io.lock().await.read().await?;
             self.reader.extend_from_slice(&data[..]);
         }
@@ -406,21 +415,21 @@ impl RTSPServerSession{
     }
 }
 
-#[derive(Default)]
-pub struct RtspStreamHandler {
-    sdp: Mutex<SessionDescription>,
-}
-
-impl RtspStreamHandler {
-    pub fn new() -> Self {
-        Self {
-            sdp: Mutex::new(SessionDescription::default()),
-        }
-    }
-    pub async fn set_sdp(&self, sdp: SessionDescription) {
-        *self.sdp.lock().await = sdp;
-    }
-}
+// #[derive(Default)]
+// pub struct RtspStreamHandler {
+//     sdp: Mutex<SessionDescription>,
+// }
+//
+// impl RtspStreamHandler {
+//     pub fn new() -> Self {
+//         Self {
+//             sdp: Mutex::new(SessionDescription::default()),
+//         }
+//     }
+//     pub async fn set_sdp(&self, sdp: SessionDescription) {
+//         *self.sdp.lock().await = sdp;
+//     }
+// }
 
 // #[async_trait]
 // impl TStreamHandler for RtspStreamHandler {
