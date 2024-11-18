@@ -1,7 +1,4 @@
-use {
-    thiserror::Error,
-    std::fmt,
-};
+use thiserror::Error;
 
 use vcp_media_common::bytesio::bytes_errors::BytesReadError;
 use vcp_media_common::bytesio::bytes_errors::BytesWriteError;

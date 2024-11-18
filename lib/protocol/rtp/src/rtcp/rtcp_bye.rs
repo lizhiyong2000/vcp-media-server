@@ -1,6 +1,6 @@
-
 use byteorder::BigEndian;
-use bytes::BytesMut;use super::errors::RtcpError;
+use bytes::BytesMut;
+use super::errors::RtcpError;
 
 use vcp_media_common::Marshal;
 use vcp_media_common::Unmarshal;

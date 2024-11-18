@@ -1,9 +1,9 @@
 pub mod errors;
 pub mod print;
 
-use vcp_media_common::scanf;
 use errors::RtmpUrlParseError;
 use indexmap::IndexMap;
+use vcp_media_common::scanf;
 
 #[derive(Debug, Clone, Default)]
 pub struct RtmpUrlParser {
@@ -100,7 +100,6 @@ impl RtmpUrlParser {
 
 #[cfg(test)]
 mod tests {
-
     use super::RtmpUrlParser;
     #[test]
     fn test_rtmp_url_parser() {

@@ -1,7 +1,7 @@
 use {
-    vcp_media_common::bytesio::bytes_errors::{BytesReadError, BytesWriteError},
+    std::{io, time::SystemTimeError},
     thiserror::Error,
-    std::{fmt, io, time::SystemTimeError},
+    vcp_media_common::bytesio::bytes_errors::{BytesReadError, BytesWriteError},
 };
 
 #[derive(Debug, Error)]

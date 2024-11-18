@@ -1,10 +1,10 @@
 use {
-    super::errors::H264Error, 
+    super::errors::H264Error,
     super::utils,
     bytes::BytesMut,
-    vcp_media_common::bytesio::bits_reader::BitsReader,
-    vcp_media_common::bytesio::bytes_reader::BytesReader, 
     std::vec::Vec,
+    vcp_media_common::bytesio::bits_reader::BitsReader,
+    vcp_media_common::bytesio::bytes_reader::BytesReader,
 };
 
 #[derive(Default, Debug)]

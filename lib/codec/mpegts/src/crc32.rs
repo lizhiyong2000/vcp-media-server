@@ -49,7 +49,6 @@ pub fn gen_crc32(crc: u32, buffer: BytesMut) -> u32 {
 
 #[cfg(test)]
 mod tests {
-
     use super::gen_crc32;
 
     use bytes::BytesMut;

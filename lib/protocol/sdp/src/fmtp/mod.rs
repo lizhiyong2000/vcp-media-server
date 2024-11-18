@@ -2,14 +2,14 @@ mod h264;
 mod h265;
 mod mpeg4;
 
+use base64::Engine as _;
+use bytes::BufMut;
 use vcp_media_common::{Marshal, Unmarshal};
-use base64::{engine::general_purpose, Engine as _};
-use bytes::{BufMut, BytesMut};
 
+use crate::errors::SdpError;
 use h264::H264Fmtp;
 use h265::H265Fmtp;
 use mpeg4::Mpeg4Fmtp;
-use crate::errors::{SdpError};
 
 #[derive(Debug, Clone)]
 pub enum Fmtp {

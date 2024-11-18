@@ -5,12 +5,12 @@ use {
     },
     byteorder::BigEndian,
     bytes::BytesMut,
+    std::sync::Arc,
+    tokio::sync::Mutex,
     vcp_media_common::bytesio::{
         bytes_reader::BytesReader, bytes_writer::AsyncBytesWriter, bytes_writer::BytesWriter,
         bytesio::TNetIO,
     },
-    std::sync::Arc,
-    tokio::sync::Mutex,
 };
 
 pub struct SimpleHandshakeServer {

@@ -1,7 +1,5 @@
-
-use vcp_media_common::{Marshal, Unmarshal};
 use super::SessionDescription;
-use std::error;
+use vcp_media_common::{Marshal, Unmarshal};
 
 #[test]
 fn test_one_format_for_each_media_absolute(){

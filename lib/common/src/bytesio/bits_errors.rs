@@ -1,7 +1,6 @@
 use super::bytes_errors::BytesReadError;
 use super::bytes_errors::BytesWriteError;
 use thiserror::Error;
-use std::fmt;
 
 #[derive(Debug, Error)]
 pub enum BitError {

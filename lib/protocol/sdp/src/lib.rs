@@ -7,13 +7,13 @@ pub mod errors;
 mod sdp_test;
 
 
-use vcp_media_common::{Marshal, Unmarshal};
+use self::fmtp::Fmtp;
+use crate::errors::SdpError;
+use crate::errors::SdpError::SessionOriginError;
 use rtpmap::RtpMap;
 use std::collections::HashMap;
 use std::time::Duration;
-use crate::errors::SdpError;
-use crate::errors::SdpError::SessionOriginError;
-use self::fmtp::Fmtp;
+use vcp_media_common::{Marshal, Unmarshal};
 
 
 //
@@ -723,7 +723,6 @@ impl Marshal<String> for SessionDescription {
 
 #[cfg(test)]
 mod tests {
-
     use vcp_media_common::{Marshal, Unmarshal};
 
     use super::SessionDescription;

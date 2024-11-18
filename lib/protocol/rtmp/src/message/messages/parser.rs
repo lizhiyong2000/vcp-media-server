@@ -132,7 +132,6 @@ impl MessageParser {
 
 #[cfg(test)]
 mod tests {
-
     use super::MessageParser;
     use crate::message::chunk::unpacketizer::ChunkUnpacketizer;
     use crate::message::chunk::unpacketizer::UnpackResult;

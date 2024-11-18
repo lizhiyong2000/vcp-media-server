@@ -1,8 +1,6 @@
 use std::str::FromStr;
 
 use chrono::Local;
-use tracing::instrument::WithSubscriber;
-use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 // use tracing::{info, instrument};
 use tracing_subscriber::layer::SubscriberExt;

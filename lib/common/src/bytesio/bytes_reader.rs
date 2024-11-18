@@ -1,6 +1,6 @@
 use {
     super::{
-        bytes_errors::{BytesReadError},
+        bytes_errors::BytesReadError,
         bytesio::TNetIO,
     },
     byteorder::{ByteOrder, ReadBytesExt},
@@ -236,7 +236,6 @@ where
 
 #[cfg(test)]
 mod tests {
-
     use super::BytesReader;
     use bytes::BytesMut;
     use std::cell::RefCell;

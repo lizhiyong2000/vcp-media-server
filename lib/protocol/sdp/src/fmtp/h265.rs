@@ -1,7 +1,7 @@
-use vcp_media_common::{Marshal, Unmarshal};
+use crate::errors::SdpError;
 use base64::{engine::general_purpose, Engine as _};
 use bytes::{BufMut, BytesMut};
-use crate::errors::{SdpError};
+use vcp_media_common::{Marshal, Unmarshal};
 
 #[derive(Debug, Clone, Default)]
 pub struct H265Fmtp {
@@ -76,9 +76,6 @@ impl Marshal<String> for H265Fmtp {
 
 #[cfg(test)]
 mod tests {
-
-    use bytes::BytesMut;
-
     use super::H265Fmtp;
     use vcp_media_common::Marshal;
     use vcp_media_common::Unmarshal;

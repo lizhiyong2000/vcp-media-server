@@ -1,6 +1,6 @@
 use crate::message::chunk::errors::PackError;
-use vcp_media_flv::amf0::errors::Amf0WriteError;
 use thiserror::Error;
+use vcp_media_flv::amf0::errors::Amf0WriteError;
 
 #[derive(Debug, Error)]
 pub enum NetStreamError {

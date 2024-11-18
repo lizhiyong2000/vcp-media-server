@@ -1,9 +1,8 @@
 pub mod tcp_server;
 
+use async_trait::async_trait;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use async_trait::async_trait;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

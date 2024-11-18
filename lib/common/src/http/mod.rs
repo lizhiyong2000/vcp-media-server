@@ -2,11 +2,11 @@ mod errors;
 
 use crate::scanf;
 use indexmap::IndexMap;
-use tokio::task::LocalEnterGuard;
 use std::fmt::{self, Display};
+use tokio::task::LocalEnterGuard;
 
+use crate::http::errors::HttpError;
 use crate::{Marshal, Unmarshal};
-use crate::http::errors::{HttpError};
 
 #[derive(Debug, Clone, Default)]
 pub enum Schema {
@@ -395,7 +395,6 @@ impl Display for HttpResponse{
 
 #[cfg(test)]
 mod tests {
-
     use super::Marshal;
     use super::Unmarshal;
 

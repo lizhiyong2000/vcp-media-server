@@ -1,7 +1,7 @@
-use vcp_media_common::{Marshal, Unmarshal};
+use crate::errors::SdpError;
 use base64::{engine::general_purpose, DecodeError, Engine as _};
 use bytes::{BufMut, BytesMut};
-use crate::errors::{SdpError};
+use vcp_media_common::{Marshal, Unmarshal};
 // pub trait Fmtp: TMsgConverter {}
 
 #[derive(Debug, Clone, Default)]
@@ -105,8 +105,6 @@ impl Marshal<String> for H264Fmtp {
 
 #[cfg(test)]
 mod tests {
-
-    use bytes::BytesMut;
     use super::H264Fmtp;
     use vcp_media_common::Marshal;
     use vcp_media_common::Unmarshal;

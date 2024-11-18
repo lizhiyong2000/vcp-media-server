@@ -1,7 +1,5 @@
-use thiserror::Error;
-use std::fmt;
 use std::io;
-// use tokio::time::Elapsed;
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BytesIOError {

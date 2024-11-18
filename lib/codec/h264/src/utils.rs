@@ -33,7 +33,6 @@ pub fn read_sev(bit_reader: &mut BitsReader) -> Result<i32, H264Error> {
 
 #[cfg(test)]
 mod tests {
-
     use super::read_uev;
     use bytes::BytesMut;
     use vcp_media_common::bytesio::bits_reader::BitsReader;

@@ -1,6 +1,4 @@
-use std::fmt;
 use thiserror::Error;
-use crate::bytesio::bytes_errors::{BytesReadError, BytesWriteError};
 
 #[derive(Debug, Error)]
 pub enum HttpError {

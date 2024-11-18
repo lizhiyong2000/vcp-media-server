@@ -6,8 +6,8 @@ extern crate rand;
 extern crate sha2;
 extern crate tokio;
 extern crate vcp_media_common;
-extern crate vcp_media_h264;
 extern crate vcp_media_flv;
+extern crate vcp_media_h264;
 
 pub mod config;
 pub mod message;

@@ -1,7 +1,7 @@
 use {
     thiserror::Error,
-    vcp_media_common::bytesio::bytes_errors::{BytesReadError, BytesWriteError},
-    std::fmt,
+    vcp_media_common::bytesio::bytes_errors::{BytesReadError, BytesWriteError}
+    ,
 };
 
 #[derive(Debug, Error)]

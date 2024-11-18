@@ -1,6 +1,6 @@
 use {
     super::{
-        bits_errors::{BitError},
+        bits_errors::BitError,
         bytes_writer::BytesWriter,
     },
     bytes::BytesMut,
@@ -122,10 +122,9 @@ impl BitsWriter {
 
 #[cfg(test)]
 mod tests {
-
     use super::BitsWriter;
     use super::BytesWriter;
-    
+
 
     #[test]
     fn test_write_bit() {

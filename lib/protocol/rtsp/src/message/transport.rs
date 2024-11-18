@@ -1,7 +1,7 @@
-use vcp_media_common::{Marshal, Unmarshal};
 use crate::message::errors::RtspError;
-use crate::utils::scanf;
 use crate::message::errors::RtspError::*;
+use crate::utils::scanf;
+use vcp_media_common::{Marshal, Unmarshal};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 
@@ -157,7 +157,6 @@ impl Marshal<String> for RtspTransport {
 
 #[cfg(test)]
 mod tests {
-
     use vcp_media_common::Marshal;
     use vcp_media_common::Unmarshal;
 

@@ -2,7 +2,7 @@ use {
     super::{
         define,
         define::{epat_pid, epes_stream_id, ts},
-        errors::{MpegTsError},
+        errors::MpegTsError,
         pat, pes,
         pes::PesMuxer,
         pmt, utils,

@@ -1,5 +1,5 @@
 use {
-    super::errors::{MpegError},
+    super::errors::MpegError,
     bytes::BytesMut,
     vcp_media_common::bytesio::{
         bits_reader::BitsReader, bits_writer::BitsWriter, bytes_reader::BytesReader,

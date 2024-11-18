@@ -1,6 +1,5 @@
-use vcp_media_common::bytesio::bits_errors::BitError;
 use thiserror::Error;
-use std::fmt;
+use vcp_media_common::bytesio::bits_errors::BitError;
 
 #[derive(Debug, Error)]
 pub enum H264Error {

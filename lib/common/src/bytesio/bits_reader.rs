@@ -1,5 +1,5 @@
 use {
-    super::bits_errors::{BitError},
+    super::bits_errors::BitError,
     super::bytes_reader::BytesReader,
     bytes::BytesMut,
 };
@@ -66,7 +66,6 @@ impl BitsReader {
 
 #[cfg(test)]
 mod tests {
-
     use super::BitsReader;
     use super::BytesReader;
     use bytes::BytesMut;

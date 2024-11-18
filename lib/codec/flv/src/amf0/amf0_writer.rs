@@ -2,8 +2,8 @@ use {
     super::{amf0_markers, errors::Amf0WriteError, Amf0ValueType},
     byteorder::BigEndian,
     bytes::BytesMut,
-    vcp_media_common::bytesio::bytes_writer::BytesWriter,
     indexmap::IndexMap,
+    vcp_media_common::bytesio::bytes_writer::BytesWriter,
 };
 
 #[derive(Default)]

@@ -1,7 +1,7 @@
-use vcp_media_common::{Marshal, Unmarshal};
 use crate::message::errors::RtspError;
 use crate::message::errors::RtspError::*;
 use crate::utils;
+use vcp_media_common::{Marshal, Unmarshal};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum RtspRangeType {
@@ -97,7 +97,6 @@ impl Marshal<String> for RtspRange {
 
 #[cfg(test)]
 mod tests {
-
     use super::RtspRange;
     use vcp_media_common::Unmarshal;
 

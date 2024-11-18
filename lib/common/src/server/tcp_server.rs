@@ -1,11 +1,11 @@
+use crate::server::{NetworkServer, NetworkSession, ServerSessionHandler, SessionAlloc, SessionError, SessionManager, TcpServerHandler, TcpSession};
+use log::{error, info};
 use std::collections::HashMap;
 use std::sync::Arc;
-use log::{error, info};
 use tokio::net::TcpListener;
-use crate::server::{NetworkServer, NetworkSession, SessionAlloc, SessionError, ServerSessionHandler, SessionManager, TcpSession, TcpServerHandler};
 
-use std::marker::PhantomData;
 use async_trait::async_trait;
+use std::marker::PhantomData;
 
 pub struct TcpServer<T>
 where T: TcpSession + 'static
@@ -15,7 +15,7 @@ where T: TcpSession + 'static
     sessions: HashMap<String, Arc<Box<T>>>,
     session_alloc: SessionAlloc<T>,
     phantom: PhantomData<T>,
-    connection_handler: Option<Box<dyn TcpServerHandler<T>>>,
+    handler: Option<Box<dyn TcpServerHandler<T>>>,
     // bytes_pending: u64,
     // bytes_sent: u64,
     // bytes_received: u64,
@@ -62,7 +62,7 @@ where T: TcpSession + 'static
             sessions: HashMap::new(),
             session_alloc: Default::default(),
             phantom: Default::default(),
-            connection_handler: handler,
+            handler,
         };
         return server;
     }
@@ -75,7 +75,7 @@ where T: TcpSession + 'static
         loop {
             let (socket, remote_addr) = listener.accept().await?;
 
-            if let Some(handler) = self.connection_handler.as_mut(){
+            if let Some(handler) = self.handler.as_mut(){
                 if let  Ok(mut session) = handler.on_create_session(socket, remote_addr).await{
                     info!("server received connection from :{}, session id:{}", remote_addr, session.id());
                     // self.notify_session_created(session.clone()).await;

@@ -1,6 +1,6 @@
 use {
     super::{
-        bytes_errors::{BytesWriteError},
+        bytes_errors::BytesWriteError,
         bytesio::TNetIO,
     },
     byteorder::{ByteOrder, WriteBytesExt},

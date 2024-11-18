@@ -2,8 +2,8 @@ use {
     super::{amf0_markers, errors::Amf0ReadError, Amf0ValueType},
     byteorder::BigEndian,
     // bytes::BytesMut,
-    vcp_media_common::bytesio::bytes_reader::BytesReader,
     indexmap::IndexMap,
+    vcp_media_common::bytesio::bytes_reader::BytesReader,
 };
 
 pub struct Amf0Reader {

@@ -2,8 +2,8 @@ use {
     super::{define::h264_nal_type, errors::MpegError},
     byteorder::BigEndian,
     bytes::BytesMut,
-    vcp_media_common::bytesio::{bytes_reader::BytesReader, bytes_writer::BytesWriter},
     std::vec::Vec,
+    vcp_media_common::bytesio::{bytes_reader::BytesReader, bytes_writer::BytesWriter},
 };
 
 use vcp_media_h264::sps::SpsParser;

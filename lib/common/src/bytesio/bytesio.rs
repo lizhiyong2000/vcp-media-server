@@ -12,7 +12,7 @@ use tokio::net::UdpSocket;
 use tokio_util::codec::BytesCodec;
 use tokio_util::codec::Framed;
 
-use super::bytesio_errors::{BytesIOError};
+use super::bytesio_errors::BytesIOError;
 
 pub enum NetType {
     TCP,
@@ -208,7 +208,6 @@ impl TNetIO for TcpIO {
 
 #[cfg(test)]
 mod tests {
-
     use super::new_udpio_pair;
     use super::UdpIO;
 

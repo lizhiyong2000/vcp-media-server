@@ -1,9 +1,9 @@
 use {
+    thiserror::Error,
     vcp_media_common::bytesio::bits_errors::BitError,
     vcp_media_common::bytesio::bytes_errors::{BytesReadError, BytesWriteError},
-    thiserror::Error,
-    vcp_media_h264::errors::H264Error,
-    std::fmt,
+    vcp_media_h264::errors::H264Error
+    ,
 };
 
 #[derive(Debug, Error)]

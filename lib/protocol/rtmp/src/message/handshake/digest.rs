@@ -2,12 +2,12 @@ use {
     super::{
         define,
         define::SchemaVersion,
-        errors::{DigestError},
+        errors::DigestError,
     },
     bytes::BytesMut,
-    vcp_media_common::bytesio::bytes_reader::BytesReader,
     hmac::{Hmac, Mac, NewMac},
     sha2::Sha256,
+    vcp_media_common::bytesio::bytes_reader::BytesReader,
 };
 
 pub struct DigestProcessor {

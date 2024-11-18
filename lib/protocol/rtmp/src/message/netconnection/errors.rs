@@ -1,7 +1,7 @@
 use {
     crate::message::chunk::errors::PackError,
-    thiserror::Error,
-    std::fmt,
+    thiserror::Error
+    ,
     vcp_media_flv::amf0::errors::{Amf0ReadError, Amf0WriteError},
 };
 
