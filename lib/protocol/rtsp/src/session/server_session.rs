@@ -114,7 +114,10 @@ impl NetworkSession for RTSPServerSession {
     fn session_type(&self) -> String {
         return "RTSP".to_string();
     }
-
+    //
+    // fn set_handler(&mut self, handler: Box<dyn ServerSessionHandler>) {
+    //     self.session_handler = Some(handler)
+    // }
 
 
     async fn run(&mut self) {
@@ -133,6 +136,14 @@ impl TcpSession for RTSPServerSession {
         let id = Uuid::new(RandomDigitCount::Zero).to_string();
         Self::new(id, sock, remote)
     }
+
+    // async fn notify_created(&mut self) {
+    //     if let Some(handler) = self.session_handler.as_mut(){
+    //         handler.handle_created().await
+    //     }else {
+    //         Err(RtspSessionError::NoSessionHandlerError)
+    //     }
+    // }
 }
 
 impl RTSPServerSession {
@@ -283,8 +294,15 @@ impl RTSPServerSession {
     }
 }
 
-#[async_trait]
-impl RtspServerSessionHandler for RTSPServerSession{
+impl RTSPServerSession{
+    // async fn on_created(&mut self, session: Arc<Box<RTSPServerSession>>) -> Result<(), RtspSessionError> {
+    //     if let Some(handler) = self.session_handler.as_mut(){
+    //         handler.on_created(session).await
+    //     }else {
+    //         Err(RtspSessionError::NoSessionHandlerError)
+    //     }
+    // }
+
     async fn handle_options(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         if let Some(handler) = self.session_handler.as_mut(){
             handler.handle_options(rtsp_request).await

@@ -25,26 +25,32 @@ use vcp_media_rtsp::message::codec::RtspCodecInfo;
 use vcp_media_rtsp::message::track::{RtspTrack, TrackType};
 use vcp_media_sdp::SessionDescription;
 
+
+pub struct RtspServerHandler;
+#[async_trait]
+impl ServerHandler for RtspServerHandler {
+    async fn on_session_created(&mut self, session_id: String) -> Result<(), SessionError> {
+        info!("Session {} created", session_id);
+        Ok(())
+    }
+}
+
+
 pub struct RtspServer {
     tcp_server: TcpServer<RTSPServerSession>,
-
 }
 
-pub struct RtspServerHandler<'a>{
-    server: Arc<Box<&'a RtspServer>>,
-}
 
 impl RtspServer {
     pub fn new(addr:String) -> Self{
-
-        let mut rtsp_server: TcpServer<RTSPServerSession> = TcpServer::new(addr, None);
+        let server_handler = Box::new(
+            RtspServerHandler
+        );
+        let mut rtsp_server: TcpServer<RTSPServerSession> = TcpServer::new(addr, Some(server_handler));
 
         let res = Self{
             tcp_server: rtsp_server,
         };
-
-
-
         res
 
     }
@@ -53,26 +59,11 @@ impl RtspServer {
         self.tcp_server.session_type()
     }
 
-
-    pub fn setup_handler(&mut self){
-        let server_handler = Box::new(
-            RtspServerHandler{
-                server: Arc::new(Box::new(self.deref_mut()))
-            }
-        );
-        self.tcp_server.set_handler(server_handler);
-    }
-
     pub async fn start(&mut self) -> Result<(), SessionError> {
         self.tcp_server.start().await
     }
 }
-#[async_trait]
-impl<'a> ServerHandler for RtspServerHandler<'a> {
-    async fn on_session_created(&mut self, session: &mut Box<dyn NetworkSession>) -> Result<(), SessionError> {
-        todo!()
-    }
-}
+
 
 
 pub struct VcpRtspServerSessionHandler {

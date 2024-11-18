@@ -15,19 +15,10 @@ where T: TcpSession + 'static
     sessions: HashMap<String, Arc<Box<T>>>,
     session_alloc: SessionAlloc<T>,
     phantom: PhantomData<T>,
-
-    connection_handler: Option<Box<dyn ServerHandler>>
+    connection_handler: Option<Box<dyn ServerHandler>>,
     // bytes_pending: u64,
     // bytes_sent: u64,
     // bytes_received: u64,
-}
-
-
-impl<'a, T> TcpServer<T>
-where T: TcpSession{
-    pub fn set_handler(&mut self, handler: Box<dyn ServerHandler>)     {
-        self.connection_handler = Some(handler);
-    }
 }
 
 impl<'a, T> SessionManager<T> for TcpServer<T>
@@ -53,6 +44,12 @@ where T: TcpSession + 'static
     pub fn session_type(&self) -> String {
         return "".to_string();
     }
+
+    pub async fn notify_session_created(&self, session: Arc<Box<T>>){
+
+        // session.session_type()
+
+    }
 }
 
 #[async_trait]
@@ -77,10 +74,14 @@ where T: TcpSession + 'static
 
         loop {
             let (socket, remote_addr) = listener.accept().await?;
-            if let Some(mut session) = self.session_alloc.new_tcp_session(socket, remote_addr){
+            if let mut session = self.session_alloc.new_tcp_session(socket, remote_addr){
                 info!("server received connection from :{}, session id:{}", remote_addr, session.id());
+                // self.notify_session_created(session.clone()).await;
+                // session.set_handler()
+
                 tokio::spawn(
                     async move {
+
                         session.run().await;
                         info!("server end connection from :{}, session id:{}", remote_addr, session.id());
                     }
@@ -89,5 +90,7 @@ where T: TcpSession + 'static
 
         }
     }
+
+
 
 }

@@ -95,6 +95,10 @@ impl TcpSession for RTMPServerSession {
         let id = Uuid::new(RandomDigitCount::Zero).to_string();
         Self::new(id, sock, remote)
     }
+
+    // fn notify_created(&self) {
+    //     todo!()
+    // }
 }
 
 impl RTMPServerSession {

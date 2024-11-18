@@ -12,7 +12,9 @@ pub enum SessionError {
     SocketIOError(#[from] std::io::Error),
 }
 
-pub trait ServerSessionHandler{}
+pub trait ServerSessionHandler{
+
+}
 
 
 #[async_trait]
@@ -20,9 +22,6 @@ pub trait NetworkSession : Send + Sync{
 
     fn id(&self)->String;
     fn session_type(&self)->String;
-
-    // fn set_handler(&mut self, handler: Box<dyn ServerSessionHandler>);
-
     async fn run(&mut self);
 }
 
@@ -32,11 +31,13 @@ pub trait TcpSession: NetworkSession{
     //     return "TCP".to_string()
     // }
     fn from_tcp_socket(sock: tokio::net::TcpStream, remote: SocketAddr) -> Self;
+
+    // fn notify_created(&self);
 }
 
 #[async_trait]
 pub trait ServerHandler :Send+Sync {
-    async fn on_session_created(&mut self, session: &mut Box<dyn NetworkSession>) -> Result<(), SessionError>;
+    async fn on_session_created(&mut self, session_id:String) -> Result<(), SessionError>;
 }
 
 pub trait UdpSession: NetworkSession{
@@ -74,14 +75,14 @@ impl<T:NetworkSession> Default for SessionAlloc<T> {
 
 
 impl<T> SessionAlloc<T> where T: TcpSession{
-    pub fn new_tcp_session(&self, sock: tokio::net::TcpStream, remote: SocketAddr) -> Option<T>{
-        return Some(T::from_tcp_socket(sock, remote))
+    pub fn new_tcp_session(&self, sock: tokio::net::TcpStream, remote: SocketAddr) -> T{
+        T::from_tcp_socket(sock, remote)
     }
 }
 
 impl<T> SessionAlloc<T> where T: UdpSession{
-    pub fn new_udp_session(&self, sock: tokio::net::UdpSocket, remote: SocketAddr) -> Option<T>{
-        return Some(T::from_udp_socket(sock, remote))
+    pub fn new_udp_session(&self, sock: tokio::net::UdpSocket, remote: SocketAddr) -> T{
+        T::from_udp_socket(sock, remote)
     }
 }
 
