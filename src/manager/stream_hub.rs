@@ -11,7 +11,7 @@ pub struct StreamHub {
 impl StreamHub {
 
     pub fn new() -> Self {
-        let receiver = message_hub::subscribe_to(EventKind::StreamEvent);
+        let receiver = message_hub::subscribe_to(EventKind::StreamEventKind);
         Self{
             stream_event_receiver: receiver,
         }
@@ -23,7 +23,7 @@ impl StreamHub {
     }
 
     pub async fn event_loop(&mut self) {
-        while let Ok(Event{info:EventKindInfo::StreamEvent(event), .. }) = self.stream_event_receiver.recv().await {
+        while let Ok(Event{info:EventKindInfo::StreamEventInfo(event), .. }) = self.stream_event_receiver.recv().await {
 
             info!("[MESSAGE] [Stream Hub]:{:?}", event);
             match event {

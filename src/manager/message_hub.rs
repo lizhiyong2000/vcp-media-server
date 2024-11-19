@@ -11,18 +11,18 @@ use tokio::sync::broadcast::error::SendError;
 
 #[derive(Clone, Debug, EnumIter, Hash, Eq, PartialEq, Copy)]
 pub enum EventKind {
-    ApplicationEvent = 0,
-    ApiEvent = 1,
-    StreamEvent = 2,
-    StreamTransmitterEvent = 3,
+    ApplicationEventKind = 0,
+    ApiEventKind = 1,
+    StreamEventKind = 2,
+    StreamTransmitEventKind = 3,
 }
 
 #[derive(Clone, Debug)]
 pub enum EventKindInfo {
-    ApplicationEvent(String),
-    ApiEvent(String),
-    StreamEvent(StreamEvent),
-    StreamTransmitterEvent(String),
+    ApplicationEventInfo(String),
+    ApiEventInfo(String),
+    StreamEventInfo(StreamEvent),
+    StreamTransmitEventInfo(StreamTransmitEvent),
 }
 
 #[derive(Clone, Debug)]
@@ -35,10 +35,10 @@ impl From<EventKindInfo> for Event {
     fn from(value: EventKindInfo) -> Self {
 
         let event_kind =  match value.clone() {
-            EventKindInfo::ApplicationEvent(value) => EventKind::ApplicationEvent,
-            EventKindInfo::ApiEvent(value) => EventKind::ApiEvent,
-            EventKindInfo::StreamEvent(value) => EventKind::StreamEvent,
-            EventKindInfo::StreamTransmitterEvent(value) => EventKind::StreamTransmitterEvent,
+            EventKindInfo::ApplicationEventInfo(value) => EventKind::ApplicationEventKind,
+            EventKindInfo::ApiEventInfo(value) => EventKind::ApiEventKind,
+            EventKindInfo::StreamEventInfo(value) => EventKind::StreamEventKind,
+            EventKindInfo::StreamTransmitEventInfo(value) => EventKind::StreamTransmitEventKind,
         };
 
         Event{
@@ -52,8 +52,8 @@ impl From<EventKindInfo> for Event {
 impl From<StreamEvent> for Event {
     fn from(value: StreamEvent) -> Self {
         Event{
-            kind: EventKind::StreamEvent,
-            info: EventKindInfo::StreamEvent(value),
+            kind: EventKind::StreamEventKind,
+            info: EventKindInfo::StreamEventInfo(value),
         }
     }
 }
@@ -81,6 +81,14 @@ pub enum StreamEvent{
     StreamPublish(StreamPublishInfo),
     StreamSubscribe(StreamSubscribeInfo),
     StreamPull(StreamPullInfo),
+}
+
+
+#[derive(Clone, Debug)]
+pub enum StreamTransmitEvent{
+    Subscribe(StreamSubscribeInfo),
+    UnSubscribe(StreamSubscribeInfo),
+    UnPublish,
 }
 
 #[derive(Debug)]

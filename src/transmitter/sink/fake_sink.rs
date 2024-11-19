@@ -8,11 +8,11 @@ pub(crate) struct FakeSink {
 
 #[async_trait]
 impl StreamSink for FakeSink {
-    fn send_data(&mut self, data: &BytesMut) {
+    fn send_data(&mut self, _data: &BytesMut) {
         todo!()
     }
 
-    async fn link_to_source(&mut self, sink: &mut Box<dyn StreamSource>) {
+    async fn link_to_source(&mut self, _sink: &mut Box<dyn StreamSource>) {
         todo!()
     }
 

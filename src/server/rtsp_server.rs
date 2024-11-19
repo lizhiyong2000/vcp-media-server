@@ -138,20 +138,20 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         Ok(None)
     }
 
-    async fn handle_setup(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_setup(&mut self, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_play(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_play(&mut self, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
 
-    async fn handle_record(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_record(&mut self, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_teardown(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_teardown(&mut self, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 

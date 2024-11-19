@@ -1,13 +1,35 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
-use vcp_media_common::bytesio::bytesio_errors::BytesIOError;
-use crate::transmitter::StreamSourceType;
+use crate::common::define::{FrameDataSender, PublishType, SubscriberInfo};
+
+
+#[derive(Debug)]
+pub enum TransceiverEvent {
+    Subscribe {
+        sender: FrameDataSender,
+        info: SubscriberInfo,
+        // result_sender: TransceiverEventExecuteResultSender,
+    },
+    UnSubscribe {
+        info: SubscriberInfo,
+    },
+    UnPublish {},
+    //
+    // Api {
+    //     sender: StatisticStreamSender,
+    //     uuid: Option<Uuid>,
+    // },
+    // Request {
+    //     sender: InformationSender,
+    // },
+}
+
 
 #[async_trait]
 pub trait StreamSource{
     async fn handle_input(&mut self);
     fn get_source_id(&self) -> String;
-    fn get_source_type(&self) -> StreamSourceType;
+    fn get_source_type(&self) -> PublishType;
 
     fn detach_sink(&mut self, sink:&mut Box<dyn StreamSink>) -> String;
 
