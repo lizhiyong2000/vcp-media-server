@@ -46,21 +46,37 @@ pub struct InterleavedBinaryData {
 #[async_trait]
 pub trait RtspServerSessionHandler : Send + Sync {
 
-    async fn handle_rtp_over_rtsp_message(  &mut self, session: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>;
+    async fn handle_rtp_over_rtsp_message(  &mut self, session: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>{
+        Ok(())
+    }
 
-    async fn handle_options(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError>;
+    async fn handle_options(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError>{
+        Ok(None)
+    }
 
-    async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> ;
+    async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+        Ok(None)
+    }
 
-    async fn handle_announce(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> ;
+    async fn handle_announce(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+        Ok(None)
+    }
 
-    async fn handle_setup(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> ;
+    async fn handle_setup(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+        Ok(None)
+    }
 
-    async fn handle_play(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError>;
+    async fn handle_play(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError>{
+        Ok(None)
+    }
 
-    async fn handle_record(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> ;
+    async fn handle_record(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+        Ok(None)
+    }
 
-    async fn handle_teardown(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> ;
+    async fn handle_teardown(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+        Ok(None)
+    }
 }
 
 impl InterleavedBinaryData {
@@ -71,13 +87,13 @@ impl InterleavedBinaryData {
     // two-byte integer in network byte order
     fn new(reader: &mut BytesReader) -> Result<Option<Self>, RtspSessionError> {
         let is_dollar_sign = reader.advance_u8()? == 0x24;
-        info!("Interleaved dollar sign: {}", is_dollar_sign);
+        debug!("Interleaved dollar sign: {}", is_dollar_sign);
         if is_dollar_sign {
             reader.read_u8()?;
             let channel_identifier = reader.read_u8()?;
-            info!("Interleaved channel_identifier: {}", channel_identifier);
+            debug!("Interleaved channel_identifier: {}", channel_identifier);
             let length = reader.read_u16::<BigEndian>()?;
-            info!("Interleaved length: {}", length);
+            debug!("Interleaved length: {}", length);
             return Ok(Some(InterleavedBinaryData {
                 channel_identifier,
                 length,
@@ -144,12 +160,6 @@ pub struct RTSPServerSession {
     sdp: SessionDescription,
     session_id: Option<Uuid>,
     handler: Option<Box<dyn RtspServerSessionHandler>>,
-
-
-    // stream_handler: Arc<RtspStreamHandler>,
-    // event_producer: StreamHubEventSender,
-
-    // auth: Option<Auth>,
 }
 
 
@@ -162,11 +172,6 @@ impl NetworkSession for RTSPServerSession {
     fn session_type() -> String {
         return "RTSP".to_string();
     }
-    //
-    // fn set_handler(&mut self, handler: Box<dyn ServerSessionHandler>) {
-    //     self.session_handler = Some(handler)
-    // }
-
 
     async fn run(&mut self) {
         let res = self.handle_session().await;
@@ -184,14 +189,6 @@ impl TcpSession for RTSPServerSession {
         let id = Uuid::new(RandomDigitCount::Zero).to_string();
         Self::new(id, sock, remote, None)
     }
-
-    // async fn notify_created(&mut self) {
-    //     if let Some(handler) = self.session_handler.as_mut(){
-    //         handler.handle_created().await
-    //     }else {
-    //         Err(RtspSessionError::NoSessionHandlerError)
-    //     }
-    // }
 }
 
 impl RTSPServerSession {
@@ -219,13 +216,11 @@ impl RTSPServerSession {
             context: RTSPServerSessionContext::new(io.clone()),
             reader: BytesReader::new(BytesMut::default()),
             writer: AsyncBytesWriter::new(io),
-
             remote_addr: remote,
             tracks: HashMap::new(),
             sdp: SessionDescription::default(),
             session_id: None,
-            // stream_handler: Arc::new(RtspStreamHandler::new()),
-            handler: handler,
+            handler,
         }
     }
 
@@ -368,7 +363,7 @@ impl RTSPServerSession {
         info!("received rtsp session data, length {}", data.len());
 
         if let Ok(rtsp_request) = RtspRequest::unmarshal(std::str::from_utf8(&data)?) {
-            info!("received rtsp request session:{}", rtsp_request);
+            info!("\n[ S<-C ]====================\n{}====================", rtsp_request);
             self.reader.read_bytes(rtsp_request.origin_length);
 
             match rtsp_request.method.as_str() {
@@ -411,7 +406,7 @@ impl RTSPServerSession {
 
 
     pub async fn send_response(&mut self, response: &RtspResponse) -> Result<(), RtspSessionError> {
-        info!("send response:==========================\n{}=============", response);
+        info!("send response:\n[ S->C ]====================\n{}====================", response);
 
         self.writer.write(response.marshal().as_bytes())?;
         self.writer.flush().await?;
@@ -427,19 +422,56 @@ impl RTSPServerSession {
 impl RTSPServerSession{
 
     async fn handle_options(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
-        let status_code = http::StatusCode::OK;
-        let mut response = Self::gen_response(status_code, rtsp_request);
-        let public_str = rtsp_method_name::ARRAY.join(",");
-        response.headers.insert("Public".to_string(), public_str);
+        let custom_response = {
+            if let Some(h) =  self.handler.as_mut(){
+                h.handle_options(rtsp_request).await?
+            } else {
+                None
+            }
+        };
+
+        let response =  {
+            match custom_response {
+                Some(r) => { r }
+                None => {
+                    let status_code = http::StatusCode::OK;
+                    let mut response = Self::gen_response(status_code, rtsp_request);
+                    let public_str = rtsp_method_name::ARRAY.join(",");
+                    response.headers.insert("Public".to_string(), public_str);
+                    response
+                }
+            }
+        };
         self.send_response(&response).await?;
-
         Ok(())
-
-
     }
 
     async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
-        let status_code = http::StatusCode::OK;
+        let custom_response = {
+            if let Some(h) =  self.handler.as_mut(){
+                h.handle_describe(rtsp_request).await?
+            } else {
+                None
+            }
+        };
+
+        let response =  {
+            match custom_response {
+                Some(r) => { r }
+                None => {
+                    let status_code = http::StatusCode::OK;
+                    let mut response = Self::gen_response(status_code, rtsp_request);
+                    let sdp = self.sdp.marshal();
+                    debug!("sdp: {}", sdp);
+                    response.body = Some(sdp);
+                    response
+                        .headers
+                        .insert("Content-Type".to_string(), "application/sdp".to_string());
+                    response
+                }
+            }
+        };
+
 
         // The sender is used for sending sdp information from the server session to client session
         // receiver is used to receive the sdp information
@@ -466,29 +498,43 @@ impl RTSPServerSession{
         //     }
         // }
 
-        let mut response = Self::gen_response(status_code, rtsp_request);
-        let sdp = self.sdp.marshal();
-        debug!("sdp: {}", sdp);
-        response.body = Some(sdp);
-        response
-            .headers
-            .insert("Content-Type".to_string(), "application/sdp".to_string());
+
+
         self.send_response(&response).await?;
 
         Ok(())
     }
 
     async fn handle_announce(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
-        // if let Some(auth) = &self.auth {
-        //     let stream_name = rtsp_request.uri.path.clone();
-        //     auth.authenticate(&stream_name, &rtsp_request.uri.query, false)?;
-        // }
+        let custom_response = {
+            if let Some(h) =  self.handler.as_mut(){
+                h.handle_announce(rtsp_request).await?
+            } else {
+                None
+            }
+        };
+
+        let response =  {
+            match custom_response {
+                Some(r) => { r }
+                None => {
+                    let status_code = http::StatusCode::OK;
+                    let response = Self::gen_response(status_code, rtsp_request);
+                    response
+                }
+            }
+        };
 
         if let Some(request_body) = &rtsp_request.body {
             if let sdp = SessionDescription::unmarshal(request_body)? {
                 self.sdp = sdp.clone();
                 // self.stream_handler.set_sdp(sdp).await;
             }
+        }
+
+        if response.status_code != http::StatusCode::OK{
+            self.send_response(&response).await?;
+            return Ok(());
         }
 
         //new tracks for publish session
@@ -535,17 +581,37 @@ impl RTSPServerSession{
         //     }));
         // }
 
-        let status_code = http::StatusCode::OK;
-        let response = Self::gen_response(status_code, rtsp_request);
+
         self.send_response(&response).await?;
 
         Ok(())
     }
 
     async fn handle_setup(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
-        let status_code = http::StatusCode::OK;
-        let mut response = Self::gen_response(status_code, rtsp_request);
 
+        let custom_response = {
+            if let Some(h) =  self.handler.as_mut(){
+                h.handle_setup(rtsp_request).await?
+            } else {
+                None
+            }
+        };
+
+        let mut response =  {
+            match custom_response {
+                Some(r) => { r }
+                None => {
+                    let status_code = http::StatusCode::OK;
+                    let response = Self::gen_response(status_code, rtsp_request);
+                    response
+                }
+            }
+        };
+
+        if response.status_code != http::StatusCode::OK {
+            self.send_response(&response).await?;
+            return Ok(());
+        }
         for track in self.tracks.values_mut() {
             if !rtsp_request.uri.marshal().contains(&track.media_control) {
                 continue;
@@ -625,15 +691,33 @@ impl RTSPServerSession{
         }
 
         self.send_response(&response).await?;
-
         Ok(())
     }
 
     async fn handle_play(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
-        // if let Some(auth) = &self.auth {
-        //     let stream_name = rtsp_request.uri.path.clone();
-        //     auth.authenticate(&stream_name, &rtsp_request.uri.query, true)?;
-        // }
+        let custom_response = {
+            if let Some(h) =  self.handler.as_mut(){
+                h.handle_play(rtsp_request).await?
+            } else {
+                None
+            }
+        };
+
+        let mut response =  {
+            match custom_response {
+                Some(r) => { r }
+                None => {
+                    let status_code = http::StatusCode::OK;
+                    let response = Self::gen_response(status_code, rtsp_request);
+                    response
+                }
+            }
+        };
+
+        if response.status_code != http::StatusCode::OK {
+            self.send_response(&response).await?;
+            return Ok(());
+        }
 
         for track in self.tracks.values_mut() {
             let protocol_type = track.transport.protocol_type.clone();
@@ -680,11 +764,8 @@ impl RTSPServerSession{
             }
         }
 
-        let status_code = http::StatusCode::OK;
-        let response = Self::gen_response(status_code, rtsp_request);
 
         self.send_response(&response).await?;
-
         Ok(())
 
         // let (event_result_sender, event_result_receiver) = oneshot::channel();
@@ -754,30 +835,70 @@ impl RTSPServerSession{
     }
 
     async fn handle_record(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
-        if let Some(range_str) = rtsp_request.headers.get(&String::from("Range")) {
-            if let Ok(range) = RtspRange::unmarshal(range_str) {
-                let status_code = http::StatusCode::OK;
-                let mut response = Self::gen_response(status_code, rtsp_request);
-                response
-                    .headers
-                    .insert(String::from("Range"), range.marshal());
-                response
-                    .headers
-                    .insert("Session".to_string(), self.session_id.unwrap().to_string());
-
-                self.send_response(&response).await?;
-
-                return Ok(());
+        let custom_response = {
+            if let Some(h) =  self.handler.as_mut(){
+                h.handle_record(rtsp_request).await?
             } else {
-                return Err(RtspSessionError::RecordRangeError);
+                None
             }
-        }
+        };
 
-        Err(RtspSessionError::RecordRangeError)
+        let mut response =  {
+            match custom_response {
+                Some(r) => { r }
+                None => {
+                    if let Some(range_str) = rtsp_request.headers.get(&String::from("Range")) {
+                        if let Ok(range) = RtspRange::unmarshal(range_str) {
+                            let status_code = http::StatusCode::OK;
+                            let mut response = Self::gen_response(status_code, rtsp_request);
+                            response
+                                .headers
+                                .insert(String::from("Range"), range.marshal());
+                            response
+                                .headers
+                                .insert("Session".to_string(), self.session_id.unwrap().to_string());
+
+                            response
+                        } else {
+                            return Err(RtspSessionError::RecordRangeError);
+                        }
+                    }else{
+                        return Err(RtspSessionError::RecordRangeError);
+                    }
+                }
+            }
+        };
+
+        self.send_response(&response).await?;
+        return Ok(());
+
     }
 
     async fn handle_teardown(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
-        let _stream_path = &rtsp_request.uri.path;
+        let custom_response = {
+            if let Some(h) =  self.handler.as_mut(){
+                h.handle_teardown(rtsp_request).await?
+            } else {
+                None
+            }
+        };
+
+        let mut response =  {
+            match custom_response {
+                Some(r) => { r }
+                None => {
+                    let status_code = http::StatusCode::OK;
+                    let response = Self::gen_response(status_code, rtsp_request);
+                    response
+                }
+            }
+        };
+
+        self.send_response(&response).await?;
+        return Ok(());
+
+
+        // let _stream_path = &rtsp_request.uri.path;
         // let unpublish_event = StreamHubEvent::UnPublish {
         //     identifier: StreamIdentifier::Rtsp {
         //         stream_path: stream_path.clone(),
@@ -802,7 +923,7 @@ impl RTSPServerSession{
         //     }
         // }
 
-        Ok(())
+        // Ok(())
     }
 }
 
