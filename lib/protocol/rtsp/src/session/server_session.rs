@@ -34,7 +34,9 @@ use vcp_media_common::server::TcpSession;
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
 use vcp_media_common::Marshal;
 use vcp_media_common::Marshal as RtpMarshal;
+use vcp_media_common::media::FrameData;
 use vcp_media_common::Unmarshal;
+use vcp_media_rtp::errors::UnPackerError;
 use vcp_media_rtp::RtpPacket;
 use vcp_media_sdp::SessionDescription;
 use crate::message;
@@ -535,27 +537,28 @@ impl RTSPServerSession{
 
         // let sender = event_result_receiver.await??.0.unwrap();
 
-        // for track in self.tracks.values_mut() {
-        //     let sender_out = sender.clone();
-        //     let mut rtp_channel_guard = track.rtp_channel.lock().await;
+        for track in self.tracks.values_mut() {
+            // let sender_out = sender.clone();
+            let mut rtp_channel_guard = track.rtp_channel.lock().await;
 
-        //     // rtp_channel_guard.on_frame_handler(Box::new(
-        //     //     move |msg: FrameData| -> Result<(), UnPackerError> {
-        //     //         if let Err(err) = sender_out.send(msg) {
-        //     //             log::error!("send frame error: {}", err);
-        //     //         }
-        //     //         Ok(())
-        //     //     },
-        //     // ));
+            rtp_channel_guard.on_frame_handler(Box::new(
+                move |msg: FrameData| -> Result<(), UnPackerError> {
+                    // if let Err(err) = sender_out.send(msg) {
+                    //     log::error!("send frame error: {}", err);
+                    // }
+                    info!("received frame: {:?}", msg);
+                    Ok(())
+                },
+            ));
 
-        //     let rtcp_channel = Arc::clone(&track.rtcp_channel);
-        //     rtp_channel_guard.on_packet_for_rtcp_handler(Box::new(move |packet: RtpPacket| {
-        //         let rtcp_channel_in = Arc::clone(&rtcp_channel);
-        //         Box::pin(async move {
-        //             rtcp_channel_in.lock().await.on_packet(packet);
-        //         })
-        //     }));
-        // }
+            let rtcp_channel = Arc::clone(&track.rtcp_channel);
+            rtp_channel_guard.on_packet_for_rtcp_handler(Box::new(move |packet: RtpPacket| {
+                let rtcp_channel_in = Arc::clone(&rtcp_channel);
+                Box::pin(async move {
+                    rtcp_channel_in.lock().await.on_packet(packet);
+                })
+            }));
+        }
 
 
         self.send_response(&response).await?;

@@ -4,6 +4,7 @@ pub mod http;
 pub mod macros;
 pub mod uuid;
 pub mod server;
+pub mod media;
 
 use std::error;
 

@@ -3,6 +3,7 @@ use serde::{Serialize, Serializer};
 use serde::ser::SerializeStruct;
 // use serde_derive::Serialize;
 use tokio::sync::mpsc;
+use vcp_media_common::media::FrameData;
 use crate::manager::message_hub::StreamTransmitEvent;
 
 pub mod http_method_name {
@@ -130,48 +131,6 @@ impl Serialize for PublisherInfo {
     }
 }
 
-#[derive(Clone, PartialEq)]
-pub enum VideoCodecType {
-    H264,
-    H265,
-}
-
-#[derive(Clone, PartialEq)]
-pub enum AudioCodecType {
-    G711,
-    AC3,
-}
-
-
-
-#[derive(Clone)]
-pub struct MediaInfo {
-    pub audio_clock_rate: u32,
-    pub video_clock_rate: u32,
-    pub video_codec: VideoCodecType,
-    pub audio_codec: AudioCodecType,
-}
-
-#[derive(Clone)]
-pub enum FrameData {
-    Video { timestamp: u32, data: BytesMut },
-    Audio { timestamp: u32, data: BytesMut },
-    MetaData { timestamp: u32, data: BytesMut },
-    MediaInfo { media_info: MediaInfo },
-}
-
-//Used to pass rtp raw data.
-#[derive(Clone)]
-pub enum PacketData {
-    Video { timestamp: u32, data: BytesMut },
-    Audio { timestamp: u32, data: BytesMut },
-}
-
-//used to save data which needs to be transferred between client/server sessions
-#[derive(Clone)]
-pub enum Information {
-    Sdp { data: String },
-}
 
 //used to transfer a/v frame between different protocols(rtmp/rtsp/webrtc/http-flv/hls)
 //or send a/v frame data from publisher to subscribers.
