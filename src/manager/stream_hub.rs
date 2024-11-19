@@ -1,8 +1,8 @@
 use log::info;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::mpsc;
-use crate::server::message_hub;
-use crate::server::message_hub::{Event, EventKind, EventKindInfo, StreamEvent};
+use crate::manager::message_hub;
+use crate::manager::message_hub::{Event, EventKind, EventKindInfo, StreamEvent};
 
 pub struct StreamHub {
     stream_event_receiver: Receiver<Event>,
@@ -18,12 +18,14 @@ impl StreamHub {
 
     }
     pub async fn run(&mut self) {
-        info!("Starting stream hub");
+        info!("Stream hub now working.");
         self.event_loop().await;
     }
 
     pub async fn event_loop(&mut self) {
         while let Ok(Event{info:EventKindInfo::StreamEvent(event), .. }) = self.stream_event_receiver.recv().await {
+
+            info!("[MESSAGE] [Stream Hub]:{:?}", event);
             match event {
                 StreamEvent::StreamPublish(info) => {
                     info!("Stream publish:{:?}", info);

@@ -31,6 +31,33 @@ pub struct Event{
     pub info: EventKindInfo,
 }
 
+impl From<EventKindInfo> for Event {
+    fn from(value: EventKindInfo) -> Self {
+
+        let event_kind =  match value.clone() {
+            EventKindInfo::ApplicationEvent(value) => EventKind::ApplicationEvent,
+            EventKindInfo::ApiEvent(value) => EventKind::ApiEvent,
+            EventKindInfo::StreamEvent(value) => EventKind::StreamEvent,
+            EventKindInfo::StreamTransmitterEvent(value) => EventKind::StreamTransmitterEvent,
+        };
+
+        Event{
+            kind:event_kind,
+            info: value,
+        }
+    }
+}
+
+
+impl From<StreamEvent> for Event {
+    fn from(value: StreamEvent) -> Self {
+        Event{
+            kind: EventKind::StreamEvent,
+            info: EventKindInfo::StreamEvent(value),
+        }
+    }
+}
+
 
 #[derive(Clone, Debug)]
 pub struct StreamPublishInfo{

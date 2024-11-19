@@ -14,7 +14,7 @@ use log::{self, info};
 use std::sync::Arc;
 use tokio::signal;
 use crate::manager::service::ServiceManager;
-use crate::server::stream_hub::StreamHub;
+use manager::stream_hub::StreamHub;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,7 +32,6 @@ async fn main() -> Result<()> {
     manager.start_service().await;
 
     let mut stream_hub = StreamHub::new();
-
     stream_hub.run().await;
 
 

@@ -37,6 +37,7 @@ use vcp_media_common::Marshal as RtpMarshal;
 use vcp_media_common::Unmarshal;
 use vcp_media_rtp::RtpPacket;
 use vcp_media_sdp::SessionDescription;
+use crate::message;
 
 pub struct InterleavedBinaryData {
     channel_identifier: u8,
@@ -273,31 +274,6 @@ impl RTSPServerSession {
         }
         Ok(())
     }
-
-    fn gen_response(status_code: http::StatusCode, rtsp_request: &RtspRequest) -> RtspResponse {
-        let reason_phrase = if let Some(reason) = status_code.canonical_reason() {
-            reason.to_string()
-        } else {
-            "".to_string()
-        };
-
-        let mut response = RtspResponse {
-            version: "RTSP/1.0".to_string(),
-            status_code: status_code.as_u16(),
-            reason_phrase,
-            ..Default::default()
-        };
-
-        if let Some(cseq) = rtsp_request.headers.get("CSeq") {
-            response
-                .headers
-                .insert("CSeq".to_string(), cseq.to_string());
-        }
-
-        response
-    }
-
-
     pub async fn handle_session(&mut self) -> Result<(), RtspSessionError> {
         loop {
             while self.reader.len() < 4 {
@@ -435,7 +411,7 @@ impl RTSPServerSession{
                 Some(r) => { r }
                 None => {
                     let status_code = http::StatusCode::OK;
-                    let mut response = Self::gen_response(status_code, rtsp_request);
+                    let mut response = message::gen_response(status_code, rtsp_request);
                     let public_str = rtsp_method_name::ARRAY.join(",");
                     response.headers.insert("Public".to_string(), public_str);
                     response
@@ -460,7 +436,7 @@ impl RTSPServerSession{
                 Some(r) => { r }
                 None => {
                     let status_code = http::StatusCode::OK;
-                    let mut response = Self::gen_response(status_code, rtsp_request);
+                    let mut response = message::gen_response(status_code, rtsp_request);
                     let sdp = self.sdp.marshal();
                     debug!("sdp: {}", sdp);
                     response.body = Some(sdp);
@@ -519,7 +495,7 @@ impl RTSPServerSession{
                 Some(r) => { r }
                 None => {
                     let status_code = http::StatusCode::OK;
-                    let response = Self::gen_response(status_code, rtsp_request);
+                    let response = message::gen_response(status_code, rtsp_request);
                     response
                 }
             }
@@ -602,7 +578,7 @@ impl RTSPServerSession{
                 Some(r) => { r }
                 None => {
                     let status_code = http::StatusCode::OK;
-                    let response = Self::gen_response(status_code, rtsp_request);
+                    let response = message::gen_response(status_code, rtsp_request);
                     response
                 }
             }
@@ -708,7 +684,7 @@ impl RTSPServerSession{
                 Some(r) => { r }
                 None => {
                     let status_code = http::StatusCode::OK;
-                    let response = Self::gen_response(status_code, rtsp_request);
+                    let response = message::gen_response(status_code, rtsp_request);
                     response
                 }
             }
@@ -850,7 +826,7 @@ impl RTSPServerSession{
                     if let Some(range_str) = rtsp_request.headers.get(&String::from("Range")) {
                         if let Ok(range) = RtspRange::unmarshal(range_str) {
                             let status_code = http::StatusCode::OK;
-                            let mut response = Self::gen_response(status_code, rtsp_request);
+                            let mut response = message::gen_response(status_code, rtsp_request);
                             response
                                 .headers
                                 .insert(String::from("Range"), range.marshal());
@@ -888,7 +864,7 @@ impl RTSPServerSession{
                 Some(r) => { r }
                 None => {
                     let status_code = http::StatusCode::OK;
-                    let response = Self::gen_response(status_code, rtsp_request);
+                    let response = message::gen_response(status_code, rtsp_request);
                     response
                 }
             }

@@ -1,4 +1,4 @@
-use super::api;
+use crate::server::http_server;
 use async_trait::async_trait;
 use log::{self, info};
 use vcp_media_common::server::tcp_server::TcpServer;
@@ -23,7 +23,7 @@ impl ServiceManager {
 
     pub async fn start_service(&mut self) {
         tokio::spawn(async {
-            Self::start_api_service("0.0.0.0:3000".to_string()).await;
+            Self::start_http_service("0.0.0.0:3000".to_string()).await;
         });
 
         tokio::spawn(async {
@@ -36,7 +36,7 @@ impl ServiceManager {
 
     }
 
-    async fn start_api_service(addr: String) {
+    async fn start_http_service(addr: String) {
         let listener = tokio::net::TcpListener::bind(addr.clone()).await.unwrap();
 
         // info!("to start api service");
@@ -44,7 +44,7 @@ impl ServiceManager {
         info!("HTTP server started listen at:{}", addr);
 
         // info!("to start api service");
-        api::start_api_server(listener).await;
+        http_server::start_api_server(listener).await;
 
         info!("HTTP server end running.");
     }

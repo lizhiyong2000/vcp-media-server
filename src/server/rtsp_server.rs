@@ -27,7 +27,8 @@ use vcp_media_rtsp::message::codec;
 use vcp_media_rtsp::message::codec::RtspCodecInfo;
 use vcp_media_rtsp::message::track::{RtspTrack, TrackType};
 use vcp_media_sdp::SessionDescription;
-
+use crate::manager::message_hub;
+use crate::manager::message_hub::{Event, StreamEvent, StreamPublishInfo};
 
 pub struct VcpRtspServerSessionHandler {
     // session: Option<Arc<Mutex<RTSPServerSession>>>,
@@ -45,29 +46,6 @@ impl VcpRtspServerSessionHandler {
             // session_id: None,
         }
 
-    }
-
-    fn gen_response(status_code: http::StatusCode, rtsp_request: &RtspRequest) -> RtspResponse {
-        let reason_phrase = if let Some(reason) = status_code.canonical_reason() {
-            reason.to_string()
-        } else {
-            "".to_string()
-        };
-
-        let mut response = RtspResponse {
-            version: "RTSP/1.0".to_string(),
-            status_code: status_code.as_u16(),
-            reason_phrase,
-            ..Default::default()
-        };
-
-        if let Some(cseq) = rtsp_request.headers.get("CSeq") {
-            response
-                .headers
-                .insert("CSeq".to_string(), cseq.to_string());
-        }
-
-        response
     }
 
     // pub fn get_session_io(&mut self) -> Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>{
@@ -123,6 +101,40 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
     }
 
     async fn handle_announce(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+        // The sender is used for sending sdp information from the server session to client session
+        // receiver is used to receive the sdp information
+        // let (sender, mut receiver) = mpsc::unbounded_channel<String>();
+
+        // let request_event = StreamHubEvent::Request {
+        //     identifier: StreamIdentifier::Rtsp {
+        //         stream_path: rtsp_request.uri.path.clone(),
+        //     },
+        //     sender,
+        // };
+
+        // if self.event_producer.send(request_event).is_err() {
+        //     return Err(SessionError {
+        //         value: SessionError::StreamHubEventSendErr,
+        //     });
+        // }
+
+        // if let Some(Information::Sdp { data }) = receiver.recv().await {
+        //     if let Some(sdp) = Sdp::unmarshal(&data) {
+        //         self.sdp = sdp;
+        //         //it can new tracks when get the sdp information;
+        //         self.new_tracks()?;
+        //     }
+        // }
+
+        let publish_event = StreamEvent::StreamPublish(
+            StreamPublishInfo{
+                stream_id: "1".to_string(),
+                stream_type: "RTSP".to_string(),
+                url: "rtsp://1111.1.1.1.".to_string(),
+            }
+        );
+
+        message_hub::publish_event(Event::from(publish_event));
         Ok(None)
     }
 
@@ -161,7 +173,6 @@ impl TcpServerHandler<RTSPServerSession> for RtspServerHandler
     async fn on_create_session(&mut self, sock: tokio::net::TcpStream, remote: SocketAddr) -> Result<RTSPServerSession, SessionError> {
         // info!("Session {} created", session_id);
         let id = Uuid::new(RandomDigitCount::Zero).to_string();
-
         Ok(RTSPServerSession::new(id, sock, remote, Some(Box::new(VcpRtspServerSessionHandler::new()))))
     }
 
