@@ -1,10 +1,8 @@
+use crate::transmitter::traits::{StreamSink, StreamSource};
 use async_trait::async_trait;
 use bytes::BytesMut;
-use crate::transmitter::traits::{StreamSink, StreamSource};
 
-pub(crate) struct FakeSink {
-    
-}
+pub(crate) struct FakeSink {}
 
 #[async_trait]
 impl StreamSink for FakeSink {
@@ -20,6 +18,4 @@ impl StreamSink for FakeSink {
         todo!()
     }
 }
-impl FakeSink {
-    
-}
+impl FakeSink {}

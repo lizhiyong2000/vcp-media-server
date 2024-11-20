@@ -1,10 +1,9 @@
-use bytes::BytesMut;
-use serde::{Serialize, Serializer};
+use crate::manager::message::StreamTransmitEvent;
 use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 // use serde_derive::Serialize;
 use tokio::sync::mpsc;
 use vcp_media_common::media::FrameData;
-use crate::manager::message_hub::StreamTransmitEvent;
 
 pub mod http_method_name {
     pub const OPTIONS: &str = "OPTIONS";
@@ -13,8 +12,6 @@ pub mod http_method_name {
     pub const DELETE: &str = "DELETE";
     pub const GET: &str = "GET";
 }
-
-
 
 
 /* Subscribe streams from stream hub */
@@ -132,10 +129,6 @@ impl Serialize for PublisherInfo {
 }
 
 
-//used to transfer a/v frame between different protocols(rtmp/rtsp/webrtc/http-flv/hls)
-//or send a/v frame data from publisher to subscribers.
-pub type FrameDataSender = mpsc::UnboundedSender<FrameData>;
-pub type FrameDataReceiver = mpsc::UnboundedReceiver<FrameData>;
 
 
 pub type StreamTransmitEventSender = mpsc::UnboundedSender<StreamTransmitEvent>;

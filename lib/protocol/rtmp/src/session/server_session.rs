@@ -8,10 +8,10 @@ use crate::message::netstream::writer::NetStreamWriter;
 use crate::message::protocol_control_messages::writer::ProtocolControlMessagesWriter;
 use crate::session::errors::SessionError;
 
-use vcp_media_common::bytesio::bytes_reader::BytesReader;
+// use vcp_media_common::bytesio::bytes_reader::BytesReader;
 use vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter;
 use vcp_media_common::bytesio::bytesio::{TNetIO, TcpIO};
-use vcp_media_common::server::{tcp_server, NetworkSession, ServerSessionHandler, TcpSession};
+use vcp_media_common::server::{NetworkSession, TcpSession};
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
 use vcp_media_flv::amf0::Amf0ValueType;
 
@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use indexmap::IndexMap;
 use log::{error, info};
-use std::collections::HashMap;
+// use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -519,8 +519,8 @@ impl RTMPServerSession {
 
     pub async fn on_audio_data(
         &mut self,
-        data: &mut BytesMut,
-        timestamp: &u32,
+        _data: &mut BytesMut,
+        _timestamp: &u32,
     ) -> Result<(), SessionError> {
         // let channel_data = FrameData::Audio {
         //     timestamp: *timestamp,
@@ -546,8 +546,8 @@ impl RTMPServerSession {
 
     pub async fn on_meta_data(
         &mut self,
-        data: &mut BytesMut,
-        timestamp: &u32,
+        _data: &mut BytesMut,
+        _timestamp: &u32,
     ) -> Result<(), SessionError> {
         // let channel_data = FrameData::MetaData {
         //     timestamp: *timestamp,

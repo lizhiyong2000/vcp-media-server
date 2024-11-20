@@ -3,7 +3,7 @@ use md5;
 // use serde_derive::Deserialize;
 
 
-use super::errors::{AuthError};
+use super::errors::AuthError;
 use vcp_media_common::scanf;
 
 #[derive(Debug, Clone, Default)]

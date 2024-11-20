@@ -10,11 +10,11 @@ use vcp_media_common::Result;
 use vcp_media_rtmp::session::server_session::RTMPServerSession;
 use vcp_media_rtsp::session::server_session::RTSPServerSession;
 
+use crate::manager::service::ServiceManager;
 use log::{self, info};
+use manager::stream_hub::StreamHub;
 use std::sync::Arc;
 use tokio::signal;
-use crate::manager::service::ServiceManager;
-use manager::stream_hub::StreamHub;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,12 +28,9 @@ async fn main() -> Result<()> {
     // let es2 = event_sender.clone();
 
 
+
     let mut manager = ServiceManager::new("./config.toml");
     manager.start_service().await;
-
-    let mut stream_hub = StreamHub::new();
-    stream_hub.run().await;
-
 
 
     signal::ctrl_c().await?;

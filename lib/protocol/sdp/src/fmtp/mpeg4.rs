@@ -1,5 +1,5 @@
 use crate::errors::SdpError;
-use base64::{engine::general_purpose, Engine as _};
+// use base64::{engine::general_purpose, Engine as _};
 use bytes::{BufMut, BytesMut};
 use vcp_media_common::{Marshal, Unmarshal};
 

@@ -1,7 +1,7 @@
+use crate::common::define::{ PublishType, SubscriberInfo};
 use async_trait::async_trait;
 use bytes::BytesMut;
-use crate::common::define::{FrameDataSender, PublishType, SubscriberInfo};
-
+use vcp_media_common::media::FrameDataSender;
 
 #[derive(Debug)]
 pub enum TransceiverEvent {
@@ -26,14 +26,14 @@ pub enum TransceiverEvent {
 
 
 #[async_trait]
-pub trait StreamSource{
+pub trait StreamSource {
     async fn handle_input(&mut self);
     fn get_source_id(&self) -> String;
     fn get_source_type(&self) -> PublishType;
 
-    fn detach_sink(&mut self, sink:&mut Box<dyn StreamSink>) -> String;
+    fn detach_sink(&mut self, sink: &mut Box<dyn StreamSink>) -> String;
 
-    fn has_sinks(&self) -> bool{return false;}
+    fn has_sinks(&self) -> bool { return false; }
 
     async fn start(&mut self);
 
@@ -41,13 +41,11 @@ pub trait StreamSource{
 }
 
 #[async_trait]
-pub trait StreamSink{
+pub trait StreamSink {
     fn send_data(&mut self, data: &BytesMut);
-    async fn link_to_source(&mut self, sink:&mut Box<dyn StreamSource>);
+    async fn link_to_source(&mut self, sink: &mut Box<dyn StreamSource>);
 
     async fn handle_output(&mut self);
 }
 
-pub trait StreamFilter : StreamSource + StreamSink{
-
-}
+pub trait StreamFilter: StreamSource + StreamSink {}

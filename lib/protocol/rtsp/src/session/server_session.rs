@@ -19,6 +19,7 @@ use log::{debug, error, info};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use futures::SinkExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use vcp_media_common::bytesio::bytes_errors::BytesWriteError;
@@ -34,7 +35,7 @@ use vcp_media_common::server::TcpSession;
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
 use vcp_media_common::Marshal;
 use vcp_media_common::Marshal as RtpMarshal;
-use vcp_media_common::media::FrameData;
+use vcp_media_common::media::{FrameData, FrameDataSender};
 use vcp_media_common::Unmarshal;
 use vcp_media_rtp::errors::UnPackerError;
 use vcp_media_rtp::RtpPacket;
@@ -46,10 +47,13 @@ pub struct InterleavedBinaryData {
     length: u16,
 }
 
+
 #[async_trait]
 pub trait RtspServerSessionHandler : Send + Sync {
 
-    async fn handle_rtp_over_rtsp_message(  &mut self, session: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>{
+    fn get_frame_sender(&mut self)->Option<FrameDataSender>;
+
+    async fn handle_rtp_over_rtsp_message(&mut self, session: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>{
         Ok(())
     }
 
@@ -536,29 +540,40 @@ impl RTSPServerSession{
         // }
 
         // let sender = event_result_receiver.await??.0.unwrap();
+        if let Some(h) =  self.handler.as_mut(){
 
-        for track in self.tracks.values_mut() {
-            // let sender_out = sender.clone();
-            let mut rtp_channel_guard = track.rtp_channel.lock().await;
+            for track in self.tracks.values_mut() {
+                if let Some(mut sender_out)  = h.get_frame_sender(){
+                    let mut rtp_channel_guard = track.rtp_channel.lock().await;
 
-            rtp_channel_guard.on_frame_handler(Box::new(
-                move |msg: FrameData| -> Result<(), UnPackerError> {
-                    // if let Err(err) = sender_out.send(msg) {
-                    //     log::error!("send frame error: {}", err);
-                    // }
-                    info!("received frame: {:?}", msg);
-                    Ok(())
-                },
-            ));
+                    rtp_channel_guard.on_frame_handler(Box::new(
+                        move |msg: FrameData| -> Result<(), UnPackerError> {
+                            if let Err(err) = sender_out.send(msg.clone()) {
+                                log::error!("send frame error: {}", err);
+                            }
 
-            let rtcp_channel = Arc::clone(&track.rtcp_channel);
-            rtp_channel_guard.on_packet_for_rtcp_handler(Box::new(move |packet: RtpPacket| {
-                let rtcp_channel_in = Arc::clone(&rtcp_channel);
-                Box::pin(async move {
-                    rtcp_channel_in.lock().await.on_packet(packet);
-                })
-            }));
+                            // let _ = async {
+                            //     if let Some(h) = self.handler.as_mut() {
+                            //         h.on_frame_data(msg).await;
+                            //     }
+                            // };
+                            Ok(())
+                        },
+                    ));
+
+                    let rtcp_channel = Arc::clone(&track.rtcp_channel);
+                    rtp_channel_guard.on_packet_for_rtcp_handler(Box::new(move |packet: RtpPacket| {
+                        let rtcp_channel_in = Arc::clone(&rtcp_channel);
+                        Box::pin(async move {
+                            rtcp_channel_in.lock().await.on_packet(packet);
+                        })
+                    }));
+                }
+
+            }
         }
+
+
 
 
         self.send_response(&response).await?;

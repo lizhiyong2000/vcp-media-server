@@ -3,7 +3,7 @@ mod errors;
 use crate::scanf;
 use indexmap::IndexMap;
 use std::fmt::{self, Display};
-use tokio::task::LocalEnterGuard;
+// use tokio::task::LocalEnterGuard;
 
 use crate::http::errors::HttpError;
 use crate::{Marshal, Unmarshal};

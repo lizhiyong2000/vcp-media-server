@@ -1,5 +1,6 @@
-use std::fmt::{write, Debug, Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use bytes::BytesMut;
+use tokio::sync::mpsc;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum VideoCodecType {
@@ -59,6 +60,11 @@ impl Debug for FrameData {
     }
 }
 
+
+//used to transfer a/v frame between different protocols(rtmp/rtsp/webrtc/http-flv/hls)
+//or send a/v frame data from publisher to subscribers.
+pub type FrameDataSender = mpsc::UnboundedSender<FrameData>;
+pub type FrameDataReceiver = mpsc::UnboundedReceiver<FrameData>;
 
 //Used to pass rtp raw data.
 #[derive(Clone)]

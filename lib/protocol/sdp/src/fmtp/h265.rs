@@ -1,6 +1,6 @@
 use crate::errors::SdpError;
-use base64::{engine::general_purpose, Engine as _};
-use bytes::{BufMut, BytesMut};
+// use base64::{engine::general_purpose, Engine as _};
+use bytes:: BytesMut;
 use vcp_media_common::{Marshal, Unmarshal};
 
 #[derive(Debug, Clone, Default)]

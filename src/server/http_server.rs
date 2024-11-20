@@ -1,13 +1,13 @@
 // extern crate serde;
 
 use axum::{
-    routing::{get, post},
     http::StatusCode,
+    routing::get,
     Json, Router,
 };
 
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 
 pub async fn start_api_server(listener: tokio::net::TcpListener) {

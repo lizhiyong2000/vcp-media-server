@@ -12,7 +12,7 @@ use crate::errors::SdpError;
 use crate::errors::SdpError::SessionOriginError;
 use rtpmap::RtpMap;
 use std::collections::HashMap;
-use std::time::Duration;
+// use std::time::Duration;
 use vcp_media_common::{Marshal, Unmarshal};
 
 
@@ -422,7 +422,7 @@ impl Marshal<String> for SessionMediaInfo {
         }
 
         if self.bandwidth.len() > 0 {
-            let mut bw_str = "".to_string();
+            let _bw_str = "".to_string();
 
             for bw in &self.bandwidth {
                 media_info = format!("{media_info}{}", bw.marshal());
@@ -693,7 +693,7 @@ impl Marshal<String> for SessionDescription {
         }
 
         if self.bandwidth.len() > 0 {
-            let mut bw_str = "".to_string();
+            let _bw_str = "".to_string();
 
             for bw in &self.bandwidth {
                 sdp_str = format!("{sdp_str}{}", bw.marshal());

@@ -2,8 +2,8 @@ mod h264;
 mod h265;
 mod mpeg4;
 
-use base64::Engine as _;
-use bytes::BufMut;
+// use base64::Engine as _;
+// use bytes::BufMut;
 use vcp_media_common::{Marshal, Unmarshal};
 
 use crate::errors::SdpError;

@@ -1,5 +1,5 @@
-use crate::server::{NetworkServer, NetworkSession, ServerSessionHandler, SessionAlloc, SessionError, SessionManager, TcpServerHandler, TcpSession};
-use log::{error, info};
+use crate::server::{NetworkServer, SessionAlloc, SessionError, SessionManager, TcpServerHandler, TcpSession};
+use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -24,15 +24,15 @@ where T: TcpSession + 'static
 impl<'a, T> SessionManager<T> for TcpServer<T>
 where T: TcpSession
 {
-    fn get_session(&self, key: &str) -> Box<T> {
+    fn get_session(&self, _key: &str) -> Box<T> {
         todo!()
     }
 
-    fn add_session(&self, session: Box<T>) -> Result<bool, SessionError> {
+    fn add_session(&self, _session: Box<T>) -> Result<bool, SessionError> {
         todo!()
     }
 
-    fn del_session(&self, session: Box<T>) -> Result<bool, SessionError> {
+    fn del_session(&self, _session: Box<T>) -> Result<bool, SessionError> {
         todo!()
     }
 }
@@ -45,7 +45,7 @@ where T: TcpSession + 'static
         return T::session_type();
     }
 
-    pub async fn notify_session_created(&self, session: Arc<Box<T>>){
+    pub async fn notify_session_created(&self, _session: Arc<Box<T>>){
 
         // session.session_type()
 

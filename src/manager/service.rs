@@ -1,11 +1,13 @@
 use crate::server::http_server;
+use crate::server::rtsp_server::RtspServer;
 use async_trait::async_trait;
 use log::{self, info};
 use vcp_media_common::server::tcp_server::TcpServer;
 use vcp_media_common::server::NetworkServer;
 use vcp_media_rtmp::session::server_session::RTMPServerSession;
 use vcp_media_rtsp::session::server_session::RTSPServerSession;
-use crate::server::rtsp_server::RtspServer;
+use crate::manager::message::StreamHubEventSender;
+use crate::manager::stream_hub::StreamHub;
 
 pub struct ServiceManager {
     config: Config,
@@ -22,18 +24,25 @@ impl ServiceManager {
     }
 
     pub async fn start_service(&mut self) {
-        tokio::spawn(async {
+
+        let mut stream_hub = StreamHub::new();
+
+        // tokio::spawn(async {
             Self::start_http_service("0.0.0.0:3000".to_string()).await;
-        });
+        // });
 
-        tokio::spawn(async {
-            Self::start_rtsp_service("0.0.0.0:8554".to_string()).await;
-        });
+        // tokio::spawn(async{
+            Self::start_rtsp_service("0.0.0.0:8554".to_string(), &mut stream_hub).await;
+        // });
 
-        tokio::spawn(async {
+        // tokio::spawn(async {
             Self::start_rtmp_service("0.0.0.0:1935".to_string()).await;
-        });
+        // });
 
+        tokio::spawn(async move {
+            stream_hub.run().await;
+            log::info!("stream hub end...");
+        });
     }
 
     async fn start_http_service(addr: String) {
@@ -41,30 +50,44 @@ impl ServiceManager {
 
         // info!("to start api service");
 
-        info!("HTTP server started listen at:{}", addr);
+        tokio::spawn(async move {
+            info!("HTTP server started listen at:{}", addr);
+            // info!("to start api service");
+            http_server::start_api_server(listener).await;
 
-        // info!("to start api service");
-        http_server::start_api_server(listener).await;
+            info!("HTTP server end running.");
+        });
 
-        info!("HTTP server end running.");
+
     }
 
-    async fn start_rtsp_service(addr: String) {
-        let mut rtsp_server = RtspServer::new(addr);
-        let res = rtsp_server.start().await;
-        match res {
-            Ok(_) => info!("{} server end running.", rtsp_server.session_type()),
-            Err(e) => info!("{} server error:{}", rtsp_server.session_type(), e)
-        }
+    async fn start_rtsp_service(addr: String, stream_hub_sender: &mut StreamHub) {
+        let mut rtsp_server = RtspServer::new(addr, stream_hub_sender.get_sender());
+        tokio::spawn(async move {
+
+            let res = rtsp_server.start().await;
+            match res {
+                Ok(_) => info!("{} server end running.", rtsp_server.session_type()),
+                Err(e) => info!("{} server error:{}", rtsp_server.session_type(), e)
+            }
+        });
+
+
+
     }
 
     async fn start_rtmp_service(addr: String) {
-        let mut rtmp_server: TcpServer<RTMPServerSession> = TcpServer::new(addr, None);
-        let res = rtmp_server.start().await;
-        match res {
-            Ok(_) => info!("{} server end running.", rtmp_server.session_type()),
-            Err(e) => info!("{} server error:{}", rtmp_server.session_type(), e)
-        }
+
+        tokio::spawn(async move {
+            let mut rtmp_server: TcpServer<RTMPServerSession> = TcpServer::new(addr, None);
+            let res = rtmp_server.start().await;
+            match res {
+                Ok(_) => info!("{} server end running.", rtmp_server.session_type()),
+                Err(e) => info!("{} server error:{}", rtmp_server.session_type(), e)
+            }
+        });
+
+
     }
 }
 
