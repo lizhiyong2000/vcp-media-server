@@ -11,6 +11,7 @@ use crate::transmitter::source::rtsp_push_source::RtspPushSource;
 use crate::transmitter::source::StreamSource;
 use sink::fake_sink::FakeSink;
 use vcp_media_common::media::FrameDataReceiver;
+use vcp_media_sdp::SessionDescription;
 
 #[derive(Debug, Error)]
 pub enum StreamTransmitError {
@@ -62,14 +63,14 @@ impl StreamTransmitter {
         }
     }
 
-    pub async fn run(self, source_type: PublishType, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver) -> Result<(), StreamTransmitError> {
+    pub async fn run(self, source_type: PublishType, sdp:SessionDescription, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver) -> Result<(), StreamTransmitError> {
         let mut source = match source_type {
             // PublishType::RtmpPush => {
             //     // RtmpPushSource::new(stream_id.clone(), data_receiver);
             // }
             // PublishType::RtmpPull => {}
             PublishType::RtspPush => {
-                RtspPushSource::new(self.stream_id.clone(), data_receiver, event_receiver)
+                RtspPushSource::new(self.stream_id.clone(), sdp, data_receiver, event_receiver)
             }
             // PublishType::RtspPull => {}
             // PublishType::WhipPush => {}

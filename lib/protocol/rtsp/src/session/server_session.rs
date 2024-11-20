@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use futures::SinkExt;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use vcp_media_common::bytesio::bytes_errors::BytesWriteError;
 use vcp_media_common::bytesio::bytes_reader::BytesReader;
 use vcp_media_common::bytesio::bytes_writer::{AsyncBytesWriter, BytesWriter};
@@ -35,7 +35,7 @@ use vcp_media_common::server::TcpSession;
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
 use vcp_media_common::Marshal;
 use vcp_media_common::Marshal as RtpMarshal;
-use vcp_media_common::media::{FrameData, FrameDataSender};
+use vcp_media_common::media::{FrameData, FrameDataReceiver, FrameDataSender};
 use vcp_media_common::Unmarshal;
 use vcp_media_rtp::errors::UnPackerError;
 use vcp_media_rtp::RtpPacket;
@@ -51,7 +51,9 @@ pub struct InterleavedBinaryData {
 #[async_trait]
 pub trait RtspServerSessionHandler : Send + Sync {
 
-    fn get_frame_sender(&mut self)->Option<FrameDataSender>;
+    // fn get_frame_sender(&mut self)->Option<FrameDataSender>;
+    // fn get_frame_receiver(&mut self)->Option<FrameDataReceiver>;
+    //
 
     async fn handle_rtp_over_rtsp_message(&mut self, session: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>{
         Ok(())
@@ -61,11 +63,11 @@ pub trait RtspServerSessionHandler : Send + Sync {
         Ok(None)
     }
 
-    async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
-        Ok(None)
+    async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<SessionDescription, RtspSessionError> {
+        Ok(SessionDescription::default())
     }
 
-    async fn handle_announce(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_announce(&mut self, rtsp_request: &RtspRequest, frame_receiver: FrameDataReceiver) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
@@ -73,7 +75,7 @@ pub trait RtspServerSessionHandler : Send + Sync {
         Ok(None)
     }
 
-    async fn handle_play(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError>{
+    async fn handle_play(&mut self, rtsp_request: &RtspRequest, frame_sender: FrameDataSender) -> Result<Option<RtspResponse>, RtspSessionError>{
         Ok(None)
     }
 
@@ -167,6 +169,9 @@ pub struct RTSPServerSession {
     sdp: SessionDescription,
     session_id: Option<Uuid>,
     handler: Option<Box<dyn RtspServerSessionHandler>>,
+
+    frame_sender: Option<FrameDataSender>,
+    frame_receiver: Option<FrameDataReceiver>,
 }
 
 
@@ -228,6 +233,8 @@ impl RTSPServerSession {
             sdp: SessionDescription::default(),
             session_id: None,
             handler,
+            frame_sender: None,
+            frame_receiver: None,
         }
     }
 
@@ -429,30 +436,21 @@ impl RTSPServerSession{
     }
 
     async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
-        let custom_response = {
-            if let Some(h) =  self.handler.as_mut(){
-                h.handle_describe(rtsp_request).await?
-            } else {
-                None
-            }
-        };
+        if let Some(h) =  self.handler.as_mut() {
+            let sdp = h.handle_describe(rtsp_request).await?;
+            self.sdp = sdp.clone();
+            self.new_tracks()?;
+        }
 
-        let response =  {
-            match custom_response {
-                Some(r) => { r }
-                None => {
-                    let status_code = http::StatusCode::OK;
-                    let mut response = message::gen_response(status_code, rtsp_request);
-                    let sdp = self.sdp.marshal();
-                    debug!("sdp: {}", sdp);
-                    response.body = Some(sdp);
-                    response
-                        .headers
-                        .insert("Content-Type".to_string(), "application/sdp".to_string());
-                    response
-                }
-            }
-        };
+
+        let status_code = http::StatusCode::OK;
+        let mut response = message::gen_response(status_code, rtsp_request);
+        let sdp = self.sdp.marshal();
+        debug!("sdp: {}", sdp);
+        response.body = Some(sdp);
+        response
+            .headers
+            .insert("Content-Type".to_string(), "application/sdp".to_string());
 
 
         // The sender is used for sending sdp information from the server session to client session
@@ -488,9 +486,12 @@ impl RTSPServerSession{
     }
 
     async fn handle_announce(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+
         let custom_response = {
             if let Some(h) =  self.handler.as_mut(){
-                h.handle_announce(rtsp_request).await?
+                h.handle_announce(rtsp_request, receiver).await?
             } else {
                 None
             }
@@ -540,15 +541,15 @@ impl RTSPServerSession{
         // }
 
         // let sender = event_result_receiver.await??.0.unwrap();
-        if let Some(h) =  self.handler.as_mut(){
 
             for track in self.tracks.values_mut() {
-                if let Some(mut sender_out)  = h.get_frame_sender(){
+                {
                     let mut rtp_channel_guard = track.rtp_channel.lock().await;
-
+                    let sender_out = sender.clone();
                     rtp_channel_guard.on_frame_handler(Box::new(
                         move |msg: FrameData| -> Result<(), UnPackerError> {
-                            if let Err(err) = sender_out.send(msg.clone()) {
+                            // info!("server session received frame:{:?}", msg);
+                            if let Err(err) = sender_out.send(msg) {
                                 log::error!("send frame error: {}", err);
                             }
 
@@ -571,10 +572,6 @@ impl RTSPServerSession{
                 }
 
             }
-        }
-
-
-
 
         self.send_response(&response).await?;
 
@@ -689,9 +686,13 @@ impl RTSPServerSession{
     }
 
     async fn handle_play(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+
         let custom_response = {
             if let Some(h) =  self.handler.as_mut(){
-                h.handle_play(rtsp_request).await?
+                h.handle_play(rtsp_request, sender).await?
             } else {
                 None
             }
@@ -760,72 +761,54 @@ impl RTSPServerSession{
 
 
         self.send_response(&response).await?;
+
+
+            let mut retry_times = 0;
+            loop {
+                if let Some(frame_data) = receiver.recv().await {
+                    match frame_data {
+                        FrameData::Audio {
+                            timestamp,
+                            mut data,
+                        } => {
+                            if let Some(audio_track) = self.tracks.get_mut(&TrackType::Audio) {
+                                audio_track
+                                    .rtp_channel
+                                    .lock()
+                                    .await
+                                    .on_frame(&mut data, timestamp)
+                                    .await?;
+                            }
+                        }
+                        FrameData::Video {
+                            timestamp,
+                            mut data,
+                        } => {
+                            if let Some(video_track) = self.tracks.get_mut(&TrackType::Video) {
+                                video_track
+                                    .rtp_channel
+                                    .lock()
+                                    .await
+                                    .on_frame(&mut data, timestamp)
+                                    .await?;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    retry_times += 1;
+                    log::info!(
+                    "send_channel_data: no data receives ,retry {} times!",
+                    retry_times
+                );
+
+                    if retry_times > 10 {
+                        return Err(RtspSessionError::CannotReceiveFrameData);
+                    }
+                }
+            }
+
         Ok(())
-
-        // let (event_result_sender, event_result_receiver) = oneshot::channel();
-
-        // let publish_event = StreamHubEvent::Subscribe {
-        //     identifier: StreamIdentifier::Rtsp {
-        //         stream_path: rtsp_request.uri.path.clone(),
-        //     },
-        //     info: self.get_subscriber_info(),
-        //     result_sender: event_result_sender,
-        // };
-
-        // if self.event_producer.send(publish_event).is_err() {
-        //     return Err(SessionError {
-        //         value: SessionError::StreamHubEventSendErr,
-        //     });
-        // }
-
-        // let mut receiver = event_result_receiver.await?.frame_receiver.unwrap();
-
-        // let mut retry_times = 0;
-        // loop {
-        //     if let Some(frame_data) = receiver.recv().await {
-        //         match frame_data {
-        //     FrameData::Audio {
-        //         timestamp,
-        //         mut data,
-        //     } => {
-        //         if let Some(audio_track) = self.tracks.get_mut(&TrackType::Audio) {
-        //             audio_track
-        //                 .rtp_channel
-        //                 .lock()
-        //                 .await
-        //                 .on_frame(&mut data, timestamp)
-        //                 .await?;
-        //         }
-        //     }
-        //     FrameData::Video {
-        //         timestamp,
-        //         mut data,
-        //     } => {
-        //         if let Some(video_track) = self.tracks.get_mut(&TrackType::Video) {
-        //             video_track
-        //                 .rtp_channel
-        //                 .lock()
-        //                 .await
-        //                 .on_frame(&mut data, timestamp)
-        //                 .await?;
-        //         }
-        //     }
-        //             _ => {}
-        //         }
-        //     } else {
-        //         retry_times += 1;
-        //         log::info!(
-        //             "send_channel_data: no data receives ,retry {} times!",
-        //             retry_times
-        //         );
-
-        //         if retry_times > 10 {
-        //             return Err(SessionError {
-        //                 value: SessionError::CannotReceiveFrameData,
-        //             });
-        //         }
-        //     }
-        // }
     }
 
     async fn handle_record(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {

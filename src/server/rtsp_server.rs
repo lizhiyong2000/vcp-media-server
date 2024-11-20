@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use vcp_media_common::bytesio::bytes_reader::BytesReader;
 use vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter;
 use vcp_media_common::bytesio::bytesio::{TNetIO, UdpIO};
@@ -20,10 +20,11 @@ use vcp_media_rtsp::session::errors::RtspSessionError;
 use vcp_media_rtsp::session::server_session::{RTSPServerSession, RTSPServerSessionContext, RtspServerSessionHandler};
 
 use crate::manager::message;
-use crate::manager::message::{StreamHubEvent, StreamHubEventSender, StreamPublishInfo};
+use crate::manager::message::{StreamHubEvent, StreamHubEventSender, StreamPublishInfo, StreamSubscribeInfo};
 use vcp_media_common::http::HttpRequest as RtspRequest;
 use vcp_media_common::http::HttpResponse as RtspResponse;
-use vcp_media_common::media::{FrameData, FrameDataSender};
+use vcp_media_common::media::{FrameData, FrameDataReceiver, FrameDataSender, StreamInformation};
+use vcp_media_common::media::StreamInformation::Sdp;
 use vcp_media_common::server::{NetworkServer, NetworkSession, SessionError, TcpServerHandler, TcpSession};
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
 use vcp_media_rtsp::message::codec;
@@ -34,16 +35,19 @@ use vcp_media_sdp::SessionDescription;
 pub struct VcpRtspServerSessionHandler {
     // session: Option<Arc<Mutex<RTSPServerSession>>>,
     // tracks: HashMap<TrackType, RtspTrack>,
-    // sdp: SessionDescription,
+    sdp: SessionDescription,
     // session_id: Option<Uuid>,
     event_producer: StreamHubEventSender,
-    frame_sender: Option<FrameDataSender>,
+    // frame_sender: Option<FrameDataSender>,
+    // frame_receiver: Option<FrameDataReceiver>,
 }
 impl VcpRtspServerSessionHandler {
     pub fn new(event_producer: StreamHubEventSender) -> Self {
         Self {
             event_producer,
-            frame_sender:None,
+            // frame_sender:None,
+            // frame_receiver:None,
+            sdp: SessionDescription::default(),
             // session:None,
             // tracks: HashMap::new(),
             // sdp: SessionDescription::default(),
@@ -77,9 +81,13 @@ impl VcpRtspServerSessionHandler {
 
 #[async_trait]
 impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
-    fn get_frame_sender(&mut self) -> Option<FrameDataSender> {
-        return self.frame_sender.clone()
-    }
+    // fn get_frame_sender(&mut self) -> Option<FrameDataSender> {
+    //     return self.frame_sender.clone()
+    // }
+    //
+    // fn get_frame_receiver(&mut self) -> Option<FrameDataReceiver> {
+    //     return self.frame_receiver.clone()
+    // }
     // async fn on_frame_data(&mut self, frame_data: FrameData) {
     //     info!("Received frame data from {:?}", frame_data);
     //
@@ -110,38 +118,38 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         Ok(None)
     }
 
-    async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
-        Ok(None)
+    async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<SessionDescription, RtspSessionError> {
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        let request_event = StreamHubEvent::Request{
+            stream_id: "1".to_string(),
+            result_sender: sender,
+        };
+
+        self.event_producer.send(request_event);
+
+        if let Some(StreamInformation::Sdp { data }) = receiver.recv().await {
+            if let Ok(sdp) = SessionDescription::unmarshal(&data) {
+                self.sdp = sdp.clone();
+                return Ok(sdp);
+                //it can new tracks when get the sdp information;
+            }
+        }
+
+        Err(RtspSessionError::StreamHubEventSendErr)
+
     }
 
-    async fn handle_announce(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
-        // The sender is used for sending sdp information from the server session to client session
-        // receiver is used to receive the sdp information
-        // let (sender, mut receiver) = mpsc::unbounded_channel<String>();
+    async fn handle_announce(&mut self, rtsp_request: &RtspRequest, frame_receiver:FrameDataReceiver) -> Result<Option<RtspResponse>, RtspSessionError> {
 
-        // let request_event = StreamHubEvent::Request {
-        //     identifier: StreamIdentifier::Rtsp {
-        //         stream_path: rtsp_request.uri.path.clone(),
-        //     },
-        //     sender,
-        // };
-
-        // if self.event_producer.send(request_event).is_err() {
-        //     return Err(SessionError {
-        //         value: SessionError::StreamHubEventSendErr,
-        //     });
-        // }
-
-        // if let Some(Information::Sdp { data }) = receiver.recv().await {
-        //     if let Some(sdp) = Sdp::unmarshal(&data) {
-        //         self.sdp = sdp;
-        //         //it can new tracks when get the sdp information;
-        //         self.new_tracks()?;
-        //     }
-        // }
+        if let Some(request_body) = &rtsp_request.body {
+            if let sdp = SessionDescription::unmarshal(request_body)? {
+                self.sdp = sdp;
+            }
+        }
 
         let (result_sender, result_receiver) = oneshot::channel();
-
 
         let publish_event = StreamHubEvent::Publish{
             info:StreamPublishInfo {
@@ -149,7 +157,8 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
                 stream_type: "RTSP".to_string(),
                 url: "rtsp://1111.1.1.1.".to_string(),
             },
-
+            sdp: self.sdp.clone(),
+            receiver:frame_receiver,
             result_sender: result_sender,
         };
 
@@ -157,7 +166,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
 
         let sender = match result_receiver.await? {
             Ok(x) => {
-                self.frame_sender = Some(x);
+                // self.frame_sender = Some(x);
                 info!("rtsp server frame sender settled")
             },
             Err(_) => todo!(),
@@ -170,7 +179,27 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         Ok(None)
     }
 
-    async fn handle_play(&mut self, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_play(&mut self, _rtsp_request: &RtspRequest, frame_sender: FrameDataSender) -> Result<Option<RtspResponse>, RtspSessionError> {
+
+        let (event_result_sender, event_result_receiver) = oneshot::channel();
+
+        let publish_event = StreamHubEvent::Subscribe {
+            info:StreamSubscribeInfo {
+                stream_id: "1".to_string(),
+                stream_type: "RTSP".to_string(),
+                url: "rtsp://1111.1.1.1.".to_string(),
+            },
+            sender: frame_sender,
+            result_sender: event_result_sender,
+        };
+
+        if self.event_producer.send(publish_event).is_err() {
+            return Err(RtspSessionError::StreamHubEventSendErr);
+        }
+
+        // let mut receiver = event_result_receiver.await?.unwrap();
+        // // self.frame_receiver= Some(receiver);
+
         Ok(None)
     }
 

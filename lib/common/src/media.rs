@@ -75,6 +75,6 @@ pub enum PacketData {
 
 //used to save data which needs to be transferred between client/server sessions
 #[derive(Clone)]
-pub enum Information {
+pub enum StreamInformation {
     Sdp { data: String },
 }

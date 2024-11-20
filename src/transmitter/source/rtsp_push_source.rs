@@ -1,6 +1,6 @@
 use crate::common::define::{ StreamTransmitEventReceiver};
 use crate::manager::message;
-use crate::manager::message::{EventKind, StreamTransmitEvent};
+use crate::manager::message::{StreamTransmitEvent};
 use crate::transmitter::source::StreamSource;
 use crate::transmitter::StreamTransmitError;
 use async_trait::async_trait;
@@ -9,10 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use log::info;
 use tokio::sync::broadcast;
-use vcp_media_common::media::{FrameData, FrameDataReceiver, FrameDataSender};
+use vcp_media_common::Marshal;
+use vcp_media_common::media::{FrameData, FrameDataReceiver, FrameDataSender, StreamInformation};
+use vcp_media_sdp::SessionDescription;
 
 pub struct RtspPushSource {
     stream_id: String,
+    sdp: SessionDescription,
     data_receiver: FrameDataReceiver,
     event_receiver: StreamTransmitEventReceiver,
     exit: broadcast::Sender<()>,
@@ -32,17 +35,14 @@ impl StreamSource for RtspPushSource {
             // info!("rtsp push source loop");
             tokio::select! {
                 data = self.data_receiver.recv() => {
-
-
                     self.receive_frame_data(data).await;
                 }
 
                 event = self.event_receiver.recv() =>{
-
                     self.receive_event(event).await;
                 }
                 _ = receiver.recv()=>{
-                info!("rtsp exit event received");
+                    info!("rtsp exit event received");
                     break;
                 }
             }
@@ -55,10 +55,11 @@ impl StreamSource for RtspPushSource {
 
 
 impl RtspPushSource {
-    pub fn new(stream_id: String, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver) -> Self {
+    pub fn new(stream_id: String, sdp:SessionDescription, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver) -> Self {
         let (tx, _) = broadcast::channel::<()>(1);
         Self {
             stream_id,
+            sdp,
             data_receiver,
             event_receiver,
             exit: tx,
@@ -88,7 +89,7 @@ impl RtspPushSource {
             info!("rtsp event received");
 
             match event {
-                StreamTransmitEvent::Subscribe(info)
+                StreamTransmitEvent::Subscribe{ sender, info }
                 => {
                     // if let Err(err) = stream_handler
                     //     .send_prior_data(sender.clone(), info.sub_type)
@@ -97,6 +98,8 @@ impl RtspPushSource {
                     //     log::error!("receive_event_loop send_prior_data err: {}", err);
                     //     break;
                     // }
+
+                    self.frame_senders.lock().await.insert(info.stream_id, sender);
                     // match sender {
                     //     DataSender::Frame {
                     //         sender: frame_sender,
@@ -156,6 +159,13 @@ impl RtspPushSource {
                 // TransceiverEvent::Request { sender } => {
                 //     // stream_handler.send_information(sender).await;
                 // }
+                StreamTransmitEvent::Request{ sender } => {
+                    if let Err(err) = sender.send(StreamInformation::Sdp {
+                        data: self.sdp.marshal(),
+                    }) {
+                        log::error!("send_information of rtsp error: {}", err);
+                    }
+                }
             }
         }
     }
@@ -169,7 +179,7 @@ impl RtspPushSource {
                     data: _,
                 } => {}
                 FrameData::Audio { timestamp, data } => {
-                    info!("rtsp audio frame data received");
+                    // info!("transmit audio frame data received, len:{}", data.len());
                     let data = FrameData::Audio {
                         timestamp,
                         data: data.clone(),
@@ -177,19 +187,19 @@ impl RtspPushSource {
 
                     for (_, v) in self.frame_senders.lock().await.iter() {
                         if let Err(audio_err) = v.send(data.clone()).map_err(|_| StreamTransmitError::SendAudioError) {
-                            log::error!("Transmiter send error: {}", audio_err);
+                            log::error!("Transmitter send audio frame error: {}", audio_err);
                         }
                     }
                 }
                 FrameData::Video { timestamp, data } => {
-                    info!("rtsp video frame data received");
+                    // info!("transmit video frame, len:{}", data.len());
                     let data = FrameData::Video {
                         timestamp,
                         data: data.clone(),
                     };
                     for (_, v) in self.frame_senders.lock().await.iter() {
                         if let Err(video_err) = v.send(data.clone()).map_err(|_| StreamTransmitError::SendVideoError) {
-                            log::error!("Transmiter send error: {}", video_err);
+                            log::error!("Transmitter send video frame error: {}", video_err);
                         }
                     }
                 }
@@ -201,7 +211,7 @@ impl RtspPushSource {
                     };
                     for (_, v) in self.frame_senders.lock().await.iter() {
                         if let Err(media_err) = v.send(data.clone()).map_err(|_| StreamTransmitError::SendMediaInfoError) {
-                            log::error!("Transmiter send error: {}", media_err);
+                            log::error!("Transmitter send frame media info error: {}", media_err);
                         }
                     }
                 }

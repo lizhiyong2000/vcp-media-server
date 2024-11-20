@@ -9,17 +9,18 @@ use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::UnboundedSender;
-use vcp_media_common::media::FrameDataSender;
+use vcp_media_common::media::{FrameDataReceiver, FrameDataSender, StreamInformation};
+use vcp_media_sdp::SessionDescription;
 // use tokio::sync::broadcast::error::SendError;
 use crate::manager::stream_hub::StreamHubError;
 
-#[derive(Clone, Debug, EnumIter, Hash, Eq, PartialEq, Copy)]
-pub enum EventKind {
-    ApplicationEvent = 0,
-    ApiEvent = 1,
-    StreamHubEvent = 2,
-    StreamTransmitEvent = 3,
-}
+// #[derive(Clone, Debug, EnumIter, Hash, Eq, PartialEq, Copy)]
+// pub enum EventKind {
+//     ApplicationEvent = 0,
+//     ApiEvent = 1,
+//     StreamHubEvent = 2,
+//     StreamTransmitEvent = 3,
+// }
 
 // #[derive(Debug)]
 // pub enum EventKindInfo {
@@ -70,7 +71,11 @@ pub struct StreamPublishInfo {
 }
 
 #[derive(Clone, Debug)]
-pub struct StreamSubscribeInfo {}
+pub struct StreamSubscribeInfo {
+    pub stream_id: String,
+    pub stream_type: String,
+    pub url: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct StreamPullInfo {}
@@ -93,17 +98,29 @@ pub struct StreamPullInfo {}
 pub enum StreamHubEvent {
     Publish{
         info:StreamPublishInfo,
+        sdp:SessionDescription,
+        receiver: FrameDataReceiver,
         result_sender:PublishResultSender,
     },
-    Subscribe(StreamSubscribeInfo),
+    Subscribe{
+        info:StreamSubscribeInfo,
+        sender: FrameDataSender,
+        result_sender:SubscribeResultSender,
+    },
+    Request {
+        stream_id: String,
+        result_sender: RequestResultSender,
+    },
     // StartRelay(StreamPublishInfo),
     // StopRelay(StreamPullInfo),
 }
 
 
 pub type StreamHubEventSender = UnboundedSender<StreamHubEvent>;
-pub type PublishResultSender = oneshot::Sender< Result<FrameDataSender, StreamHubError> >;
+pub type PublishResultSender = oneshot::Sender< Result<(), StreamHubError>>;
+pub type SubscribeResultSender = oneshot::Sender< Result<(), StreamHubError>>;
 
+pub type RequestResultSender = mpsc::UnboundedSender<StreamInformation>;
 
 
 // impl Debug for StreamHubEvent {
@@ -122,9 +139,15 @@ pub type PublishResultSender = oneshot::Sender< Result<FrameDataSender, StreamHu
 
 #[derive(Clone, Debug)]
 pub enum StreamTransmitEvent {
-    Subscribe(StreamSubscribeInfo),
+    Subscribe {
+        sender: FrameDataSender,
+        info: StreamSubscribeInfo,
+    },
     UnSubscribe(StreamSubscribeInfo),
     UnPublish,
+    Request{
+        sender: RequestResultSender,
+    }
 }
 
 // #[derive(Debug)]
