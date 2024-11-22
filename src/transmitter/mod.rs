@@ -11,7 +11,7 @@ use crate::transmitter::source::StreamSource;
 use sink::fake_sink::FakeSink;
 use vcp_media_common::media::FrameDataReceiver;
 use vcp_media_sdp::SessionDescription;
-use crate::common::stream::PublishType;
+use crate::common::stream::{PublishType, StreamId};
 use crate::manager::message::StreamTransmitEventReceiver;
 
 #[derive(Debug, Error)]
@@ -33,7 +33,7 @@ pub enum StreamTransmitError {
 //     RtmpPull,
 // }
 pub struct StreamTransmitter {
-    stream_id: String,
+    stream_id: StreamId,
     // source_type: PublishType,
     // source_element: Box<dyn StreamSource>,
     default_sink: Arc<Box<FakeSink>>,
@@ -41,7 +41,7 @@ pub struct StreamTransmitter {
 }
 
 impl StreamTransmitter {
-    pub fn new(stream_id: String) -> Self {
+    pub fn new(stream_id: StreamId) -> Self {
         // let source = match source_type {
         //     // PublishType::RtmpPush => {
         //     //     // RtmpPushSource::new(stream_id.clone(), data_receiver);
@@ -70,13 +70,17 @@ impl StreamTransmitter {
             //     // RtmpPushSource::new(stream_id.clone(), data_receiver);
             // }
             // PublishType::RtmpPull => {}
-            PublishType::RtspPush => {
+            PublishType::Push => {
+
                 RtspPushSource::new(self.stream_id.clone(), sdp, data_receiver, event_receiver)
             }
             // PublishType::RtspPull => {}
             // PublishType::WhipPush => {}
             // PublishType::WhepPull => {}
             // PublishType::RtpPush => {}
+            PublishType::Pull => {
+                todo!()
+            }
         };
 
 

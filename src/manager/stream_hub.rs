@@ -1,14 +1,12 @@
 use std::collections::HashMap;
-use crate::manager::message;
 use crate::manager::message::{RequestResultSender, StreamHubEvent, StreamPublishInfo, StreamSubscribeInfo, StreamTransmitEvent, StreamTransmitEventSender};
 use crate::transmitter::StreamTransmitter;
 use log::info;
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use vcp_media_common::media::{FrameData, FrameDataReceiver, FrameDataSender};
+use vcp_media_common::media::{FrameDataReceiver, FrameDataSender};
 use vcp_media_sdp::SessionDescription;
-use crate::common::stream::PublishType;
+use crate::common::stream::{PublishType, StreamId};
 
 #[derive(Debug, Error)]
 pub enum StreamHubError {
@@ -32,7 +30,7 @@ pub enum StreamHubError {
 pub struct StreamHub {
     event_sender: mpsc::UnboundedSender<StreamHubEvent>,
     event_receiver: mpsc::UnboundedReceiver<StreamHubEvent>,
-    streams: HashMap<String, StreamTransmitEventSender>,
+    streams: HashMap<StreamId, StreamTransmitEventSender>,
 }
 
 impl StreamHub {
@@ -72,6 +70,7 @@ impl StreamHub {
 
                 StreamHubEvent::UnPublish { info } => {
                     info!("=====[StreamHub] [UnPublish]:{:?}", info);
+                    self.handle_unpublish(info);
                 }
 
                 StreamHubEvent::Subscribe{info, sender, result_sender}  => {
@@ -90,6 +89,7 @@ impl StreamHub {
 
                 StreamHubEvent::UnSubscribe { info } => {
                     info!("=====[StreamHub] [UnSubscribe]:{:?}", info);
+                    self.handle_unsubscribe(info);
                 }
                 // StreamHubEvent::StreamPull(_) => {}
                 StreamHubEvent::Request { stream_id, result_sender } => {
@@ -111,14 +111,14 @@ impl StreamHub {
         info!("stream hub handle publish:{:?}", info);
 
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
-        let mut transceiver =
+        let transceiver =
             StreamTransmitter::new(info.stream_id.clone());
 
         // let statistic_data_sender = transceiver.get_statistics_data_sender();
         let identifier_clone = info.stream_id.clone();
 
         tokio::spawn(async move{
-            if let Err(err) = transceiver.run(PublishType::RtspPush, sdp, receiver, event_receiver).await {
+            if let Err(err) = transceiver.run(PublishType::Push, sdp, receiver, event_receiver).await {
                 log::error!(
                 "transceiver run error, identifier: {}, error: {}",
                 identifier_clone,
@@ -190,7 +190,7 @@ impl StreamHub {
 
     fn handle_request(
         &mut self,
-        identifier: String,
+        identifier: StreamId,
         sender: RequestResultSender,
     ) -> Result<(), StreamHubError> {
         if let Some(producer) = self.streams.get_mut(&identifier) {

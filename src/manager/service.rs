@@ -1,12 +1,9 @@
 use crate::server::http_server;
 use crate::server::rtsp_server::RtspServer;
-use async_trait::async_trait;
 use log::{self, info};
 use vcp_media_common::server::tcp_server::TcpServer;
 use vcp_media_common::server::NetworkServer;
 use vcp_media_rtmp::session::server_session::RTMPServerSession;
-use vcp_media_rtsp::session::server_session::RTSPServerSession;
-use crate::manager::message::StreamHubEventSender;
 use crate::manager::stream_hub::StreamHub;
 
 pub struct ServiceManager {

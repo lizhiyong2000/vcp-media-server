@@ -1,16 +1,11 @@
-use std::fmt::{Debug, Formatter, Write};
-use indexmap::IndexMap;
-use lazy_static::lazy_static;
-use std::sync::Mutex;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use std::fmt::{Debug, Write};
+use tokio::sync::{mpsc, oneshot};
 
-use strum::IntoEnumIterator;
 // 0.17.1
-use strum_macros::EnumIter;
-use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::UnboundedSender;
 use vcp_media_common::media::{FrameDataReceiver, FrameDataSender, StreamInformation};
 use vcp_media_sdp::SessionDescription;
+use crate::common::stream::{PublishType, StreamId, SubscribeType};
 // use tokio::sync::broadcast::error::SendError;
 use crate::manager::stream_hub::StreamHubError;
 
@@ -65,16 +60,16 @@ use crate::manager::stream_hub::StreamHubError;
 
 #[derive(Clone, Debug)]
 pub struct StreamPublishInfo {
-    pub stream_id: String,
-    pub stream_type: String,
-    pub url: String,
+    pub stream_id: StreamId,
+    pub publish_type: PublishType,
+    pub publisher_id: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct StreamSubscribeInfo {
-    pub stream_id: String,
-    pub stream_type: String,
-    pub url: String,
+    pub stream_id: StreamId,
+    pub subscribe_type: SubscribeType,
+    pub subscriber_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -114,7 +109,7 @@ pub enum StreamHubEvent {
         info:StreamSubscribeInfo,
     },
     Request {
-        stream_id: String,
+        stream_id: StreamId,
         result_sender: RequestResultSender,
     },
     // StartRelay(StreamPublishInfo),
