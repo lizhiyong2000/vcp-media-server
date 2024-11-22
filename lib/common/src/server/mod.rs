@@ -3,7 +3,23 @@ pub mod tcp_server;
 use async_trait::async_trait;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use serde_derive::Serialize;
 use thiserror::Error;
+
+/* Subscribe streams from stream hub */
+#[derive(Debug, Serialize, Clone, Eq, PartialEq)]
+pub enum ServerSessionType {
+    Pull,
+    Push,
+    Unknown,
+}
+
+#[derive(Debug, Serialize, Clone, Eq, PartialEq)]
+pub enum ClientSessionType {
+    Pull,
+    Push,
+}
+
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -18,10 +34,10 @@ pub trait ServerSessionHandler{
 
 #[async_trait]
 pub trait NetworkSession : Send + Sync{
-
     fn id(&self)->String;
     fn session_type()->String;
     async fn run(&mut self);
+    async fn close(&mut self);
 }
 
 

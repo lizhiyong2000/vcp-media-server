@@ -30,7 +30,7 @@ use vcp_media_common::bytesio::bytesio::TcpIO;
 use vcp_media_common::bytesio::bytesio::UdpIO;
 use vcp_media_common::http::{HttpRequest as RtspRequest, HttpResponse};
 use vcp_media_common::http::HttpResponse as RtspResponse;
-use vcp_media_common::server::{NetworkSession, ServerSessionHandler};
+use vcp_media_common::server::{NetworkSession, ServerSessionHandler, ServerSessionType};
 use vcp_media_common::server::TcpSession;
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
 use vcp_media_common::Marshal;
@@ -54,8 +54,11 @@ pub trait RtspServerSessionHandler : Send + Sync {
     // fn get_frame_sender(&mut self)->Option<FrameDataSender>;
     // fn get_frame_receiver(&mut self)->Option<FrameDataReceiver>;
     //
+    async fn handle_close(&mut self, context: &mut RTSPServerSessionContext) -> Result<(), RtspSessionError>{
+        Ok(())
+    }
 
-    async fn handle_rtp_over_rtsp_message(&mut self, session: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>{
+    async fn handle_rtp_over_rtsp_message(&mut self, context: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>{
         Ok(())
     }
 
@@ -113,49 +116,51 @@ impl InterleavedBinaryData {
 }
 
 pub struct RTSPServerSessionContext{
-    pub io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
-    pub reader: BytesReader,
-    pub writer: BytesWriter,
+    // pub io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
+    // pub reader: BytesReader,
+    // pub writer: BytesWriter,
+    pub session_id:String,
+    pub session_type: ServerSessionType,
+
 }
 
 
 impl RTSPServerSessionContext {
 
-    fn new(io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>) -> Self {
+    fn new(session_id:String) -> Self {
         Self{
-            io,
-            reader: BytesReader::new(BytesMut::default()),
-            writer: BytesWriter::new(),
+            session_id,
+            session_type: ServerSessionType::Unknown,
         }
     }
 
-    pub(crate) fn clone(&self) -> Self {
-        Self::new(self.io.clone())
-    }
+    // pub(crate) fn clone(&self) -> Self {
+    //     Self::new(self.io.clone())
+    // }
+    //
+    // pub fn get_io(&self) -> Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>{
+    //     self.io.clone()
+    // }
+    //
+    // pub async fn flush(&mut self) -> Result<(), BytesWriteError> {
+    //     self.io
+    //         .lock()
+    //         .await
+    //         .write(self.writer.bytes.clone().into())
+    //         .await?;
+    //     self.writer.bytes.clear();
+    //     Ok(())
+    // }
 
-    pub fn get_io(&self) -> Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>{
-        self.io.clone()
-    }
 
-    pub async fn flush(&mut self) -> Result<(), BytesWriteError> {
-        self.io
-            .lock()
-            .await
-            .write(self.writer.bytes.clone().into())
-            .await?;
-        self.writer.bytes.clear();
-        Ok(())
-    }
-
-
-    pub async fn send_response(&mut self, response: &RtspResponse) -> Result<(), RtspSessionError> {
-        info!("send response:==========================\n{}=============", response);
-
-        self.writer.write(response.marshal().as_bytes())?;
-        self.flush().await?;
-
-        Ok(())
-    }
+    // pub async fn send_response(&mut self, response: &RtspResponse) -> Result<(), RtspSessionError> {
+    //     info!("send response:==========================\n{}=============", response);
+    //
+    //     self.writer.write(response.marshal().as_bytes())?;
+    //     self.flush().await?;
+    //
+    //     Ok(())
+    // }
 }
 
 pub struct RTSPServerSession {
@@ -194,6 +199,12 @@ impl NetworkSession for RTSPServerSession {
             }
         }
     }
+
+    async fn close(&mut self) {
+        if let Some(h) =  self.handler.as_mut() {
+            h.handle_close(&mut self.context).await;
+        }
+    }
 }
 
 impl TcpSession for RTSPServerSession {
@@ -223,9 +234,9 @@ impl RTSPServerSession {
         let io = Arc::new(Mutex::new(net_io));
 
         Self {
-            id,
+            id: id.clone(),
             io: io.clone(),
-            context: RTSPServerSessionContext::new(io.clone()),
+            context: RTSPServerSessionContext::new(id),
             reader: BytesReader::new(BytesMut::default()),
             writer: AsyncBytesWriter::new(io),
             remote_addr: remote,
@@ -406,9 +417,7 @@ impl RTSPServerSession {
     // pub fn get_io(&self) -> Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>{
     //     self.io.clone()
     // }
-}
 
-impl RTSPServerSession{
 
     async fn handle_options(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let custom_response = {
@@ -496,6 +505,8 @@ impl RTSPServerSession{
                 None
             }
         };
+
+        self.context.session_type = ServerSessionType::Push;
 
         let response =  {
             match custom_response {
@@ -761,6 +772,8 @@ impl RTSPServerSession{
 
 
         self.send_response(&response).await?;
+
+        self.context.session_type = ServerSessionType::Pull;
 
 
             let mut retry_times = 0;

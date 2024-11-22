@@ -75,36 +75,24 @@ where T: TcpSession + 'static
         loop {
             let (socket, remote_addr) = listener.accept().await?;
 
-            if let Some(handler) = self.handler.as_mut(){
-                if let  Ok(mut session) = handler.on_create_session(socket, remote_addr).await{
-                    info!("server received connection from :{}, session id:{}", remote_addr, session.id());
-                    // self.notify_session_created(session.clone()).await;
-                    // session.set_handler()
-
-                    tokio::spawn(
-                        async move {
-
-                            session.run().await;
-                            info!("server end connection from :{}, session id:{}", remote_addr, session.id());
-                        }
-                    );
+            if let Ok(mut session) = {
+                if let Some(handler) = self.handler.as_mut() {
+                    handler.on_create_session(socket, remote_addr).await
                 }
-            }else {
-                if let mut session = self.session_alloc.new_tcp_session(socket, remote_addr){
-                    info!("server received connection from :{}, session id:{}", remote_addr, session.id());
-                    // self.notify_session_created(session.clone()).await;
-                    // session.set_handler()
-
-                    tokio::spawn(
-                        async move {
-
-                            session.run().await;
-                            info!("server end connection from :{}, session id:{}", remote_addr, session.id());
-                        }
-                    );
+                else {
+                    Ok(self.session_alloc.new_tcp_session(socket, remote_addr))
                 }
             }
-
+            {
+                info!("server received connection from :{}, session id:{}", remote_addr, session.id());
+                tokio::spawn(
+                    async move {
+                        session.run().await;
+                        info!("server end connection from :{}, session id:{}", remote_addr, session.id());
+                        session.close().await;
+                    }
+                );
+            }
 
 
         }

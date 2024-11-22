@@ -25,7 +25,7 @@ use vcp_media_common::http::HttpRequest as RtspRequest;
 use vcp_media_common::http::HttpResponse as RtspResponse;
 use vcp_media_common::media::{FrameData, FrameDataReceiver, FrameDataSender, StreamInformation};
 use vcp_media_common::media::StreamInformation::Sdp;
-use vcp_media_common::server::{NetworkServer, NetworkSession, SessionError, TcpServerHandler, TcpSession};
+use vcp_media_common::server::{NetworkServer, NetworkSession, ServerSessionType, SessionError, TcpServerHandler, TcpSession};
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
 use vcp_media_rtsp::message::codec;
 use vcp_media_rtsp::message::codec::RtspCodecInfo;
@@ -96,7 +96,37 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
     //     }
     // }
 
-    async fn handle_rtp_over_rtsp_message(&mut self, session: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError> {
+    async fn handle_close(&mut self, context: &mut RTSPServerSessionContext) -> Result<(), RtspSessionError>{
+        match context.session_type {
+            ServerSessionType::Pull => {
+                let unpublish_event = StreamHubEvent::UnSubscribe{
+                    info:StreamSubscribeInfo {
+                        stream_id: "1".to_string(),
+                        stream_type: "RTSP".to_string(),
+                        url: "rtsp://1111.1.1.1.".to_string(),
+                    },
+                };
+
+                self.event_producer.send(unpublish_event);
+            }
+            ServerSessionType::Push => {
+                let unpublish_event = StreamHubEvent::UnPublish{
+                    info:StreamPublishInfo {
+                        stream_id: "1".to_string(),
+                        stream_type: "RTSP".to_string(),
+                        url: "rtsp://1111.1.1.1.".to_string(),
+                    },
+                };
+
+                self.event_producer.send(unpublish_event);
+
+            }
+            ServerSessionType::Unknown => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_rtp_over_rtsp_message(&mut self, context: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError> {
         // let mut cur_reader = BytesReader::new(session.reader.read_bytes(length)?);
         //
         // for track in self.tracks.values_mut() {

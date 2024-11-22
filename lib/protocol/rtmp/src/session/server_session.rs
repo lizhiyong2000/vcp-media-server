@@ -87,6 +87,10 @@ impl NetworkSession for RTMPServerSession {
             }
         }
     }
+
+    async fn close(&mut self) {
+        todo!()
+    }
 }
 
 #[async_trait]

@@ -123,7 +123,7 @@ impl RtspPushSource {
                     // let mut statistics_data = statistics_data.lock().await;
                     // statistics_data.subscriber_count += 1;
                 }
-                StreamTransmitEvent::UnSubscribe(info) => {
+                StreamTransmitEvent::UnSubscribe{info} => {
                     // match info.sub_type {
                     //     SubscribeType::RtpPull | SubscribeType::WhepPull => {
                     //         packet_senders.lock().await.remove(&info.id);
@@ -138,7 +138,7 @@ impl RtspPushSource {
                     //
                     // statistics_data.subscriber_count -= 1;
                 }
-                StreamTransmitEvent::UnPublish => {
+                StreamTransmitEvent::UnPublish{info} => {
                     if let Err(err) = self.exit.send(()) {
                         log::error!("TransmitterEvent::UnPublish send error: {}", err);
                     }
@@ -187,7 +187,7 @@ impl RtspPushSource {
 
                     for (_, v) in self.frame_senders.lock().await.iter() {
                         if let Err(audio_err) = v.send(data.clone()).map_err(|_| StreamTransmitError::SendAudioError) {
-                            log::error!("Transmitter send audio frame error: {}", audio_err);
+                            // log::error!("Transmitter send audio frame error: {}", audio_err);
                         }
                     }
                 }
@@ -199,7 +199,7 @@ impl RtspPushSource {
                     };
                     for (_, v) in self.frame_senders.lock().await.iter() {
                         if let Err(video_err) = v.send(data.clone()).map_err(|_| StreamTransmitError::SendVideoError) {
-                            log::error!("Transmitter send video frame error: {}", video_err);
+                            // log::error!("Transmitter send video frame error: {}", video_err);
                         }
                     }
                 }

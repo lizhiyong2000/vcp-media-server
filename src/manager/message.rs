@@ -102,10 +102,16 @@ pub enum StreamHubEvent {
         receiver: FrameDataReceiver,
         result_sender:PublishResultSender,
     },
+    UnPublish{
+        info:StreamPublishInfo,
+    },
     Subscribe{
         info:StreamSubscribeInfo,
         sender: FrameDataSender,
         result_sender:SubscribeResultSender,
+    },
+    UnSubscribe{
+        info:StreamSubscribeInfo,
     },
     Request {
         stream_id: String,
@@ -143,8 +149,12 @@ pub enum StreamTransmitEvent {
         sender: FrameDataSender,
         info: StreamSubscribeInfo,
     },
-    UnSubscribe(StreamSubscribeInfo),
-    UnPublish,
+    UnSubscribe{
+        info:StreamSubscribeInfo
+    },
+    UnPublish{
+        info:StreamPublishInfo
+    },
     Request{
         sender: RequestResultSender,
     }
