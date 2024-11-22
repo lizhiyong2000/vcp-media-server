@@ -71,11 +71,11 @@ impl StreamHub {
                 }
 
                 StreamHubEvent::UnPublish { info } => {
-                    info!("[EVENT] [StreamHub:UnPublish]:{:?}", info);
+                    info!("=====[StreamHub] [UnPublish]:{:?}", info);
                 }
 
                 StreamHubEvent::Subscribe{info, sender, result_sender}  => {
-                    info!("[EVENT] [StreamHub:Subscribe]:{:?}", info);
+                    info!("=====[StreamHub] [Subscribe]:{:?}", info);
                     // let (sender, receiver) =
                     //     mpsc::unbounded_channel::<FrameData>();
                     self.handle_subscribe(info, sender);
@@ -89,10 +89,11 @@ impl StreamHub {
 
 
                 StreamHubEvent::UnSubscribe { info } => {
-                    info!("[EVENT] [StreamHub:UnSubscribe]:{:?}", info);
+                    info!("=====[StreamHub] [UnSubscribe]:{:?}", info);
                 }
                 // StreamHubEvent::StreamPull(_) => {}
                 StreamHubEvent::Request { stream_id, result_sender } => {
+                    info!("=====[StreamHub] [Request]:{:?}", stream_id);
                     if let Err(err) = self.handle_request(stream_id.clone(),  result_sender) {
                         log::error!("stream hub handle request error: {}", err);
                     }
@@ -107,7 +108,7 @@ impl StreamHub {
 
     //publish a stream
     async fn handle_publish(&mut self, info: StreamPublishInfo, sdp:SessionDescription, receiver: FrameDataReceiver) -> Result<(), StreamHubError> {
-        info!("[MESSAGE] [Stream Hub] handle publish:{:?}", info);
+        info!("stream hub handle publish:{:?}", info);
 
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         let mut transceiver =
