@@ -26,7 +26,9 @@ pub fn setup_log() -> WorkerGuard {
     let format = tracing_subscriber::fmt::format()
         .with_level(true)
         .with_target(true)
-        .with_timer(LocalTimer);
+        // .with_file(true)
+        .with_line_number(true)
+        .with_timer(LocalTimer).compact();
 
     let file_appender = tracing_appender::rolling::daily("./", "mediaserver.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
