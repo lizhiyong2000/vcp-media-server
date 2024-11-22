@@ -4,6 +4,15 @@ use serde::ser::SerializeStruct;
 use tokio::sync::mpsc;
 use crate::manager::message::StreamTransmitEvent;
 
+pub enum StreamId{
+    Rtsp{
+        path:String,
+    },
+    Rtmp{
+        path:String,
+    },
+}
+
 #[derive(Debug, Serialize, Clone, Eq, PartialEq)]
 pub enum SubscribeType {
     /* Remote client request pulling(play) a rtmp stream.*/
