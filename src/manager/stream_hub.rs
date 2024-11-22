@@ -1,7 +1,6 @@
 use std::collections::HashMap;
-use crate::common::define::{PublishType, StreamTransmitEventSender};
 use crate::manager::message;
-use crate::manager::message::{RequestResultSender, StreamHubEvent, StreamPublishInfo, StreamSubscribeInfo, StreamTransmitEvent};
+use crate::manager::message::{RequestResultSender, StreamHubEvent, StreamPublishInfo, StreamSubscribeInfo, StreamTransmitEvent, StreamTransmitEventSender};
 use crate::transmitter::StreamTransmitter;
 use log::info;
 use std::sync::Arc;
@@ -9,6 +8,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use vcp_media_common::media::{FrameData, FrameDataReceiver, FrameDataSender};
 use vcp_media_sdp::SessionDescription;
+use crate::common::stream::PublishType;
 
 #[derive(Debug, Error)]
 pub enum StreamHubError {

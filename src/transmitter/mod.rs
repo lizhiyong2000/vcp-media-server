@@ -5,13 +5,14 @@ mod traits;
 mod source;
 mod sink;
 
-use crate::common::define::{ PublishType, StreamTransmitEventReceiver};
 // use crate::transmitter::traits::StreamSource;
 use crate::transmitter::source::rtsp_push_source::RtspPushSource;
 use crate::transmitter::source::StreamSource;
 use sink::fake_sink::FakeSink;
 use vcp_media_common::media::FrameDataReceiver;
 use vcp_media_sdp::SessionDescription;
+use crate::common::stream::PublishType;
+use crate::manager::message::StreamTransmitEventReceiver;
 
 #[derive(Debug, Error)]
 pub enum StreamTransmitError {

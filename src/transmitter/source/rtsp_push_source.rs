@@ -1,6 +1,5 @@
-use crate::common::define::{ StreamTransmitEventReceiver};
 use crate::manager::message;
-use crate::manager::message::{StreamTransmitEvent};
+use crate::manager::message::{StreamTransmitEvent, StreamTransmitEventReceiver};
 use crate::transmitter::source::StreamSource;
 use crate::transmitter::StreamTransmitError;
 use async_trait::async_trait;

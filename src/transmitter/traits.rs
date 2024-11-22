@@ -1,28 +1,6 @@
-use crate::common::define::{ PublishType, SubscriberInfo};
 use async_trait::async_trait;
 use bytes::BytesMut;
-use vcp_media_common::media::FrameDataSender;
-
-#[derive(Debug)]
-pub enum TransceiverEvent {
-    Subscribe {
-        sender: FrameDataSender,
-        info: SubscriberInfo,
-        // result_sender: TransceiverEventExecuteResultSender,
-    },
-    UnSubscribe {
-        info: SubscriberInfo,
-    },
-    UnPublish {},
-    //
-    // Api {
-    //     sender: StatisticStreamSender,
-    //     uuid: Option<Uuid>,
-    // },
-    // Request {
-    //     sender: InformationSender,
-    // },
-}
+use crate::common::stream::PublishType;
 
 
 #[async_trait]
