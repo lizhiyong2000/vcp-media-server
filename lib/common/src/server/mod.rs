@@ -25,6 +25,10 @@ pub enum ClientSessionType {
 pub enum SessionError {
     #[error("the http request has no request line.")]
     SocketIOError(#[from] std::io::Error),
+
+
+    #[error("the http request has no request line.")]
+    StreamHubEventSendErr,
 }
 
 pub trait ServerSessionHandler{

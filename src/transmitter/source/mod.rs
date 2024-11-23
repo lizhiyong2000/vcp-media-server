@@ -1,10 +1,11 @@
 pub mod rtsp_push_source;
+pub mod rtmp_push_source;
 
 use crate::transmitter::StreamTransmitError;
 use async_trait::async_trait;
 
 #[async_trait]
-pub trait StreamSource {
+pub trait StreamSource : Send + Sync{
     async fn run(&mut self) -> Result<(), StreamTransmitError>;
     // fn new(stream_id:String, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver) -> Self;
     //

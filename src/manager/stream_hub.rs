@@ -122,8 +122,7 @@ impl StreamHub {
                 log::error!(
                 "transceiver run error, identifier: {}, error: {}",
                 identifier_clone,
-                err,
-            );
+                err);
             } else {
                 log::info!("transceiver run success, identifier: {}", identifier_clone);
             }

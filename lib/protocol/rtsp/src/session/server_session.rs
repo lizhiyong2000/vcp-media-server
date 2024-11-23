@@ -174,9 +174,6 @@ pub struct RtspServerSession {
     sdp: SessionDescription,
     session_id: Option<Uuid>,
     handler: Option<Box<dyn RtspServerSessionHandler>>,
-
-    frame_sender: Option<FrameDataSender>,
-    frame_receiver: Option<FrameDataReceiver>,
 }
 
 
@@ -244,8 +241,6 @@ impl RtspServerSession {
             sdp: SessionDescription::default(),
             session_id: None,
             handler,
-            frame_sender: None,
-            frame_receiver: None,
         }
     }
 

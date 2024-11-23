@@ -11,11 +11,9 @@ use crate::session::errors::SessionError;
 // use vcp_media_common::bytesio::bytes_reader::BytesReader;
 use vcp_media_common::bytesio::bytes_writer::AsyncBytesWriter;
 use vcp_media_common::bytesio::bytesio::{TNetIO, TcpIO};
-use vcp_media_common::server::{NetworkSession, TcpSession};
+use vcp_media_common::server::{NetworkSession, ServerSessionType, TcpSession};
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
 use vcp_media_flv::amf0::Amf0ValueType;
-
-
 use crate::config;
 use crate::message::chunk::define::{chunk_type, csid_type, CHUNK_SIZE};
 use crate::message::chunk::errors::UnpackError;
@@ -29,12 +27,12 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use indexmap::IndexMap;
 use log::{error, info};
-// use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
+use vcp_media_common::media::{FrameData, FrameDataReceiver, FrameDataSender};
 
 enum ServerSessionState {
     Handshake,
@@ -46,14 +44,39 @@ enum ServerSessionState {
     Play,
 }
 
-
+#[async_trait]
 pub trait RtmpServerSessionHandler : Send + Sync{
+    // async fn handle_session_error(&mut self, ctx: &mut RtmpServerSessionContext);
 
+    async fn handle_publish(&mut self, ctx: &mut RtmpServerSessionContext, frame_receiver: FrameDataReceiver);
+
+    async fn handle_play(&mut self, ctx: &mut RtmpServerSessionContext, frame_sender: FrameDataSender);
+
+    async fn handle_session_end(&mut self, ctx: &mut RtmpServerSessionContext);
+}
+
+
+
+pub struct RtmpServerSessionContext{
+    pub session_id:String,
+    pub session_type: ServerSessionType,
+    pub request_url: String,
+}
+
+impl RtmpServerSessionContext {
+    pub fn new(session_id:String) -> Self {
+        Self{
+            session_id,
+            session_type: ServerSessionType::Unknown,
+            request_url: "".to_string(),
+        }
+    }
 }
 
 pub struct RtmpServerSession {
     id: String,
     remote_addr: SocketAddr,
+     context: RtmpServerSessionContext,
     io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
 
     handshaker: HandshakeServer,
@@ -66,6 +89,10 @@ pub struct RtmpServerSession {
     query: Option<String>,
     bytesio_data: BytesMut,
     has_remain_data: bool,
+    gop_num: usize,
+
+    data_sender: FrameDataSender,
+    data_receiver: FrameDataReceiver,
 
     handler: Option<Box<dyn RtmpServerSessionHandler>>,
 }
@@ -80,16 +107,13 @@ impl NetworkSession for RtmpServerSession {
         return "RTMP".to_string();
     }
 
-    // fn set_handler(&mut self, handler: Box<dyn ServerSessionHandler>) {
-    //     todo!()
-    // }
-
     async fn run(&mut self) {
         let res = self.handle_session().await;
         match res {
             Ok(_) => info!("{} session {} ended.", Self::session_type(), self.id()),
             Err(e) => {
-                error!("{} session {} error:{}", Self::session_type(), self.id(), e)
+                error!("{} session {} error:{}", Self::session_type(), self.id(), e);
+                self.notify_session_error().await;
             }
         }
     }
@@ -105,10 +129,6 @@ impl TcpSession for RtmpServerSession {
         let id = Uuid::new(RandomDigitCount::Zero).to_string();
         Self::new(id, sock, remote, None)
     }
-
-    // fn notify_created(&self) {
-    //     todo!()
-    // }
 }
 
 impl RtmpServerSession {
@@ -121,9 +141,11 @@ impl RtmpServerSession {
         let net_io: Box<dyn TNetIO + Send + Sync> = Box::new(TcpIO::new(stream));
         let io = Arc::new(Mutex::new(net_io));
 
+        let (init_producer, init_consumer) = mpsc::unbounded_channel();
         Self {
-            id,
+            id: id.clone(),
             remote_addr: remote,
+            context: RtmpServerSessionContext::new(id),
             io: io.clone(),
             handshaker: HandshakeServer::new(Arc::clone(&io)),
             unpacketizer: ChunkUnpacketizer::new(),
@@ -135,11 +157,41 @@ impl RtmpServerSession {
             query: None,
             bytesio_data: BytesMut::new(),
             has_remain_data: false,
+            gop_num:5,
+            data_sender: init_producer,
+            data_receiver: init_consumer,
             handler,
         }
     }
 
+    async fn notify_session_error(&mut self) {
+        if let Some(handler) = self.handler.as_mut(){
+            handler.handle_session_end(&mut self.context).await;
+        }
+    }
 
+    async fn notify_session_end(&mut self) {
+        if let Some(handler) = self.handler.as_mut(){
+            handler.handle_session_end(&mut self.context).await;
+        }
+    }
+
+
+    async fn notify_publish(&mut self) {
+        if let Some(handler) = self.handler.as_mut(){
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.data_sender = tx;
+            handler.handle_publish(&mut self.context, rx).await;
+        }
+    }
+
+    async fn notify_play(&mut self) {
+        if let Some(handler) = self.handler.as_mut(){
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.data_receiver = rx;
+            handler.handle_play(&mut self.context, tx).await;
+        }
+    }
     async fn handle_session(&mut self) -> Result<(), SessionError> {
         loop {
             match self.state {
@@ -198,11 +250,7 @@ impl RtmpServerSession {
                     self.bytesio_data = data;
                 }
                 Err(err) => {
-                    // self.common
-                    //     .unpublish_to_stream_hub(self.app_name.clone(), self.stream_name.clone())
-                    //     .await?;
-
-                    return Err(SessionError::BytesIOError(err));
+                    return Err(SessionError::from(err));
                 }
             }
 
@@ -265,61 +313,60 @@ impl RtmpServerSession {
 
 
     pub async fn send_channel_data(&mut self) -> Result<(), SessionError> {
-        return  Ok(());
-        // let mut retry_times = 0;
-        // loop {
-        //     if let Some(data) = self.data_receiver.recv().await {
-        //         match data {
-        //             FrameData::Audio { timestamp, data } => {
-        //                 let data_size = data.len();
-        //                 self.send_audio(data, timestamp).await?;
-        //
-        //                 // if let Some(sender) = &self.statistic_data_sender {
-        //                 //     let statistic_audio_data = StatisticData::Audio {
-        //                 //         uuid: Some(self.session_id),
-        //                 //         aac_packet_type: 1,
-        //                 //         data_size,
-        //                 //         duration: 0,
-        //                 //     };
-        //                 //     if let Err(err) = sender.send(statistic_audio_data) {
-        //                 //         log::error!("send statistic_data err: {}", err);
-        //                 //     }
-        //                 // }
-        //             }
-        //             FrameData::Video { timestamp, data } => {
-        //                 let data_size = data.len();
-        //                 self.send_video(data, timestamp).await?;
-        //
-        //                 // if let Some(sender) = &self.statistic_data_sender {
-        //                 //     let statistic_video_data = StatisticData::Video {
-        //                 //         uuid: Some(self.session_id),
-        //                 //         frame_count: 1,
-        //                 //         data_size,
-        //                 //         is_key_frame: None,
-        //                 //         duration: 0,
-        //                 //     };
-        //                 //     if let Err(err) = sender.send(statistic_video_data) {
-        //                 //         log::error!("send statistic_data err: {}", err);
-        //                 //     }
-        //                 // }
-        //             }
-        //             FrameData::MetaData { timestamp, data } => {
-        //                 self.send_metadata(data, timestamp).await?;
-        //             }
-        //             _ => {}
-        //         }
-        //     } else {
-        //         retry_times += 1;
-        //         log::debug!(
-        //             "send_channel_data: no data receives ,retry {} times!",
-        //             retry_times
-        //         );
-        //
-        //         if retry_times > 10 {
-        //             return Err(SessionError::NoMediaDataReceived);
-        //         }
-        //     }
-        // }
+        let mut retry_times = 0;
+        loop {
+            if let Some(data) = self.data_receiver.recv().await {
+                match data {
+                    FrameData::Audio { timestamp, data } => {
+                        let data_size = data.len();
+                        self.send_audio(data, timestamp).await?;
+
+                        // if let Some(sender) = &self.statistic_data_sender {
+                        //     let statistic_audio_data = StatisticData::Audio {
+                        //         uuid: Some(self.session_id),
+                        //         aac_packet_type: 1,
+                        //         data_size,
+                        //         duration: 0,
+                        //     };
+                        //     if let Err(err) = sender.send(statistic_audio_data) {
+                        //         log::error!("send statistic_data err: {}", err);
+                        //     }
+                        // }
+                    }
+                    FrameData::Video { timestamp, data } => {
+                        let data_size = data.len();
+                        self.send_video(data, timestamp).await?;
+
+                        // if let Some(sender) = &self.statistic_data_sender {
+                        //     let statistic_video_data = StatisticData::Video {
+                        //         uuid: Some(self.session_id),
+                        //         frame_count: 1,
+                        //         data_size,
+                        //         is_key_frame: None,
+                        //         duration: 0,
+                        //     };
+                        //     if let Err(err) = sender.send(statistic_video_data) {
+                        //         log::error!("send statistic_data err: {}", err);
+                        //     }
+                        // }
+                    }
+                    FrameData::MetaData { timestamp, data } => {
+                        self.send_metadata(data, timestamp).await?;
+                    }
+                    _ => {}
+                }
+            } else {
+                retry_times += 1;
+                log::debug!(
+                    "send_channel_data: no data receives ,retry {} times!",
+                    retry_times
+                );
+
+                if retry_times > 10 {
+                    return Err(SessionError::NoMediaDataReceived);
+                }
+            }
+        }
     }
 
     pub async fn send_audio(&mut self, data: BytesMut, timestamp: u32) -> Result<(), SessionError> {
@@ -507,20 +554,18 @@ impl RtmpServerSession {
         data: &mut BytesMut,
         timestamp: &u32,
     ) -> Result<(), SessionError> {
-        // let channel_data = FrameData::Video {
-        //     timestamp: *timestamp,
-        //     data: data.clone(),
-        // };
-        //
-        // match self.data_sender.send(channel_data) {
-        //     Ok(_) => {}
-        //     Err(err) => {
-        //         log::error!("send video err: {}", err);
-        //         return Err(SessionError {
-        //             value: SessionErrorValue::SendFrameDataErr,
-        //         });
-        //     }
-        // }
+        let channel_data = FrameData::Video {
+            timestamp: *timestamp,
+            data: data.clone(),
+        };
+
+        match self.data_sender.send(channel_data) {
+            Ok(_) => {}
+            Err(err) => {
+                log::error!("send video err: {}", err);
+                return Err(SessionError::SendFrameDataErr );
+            }
+        }
         //
         // self.stream_handler
         //     .save_video_data(data, *timestamp)
@@ -531,23 +576,21 @@ impl RtmpServerSession {
 
     pub async fn on_audio_data(
         &mut self,
-        _data: &mut BytesMut,
-        _timestamp: &u32,
+        data: &mut BytesMut,
+        timestamp: &u32,
     ) -> Result<(), SessionError> {
-        // let channel_data = FrameData::Audio {
-        //     timestamp: *timestamp,
-        //     data: data.clone(),
-        // };
-        //
-        // match self.data_sender.send(channel_data) {
-        //     Ok(_) => {}
-        //     Err(err) => {
-        //         log::error!("receive audio err {}", err);
-        //         return Err(SessionError {
-        //             value: SessionErrorValue::SendFrameDataErr,
-        //         });
-        //     }
-        // }
+        let channel_data = FrameData::Audio {
+            timestamp: *timestamp,
+            data: data.clone(),
+        };
+
+        match self.data_sender.send(channel_data) {
+            Ok(_) => {}
+            Err(err) => {
+                log::error!("receive audio err {}", err);
+                return Err(SessionError::SendFrameDataErr);
+            }
+        }
         //
         // self.stream_handler
         //     .save_audio_data(data, *timestamp)
@@ -558,22 +601,20 @@ impl RtmpServerSession {
 
     pub async fn on_meta_data(
         &mut self,
-        _data: &mut BytesMut,
-        _timestamp: &u32,
+        data: &mut BytesMut,
+        timestamp: &u32,
     ) -> Result<(), SessionError> {
-        // let channel_data = FrameData::MetaData {
-        //     timestamp: *timestamp,
-        //     data: data.clone(),
-        // };
-        //
-        // match self.data_sender.send(channel_data) {
-        //     Ok(_) => {}
-        //     Err(_) => {
-        //         return Err(SessionError {
-        //             value: SessionErrorValue::SendFrameDataErr,
-        //         })
-        //     }
-        // }
+        let channel_data = FrameData::MetaData {
+            timestamp: *timestamp,
+            data: data.clone(),
+        };
+
+        match self.data_sender.send(channel_data) {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(SessionError::SendFrameDataErr)
+            }
+        }
         //
         // self.stream_handler.save_metadata(data, *timestamp).await;
 
@@ -720,6 +761,7 @@ impl RtmpServerSession {
         // self.common
         //     .unpublish_to_stream_hub(self.app_name.clone(), self.stream_name.clone())
         //     .await?;
+        self.notify_session_end();
 
         let mut netstream = NetStreamWriter::new(Arc::clone(&self.io));
         netstream
@@ -881,10 +923,12 @@ impl RtmpServerSession {
         );
 
         /*Now it can update the request url*/
-        // self.common.request_url = self.get_request_url(raw_stream_name);
+        self.context.request_url = self.get_request_url(raw_stream_name);
         // self.common
         //     .subscribe_from_stream_hub(self.app_name.clone(), self.stream_name.clone())
         //     .await?;
+
+        self.notify_play();
 
         self.state = ServerSessionState::Play;
 
@@ -944,7 +988,7 @@ impl RtmpServerSession {
         // }
 
         /*Now it can update the request url*/
-        // self.common.request_url = self.get_request_url(stream_name_with_query);
+        self.context.request_url = self.get_request_url(stream_name_with_query);
 
         let _ = match other_values.remove(0) {
             Amf0ValueType::UTF8String(val) => val,
@@ -985,6 +1029,8 @@ impl RtmpServerSession {
             self.app_name,
             self.stream_name
         );
+
+        self.notify_publish().await;
 
         // self.common
         //     .publish_to_stream_hub(

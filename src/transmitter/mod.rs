@@ -13,6 +13,7 @@ use vcp_media_common::media::FrameDataReceiver;
 use vcp_media_sdp::SessionDescription;
 use crate::common::stream::{PublishType, StreamId};
 use crate::manager::message::StreamTransmitEventReceiver;
+use crate::transmitter::source::rtmp_push_source::RtmpPushSource;
 
 #[derive(Debug, Error)]
 pub enum StreamTransmitError {
@@ -65,14 +66,21 @@ impl StreamTransmitter {
     }
 
     pub async fn run(self, source_type: PublishType, sdp:SessionDescription, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver) -> Result<(), StreamTransmitError> {
-        let mut source = match source_type {
+        let mut source:Box<dyn StreamSource> = match source_type {
             // PublishType::RtmpPush => {
             //     // RtmpPushSource::new(stream_id.clone(), data_receiver);
             // }
             // PublishType::RtmpPull => {}
             PublishType::Push => {
+                match self.stream_id {
+                    StreamId::Rtsp { .. } => {
+                        Box::new(RtspPushSource::new(self.stream_id.clone(), sdp, data_receiver, event_receiver))
+                    }
+                    StreamId::Rtmp { .. } => {
+                        Box::new(RtmpPushSource::new(self.stream_id.clone(), data_receiver, event_receiver))
+                    }
+                }
 
-                RtspPushSource::new(self.stream_id.clone(), sdp, data_receiver, event_receiver)
             }
             // PublishType::RtspPull => {}
             // PublishType::WhipPush => {}
