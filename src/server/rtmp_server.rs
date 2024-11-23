@@ -224,8 +224,13 @@ impl RtmpServerSessionHandler for VcpRtmpServerSessionHandler {
     }
 
     async fn handle_session_end(&mut self, ctx: &mut RtmpServerSessionContext) {
+
+        info!("handle_session_end, session_id: {}, session_type:{:?}", ctx.session_id, ctx.session_type);
+
         match ctx.session_type {
             ServerSessionType::Pull => {
+
+                info!("subscribed rtmp server session {} end", ctx.session_id);
 
                 if let Some(sub_info) = self.subscribe_info.as_mut() {
                     let unsubscribe_event = StreamHubEvent::UnSubscribe{

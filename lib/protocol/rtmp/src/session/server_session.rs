@@ -125,6 +125,7 @@ impl NetworkSession for RtmpServerSession {
 
     async fn close(&mut self) {
         info!("close session {}", self.id());
+        self.notify_session_end().await;
     }
 }
 
@@ -183,6 +184,7 @@ impl RtmpServerSession {
 
 
     async fn notify_publish(&mut self) {
+        self.context.session_type = ServerSessionType::Push;
         if let Some(handler) = self.handler.as_mut(){
             let (tx, rx) = mpsc::unbounded_channel();
             self.data_sender = tx;
@@ -191,6 +193,7 @@ impl RtmpServerSession {
     }
 
     async fn notify_play(&mut self) {
+        self.context.session_type = ServerSessionType::Pull;
         if let Some(handler) = self.handler.as_mut(){
             let (tx, rx) = mpsc::unbounded_channel();
             self.data_receiver = rx;
