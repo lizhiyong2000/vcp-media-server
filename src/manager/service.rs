@@ -3,8 +3,9 @@ use crate::server::rtsp_server::RtspServer;
 use log::{self, info};
 use vcp_media_common::server::tcp_server::TcpServer;
 use vcp_media_common::server::NetworkServer;
-use vcp_media_rtmp::session::server_session::RTMPServerSession;
+use vcp_media_rtmp::session::server_session::RtmpServerSession;
 use crate::manager::stream_hub::StreamHub;
+use crate::server::rtmp_server::RtmpServer;
 
 pub struct ServiceManager {
     config: Config,
@@ -33,7 +34,7 @@ impl ServiceManager {
         // });
 
         // tokio::spawn(async {
-            Self::start_rtmp_service("0.0.0.0:1935".to_string()).await;
+            Self::start_rtmp_service("0.0.0.0:1935".to_string(), &mut stream_hub).await;
         // });
 
         tokio::spawn(async move {
@@ -73,10 +74,11 @@ impl ServiceManager {
 
     }
 
-    async fn start_rtmp_service(addr: String) {
+    async fn start_rtmp_service(addr: String, stream_hub_sender: &mut StreamHub) {
 
+        let mut rtmp_server = RtmpServer::new(addr, stream_hub_sender.get_sender());
         tokio::spawn(async move {
-            let mut rtmp_server: TcpServer<RTMPServerSession> = TcpServer::new(addr, None);
+
             let res = rtmp_server.start().await;
             match res {
                 Ok(_) => info!("{} server end running.", rtmp_server.session_type()),

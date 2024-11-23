@@ -51,7 +51,7 @@ pub trait RtmpServerSessionHandler : Send + Sync{
 
 }
 
-pub struct RTMPServerSession {
+pub struct RtmpServerSession {
     id: String,
     remote_addr: SocketAddr,
     io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
@@ -71,7 +71,7 @@ pub struct RTMPServerSession {
 }
 
 #[async_trait]
-impl NetworkSession for RTMPServerSession {
+impl NetworkSession for RtmpServerSession {
     fn id(&self) -> String {
         return self.id.clone();
     }
@@ -100,7 +100,7 @@ impl NetworkSession for RTMPServerSession {
 }
 
 #[async_trait]
-impl TcpSession for RTMPServerSession {
+impl TcpSession for RtmpServerSession {
     fn from_tcp_socket(sock: TcpStream, remote: SocketAddr) -> Self {
         let id = Uuid::new(RandomDigitCount::Zero).to_string();
         Self::new(id, sock, remote, None)
@@ -111,7 +111,7 @@ impl TcpSession for RTMPServerSession {
     // }
 }
 
-impl RTMPServerSession {
+impl RtmpServerSession {
     pub fn new(
         id: String,
         stream: TcpStream,

@@ -54,39 +54,39 @@ pub trait RtspServerSessionHandler : Send + Sync {
     // fn get_frame_sender(&mut self)->Option<FrameDataSender>;
     // fn get_frame_receiver(&mut self)->Option<FrameDataReceiver>;
     //
-    async fn handle_close(&mut self, context: &mut RTSPServerSessionContext) -> Result<(), RtspSessionError>{
+    async fn handle_close(&mut self, context: &mut RtspServerSessionContext) -> Result<(), RtspSessionError>{
         Ok(())
     }
 
-    async fn handle_rtp_over_rtsp_message(&mut self, context: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>{
+    async fn handle_rtp_over_rtsp_message(&mut self, context: &mut RtspServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>{
         Ok(())
     }
 
-    async fn handle_options(&mut self, context: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError>{
+    async fn handle_options(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError>{
         Ok(None)
     }
 
-    async fn handle_describe(&mut self, context: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<SessionDescription, RtspSessionError> {
+    async fn handle_describe(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<SessionDescription, RtspSessionError> {
         Ok(SessionDescription::default())
     }
 
-    async fn handle_announce(&mut self, context: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest, frame_receiver: FrameDataReceiver) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_announce(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest, frame_receiver: FrameDataReceiver) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_setup(&mut self, context: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_setup(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_play(&mut self, context: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest, frame_sender: FrameDataSender) -> Result<Option<RtspResponse>, RtspSessionError>{
+    async fn handle_play(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest, frame_sender: FrameDataSender) -> Result<Option<RtspResponse>, RtspSessionError>{
         Ok(None)
     }
 
-    async fn handle_record(&mut self, context: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_record(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_teardown(&mut self, context: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_teardown(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 }
@@ -115,7 +115,7 @@ impl InterleavedBinaryData {
     }
 }
 
-pub struct RTSPServerSessionContext{
+pub struct RtspServerSessionContext {
     // pub io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
     // pub reader: BytesReader,
     // pub writer: BytesWriter,
@@ -125,7 +125,7 @@ pub struct RTSPServerSessionContext{
 }
 
 
-impl RTSPServerSessionContext {
+impl RtspServerSessionContext {
 
     pub fn new(session_id:String) -> Self {
         Self{
@@ -163,10 +163,10 @@ impl RTSPServerSessionContext {
     // }
 }
 
-pub struct RTSPServerSession {
+pub struct RtspServerSession {
     id: String,
     remote_addr: SocketAddr,
-    context: RTSPServerSessionContext,
+    context: RtspServerSessionContext,
     io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
     reader: BytesReader,
     writer: AsyncBytesWriter,
@@ -181,7 +181,7 @@ pub struct RTSPServerSession {
 
 
 #[async_trait]
-impl NetworkSession for RTSPServerSession {
+impl NetworkSession for RtspServerSession {
     fn id(&self) -> String {
         return self.id.clone();
     }
@@ -207,14 +207,14 @@ impl NetworkSession for RTSPServerSession {
     }
 }
 
-impl TcpSession for RTSPServerSession {
+impl TcpSession for RtspServerSession {
     fn from_tcp_socket(sock: TcpStream, remote: SocketAddr) -> Self {
         let id = Uuid::new(RandomDigitCount::Zero).to_string();
         Self::new(id, sock, remote, None)
     }
 }
 
-impl RTSPServerSession {
+impl RtspServerSession {
     pub fn new(
         id: String,
         stream: TcpStream,
@@ -236,7 +236,7 @@ impl RTSPServerSession {
         Self {
             id: id.clone(),
             io: io.clone(),
-            context: RTSPServerSessionContext::new(id),
+            context: RtspServerSessionContext::new(id),
             reader: BytesReader::new(BytesMut::default()),
             writer: AsyncBytesWriter::new(io),
             remote_addr: remote,

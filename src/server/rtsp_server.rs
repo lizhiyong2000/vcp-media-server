@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use vcp_media_common::server::tcp_server::TcpServer;
 use vcp_media_common::Unmarshal;
 use vcp_media_rtsp::session::errors::RtspSessionError;
-use vcp_media_rtsp::session::server_session::{RTSPServerSession, RTSPServerSessionContext, RtspServerSessionHandler};
+use vcp_media_rtsp::session::server_session::{RtspServerSession, RtspServerSessionContext, RtspServerSessionHandler};
 
 use crate::manager::message::{StreamHubEvent, StreamHubEventSender, StreamPublishInfo, StreamSubscribeInfo};
 use vcp_media_common::http::HttpRequest as RtspRequest;
@@ -85,7 +85,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
     //     }
     // }
 
-    async fn handle_close(&mut self, context: &mut RTSPServerSessionContext) -> Result<(), RtspSessionError>{
+    async fn handle_close(&mut self, context: &mut RtspServerSessionContext) -> Result<(), RtspSessionError>{
         match context.session_type {
             ServerSessionType::Pull => {
 
@@ -111,7 +111,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         Ok(())
     }
 
-    async fn handle_rtp_over_rtsp_message(&mut self, context: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError> {
+    async fn handle_rtp_over_rtsp_message(&mut self, context: &mut RtspServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError> {
         // let mut cur_reader = BytesReader::new(session.reader.read_bytes(length)?);
         //
         // for track in self.tracks.values_mut() {
@@ -129,11 +129,11 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         Ok(())
     }
 
-    async fn handle_options(&mut self, context: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_options(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_describe(&mut self, context: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest) -> Result<SessionDescription, RtspSessionError> {
+    async fn handle_describe(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<SessionDescription, RtspSessionError> {
 
         let (sender, mut receiver) = mpsc::unbounded_channel();
 
@@ -161,7 +161,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
 
     }
 
-    async fn handle_announce(&mut self, context: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest, frame_receiver:FrameDataReceiver) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_announce(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest, frame_receiver:FrameDataReceiver) -> Result<Option<RtspResponse>, RtspSessionError> {
 
         if let Some(request_body) = &rtsp_request.body {
             if let sdp = SessionDescription::unmarshal(request_body)? {
@@ -201,11 +201,11 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         Ok(None)
     }
 
-    async fn handle_setup(&mut self, context: &mut RTSPServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_setup(&mut self, context: &mut RtspServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_play(&mut self, context: &mut RTSPServerSessionContext, rtsp_request: &RtspRequest, frame_sender: FrameDataSender) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_play(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest, frame_sender: FrameDataSender) -> Result<Option<RtspResponse>, RtspSessionError> {
 
         let (event_result_sender, event_result_receiver) = oneshot::channel();
         let path = rtsp_request.uri.path.to_string();
@@ -233,11 +233,11 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
     }
 
 
-    async fn handle_record(&mut self, context: &mut RTSPServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_record(&mut self, context: &mut RtspServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_teardown(&mut self, context: &mut RTSPServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_teardown(&mut self, context: &mut RtspServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 }
@@ -254,12 +254,12 @@ impl RtspServerHandler
 }
 
 #[async_trait]
-impl TcpServerHandler<RTSPServerSession> for RtspServerHandler
+impl TcpServerHandler<RtspServerSession> for RtspServerHandler
 {
-    async fn on_create_session(&mut self, sock: tokio::net::TcpStream, remote: SocketAddr) -> Result<RTSPServerSession, SessionError> {
+    async fn on_create_session(&mut self, sock: tokio::net::TcpStream, remote: SocketAddr) -> Result<RtspServerSession, SessionError> {
         // info!("Session {} created", session_id);
         let id = Uuid::new(RandomDigitCount::Zero).to_string();
-        Ok(RTSPServerSession::new(id, sock, remote, Some(Box::new(VcpRtspServerSessionHandler::new(self.hub_event_sender.clone())))))
+        Ok(RtspServerSession::new(id, sock, remote, Some(Box::new(VcpRtspServerSessionHandler::new(self.hub_event_sender.clone())))))
     }
 
     async fn on_session_created(&mut self, session_id: String) -> Result<(), SessionError> {
@@ -270,7 +270,7 @@ impl TcpServerHandler<RTSPServerSession> for RtspServerHandler
 
 
 pub struct RtspServer {
-    tcp_server: TcpServer<RTSPServerSession>,
+    tcp_server: TcpServer<RtspServerSession>,
     // hub_event_sender: StreamHubEventSender,
 }
 
@@ -280,7 +280,7 @@ impl RtspServer {
         let server_handler = Box::new(
             RtspServerHandler::new(hub_event_sender)
         );
-        let rtsp_server: TcpServer<RTSPServerSession> = TcpServer::new(addr, Some(server_handler));
+        let rtsp_server: TcpServer<RtspServerSession> = TcpServer::new(addr, Some(server_handler));
 
         let res = Self {
             tcp_server: rtsp_server,
