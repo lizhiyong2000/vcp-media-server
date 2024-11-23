@@ -5,7 +5,7 @@ ffmpeg -re -stream_loop -1 -i ./example/test.mp4 -c copy -rtsp_transport tcp -f 
 ffmpeg -re -stream_loop -1 -i ./example/test.mp4 -c copy -rtsp_transport udp -f rtsp rtsp://127.0.0.1:8554/stream
 
 ## RTMP推流
-ffmpeg -re -stream_loop -1 -i ./example/test.mp4 -c copy -f flv rtmp://127.0.0.1:1935/stream/1
+ffmpeg -re -stream_loop -1 -i ./example/test.mp4 -c copy -f flv rtmp://127.0.0.1:1935/live/stream1
 
 
 ## ffplay播放

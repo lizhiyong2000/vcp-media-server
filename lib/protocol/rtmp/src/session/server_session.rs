@@ -47,6 +47,10 @@ enum ServerSessionState {
 }
 
 
+pub trait RtmpServerSessionHandler : Send + Sync{
+
+}
+
 pub struct RTMPServerSession {
     id: String,
     remote_addr: SocketAddr,
@@ -61,7 +65,9 @@ pub struct RTMPServerSession {
     connect_properties: ConnectProperties,
     query: Option<String>,
     bytesio_data: BytesMut,
-    has_remaing_data: bool,
+    has_remain_data: bool,
+
+    handler: Option<Box<dyn RtmpServerSessionHandler>>,
 }
 
 #[async_trait]
@@ -97,7 +103,7 @@ impl NetworkSession for RTMPServerSession {
 impl TcpSession for RTMPServerSession {
     fn from_tcp_socket(sock: TcpStream, remote: SocketAddr) -> Self {
         let id = Uuid::new(RandomDigitCount::Zero).to_string();
-        Self::new(id, sock, remote)
+        Self::new(id, sock, remote, None)
     }
 
     // fn notify_created(&self) {
@@ -110,6 +116,7 @@ impl RTMPServerSession {
         id: String,
         stream: TcpStream,
         remote: SocketAddr,
+        handler: Option<Box<dyn RtmpServerSessionHandler>>,
     ) -> Self {
         let net_io: Box<dyn TNetIO + Send + Sync> = Box::new(TcpIO::new(stream));
         let io = Arc::new(Mutex::new(net_io));
@@ -127,7 +134,8 @@ impl RTMPServerSession {
             connect_properties: ConnectProperties::default(),
             query: None,
             bytesio_data: BytesMut::new(),
-            has_remaing_data: false,
+            has_remain_data: false,
+            handler,
         }
     }
 
@@ -167,7 +175,7 @@ impl RTMPServerSession {
             let left_bytes = self.handshaker.get_remaining_bytes();
             if !left_bytes.is_empty() {
                 self.unpacketizer.extend_data(&left_bytes[..]);
-                self.has_remaing_data = true;
+                self.has_remain_data = true;
             }
             info!("[ S->C ] [send_set_chunk_size] ");
             self.send_set_chunk_size().await?;
@@ -178,7 +186,7 @@ impl RTMPServerSession {
     }
 
     async fn read_parse_chunks(&mut self) -> Result<(), SessionError> {
-        if !self.has_remaing_data {
+        if !self.has_remain_data {
             match self
                 .io
                 .lock()
@@ -201,7 +209,7 @@ impl RTMPServerSession {
             self.unpacketizer.extend_data(&self.bytesio_data[..]);
         }
 
-        self.has_remaing_data = false;
+        self.has_remain_data = false;
 
         loop {
             match self.unpacketizer.read_chunks() {
