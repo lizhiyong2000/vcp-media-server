@@ -928,7 +928,7 @@ impl RtmpServerSession {
         //     .subscribe_from_stream_hub(self.app_name.clone(), self.stream_name.clone())
         //     .await?;
 
-        self.notify_play();
+        self.notify_play().await;
 
         self.state = ServerSessionState::Play;
 
