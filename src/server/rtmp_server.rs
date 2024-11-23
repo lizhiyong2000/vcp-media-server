@@ -1,22 +1,113 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use async_trait::async_trait;
+use bytes::BytesMut;
 use log::{info, error};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
 use vcp_media_common::media::{FrameDataReceiver, FrameDataSender};
 use vcp_media_common::server::{NetworkServer, ServerSessionType, SessionError, TcpServerHandler};
 use vcp_media_common::server::tcp_server::TcpServer;
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
+use vcp_media_rtmp::session::cache::Cache;
+use vcp_media_rtmp::session::cache::errors::CacheError;
 use vcp_media_rtmp::session::server_session::{RtmpServerSession, RtmpServerSessionContext, RtmpServerSessionHandler};
 use vcp_media_sdp::SessionDescription;
-use crate::common::stream::{PublishType, StreamId, SubscribeType};
+use crate::common::stream::{HandleStreamTransmit, PublishType, StreamId, SubscribeType};
 use crate::manager::message::{StreamHubEvent, StreamHubEventSender, StreamPublishInfo, StreamSubscribeInfo};
+use crate::manager::stream_hub::StreamHubError;
 
+pub struct  RtmpStreamTransmitHandler{
+    /*cache is used to save RTMP sequence/gops/meta data
+    which needs to be send to client(player) */
+    /*The cache will be used in different threads(save
+    cache in one thread and send cache data to different clients
+    in other threads) */
+    pub cache: Mutex<Option<Cache>>,
+}
+
+impl RtmpStreamTransmitHandler {
+    pub fn new() -> Self {
+        Self {
+            cache: Mutex::new(None),
+        }
+    }
+
+    pub async fn set_cache(&self, cache: Cache) {
+        *self.cache.lock().await = Some(cache);
+    }
+
+    pub async fn save_video_data(
+        &self,
+        chunk_body: &BytesMut,
+        timestamp: u32,
+    ) -> Result<(), CacheError> {
+        if let Some(cache) = &mut *self.cache.lock().await {
+            cache.save_video_data(chunk_body, timestamp).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn save_audio_data(
+        &self,
+        chunk_body: &BytesMut,
+        timestamp: u32,
+    ) -> Result<(), CacheError> {
+        if let Some(cache) = &mut *self.cache.lock().await {
+            cache.save_audio_data(chunk_body, timestamp).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn save_metadata(&self, chunk_body: &BytesMut, timestamp: u32) -> Result<(), CacheError> {
+        if let Some(cache) = &mut *self.cache.lock().await {
+            cache.save_metadata(chunk_body, timestamp);
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl HandleStreamTransmit for RtmpStreamTransmitHandler {
+    async fn send_prior_data(&self, sender: FrameDataSender, sub_type: SubscribeType) -> Result<(), StreamHubError> {
+
+        if let Some(cache) = &mut *self.cache.lock().await {
+            if let Some(meta_body_data) = cache.get_metadata() {
+                info!("send_prior_data: meta_body_data: ");
+                sender.send(meta_body_data).map_err(|_| StreamHubError::SendTransmitPriorDataError)?;
+            }
+            if let Some(audio_seq_data) = cache.get_audio_seq() {
+                info!("send_prior_data: audio_seq_data: ",);
+                sender.send(audio_seq_data).map_err(|_| StreamHubError::SendTransmitPriorDataError)?;
+            }
+            if let Some(video_seq_data) = cache.get_video_seq() {
+                info!("send_prior_data: video_seq_data:");
+                sender.send(video_seq_data).map_err(|_| StreamHubError::SendTransmitPriorDataError)?;
+            }
+            match sub_type {
+                SubscribeType::Pull => {
+                    if let Some(gops_data) = cache.get_gops_data() {
+                        for gop in gops_data {
+                            for channel_data in gop.get_frame_data() {
+                                sender.send(channel_data).map_err(|_| StreamHubError::SendTransmitPriorDataError)?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+}
 
 pub struct VcpRtmpServerSessionHandler {
 
     event_producer: StreamHubEventSender,
     publish_info: Option<StreamPublishInfo>,
     subscribe_info: Option<StreamSubscribeInfo>,
+    transmit_handler: Arc<RtmpStreamTransmitHandler>,
 }
 
 
@@ -28,12 +119,34 @@ impl VcpRtmpServerSessionHandler{
             event_producer,
             publish_info: None,
             subscribe_info: None,
+            transmit_handler: Arc::new(RtmpStreamTransmitHandler::new()),
         }
     }
 }
 
 #[async_trait]
 impl RtmpServerSessionHandler for VcpRtmpServerSessionHandler {
+
+    async fn save_video_data(
+        &self,
+        chunk_body: &BytesMut,
+        timestamp: u32,
+    ) -> Result<(), CacheError> {
+        self.transmit_handler.save_video_data(chunk_body, timestamp).await
+    }
+
+    async fn save_audio_data(
+        &self,
+        chunk_body: &BytesMut,
+        timestamp: u32,
+    ) -> Result<(), CacheError> {
+        self.transmit_handler.save_audio_data(chunk_body, timestamp).await
+    }
+
+    async fn save_metadata(&self, chunk_body: &BytesMut, timestamp: u32) -> Result<(), CacheError> {
+        self.transmit_handler.save_metadata(chunk_body, timestamp).await;
+        Ok(())
+    }
 
     async fn handle_publish(&mut self, ctx: &mut RtmpServerSessionContext, frame_receiver: FrameDataReceiver) {
 
@@ -52,6 +165,7 @@ impl RtmpServerSessionHandler for VcpRtmpServerSessionHandler {
             sdp: SessionDescription::default(),
             receiver:frame_receiver,
             result_sender,
+            stream_handler: self.transmit_handler.clone(),
         };
 
         self.event_producer.send(publish_event);

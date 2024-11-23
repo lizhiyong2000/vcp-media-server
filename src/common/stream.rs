@@ -1,6 +1,10 @@
 /* Subscribe streams from stream hub */
 use std::fmt;
+use async_trait::async_trait;
 use serde::Serialize;
+use vcp_media_common::media::FrameDataSender;
+use crate::manager::stream_hub::StreamHubError;
+
 #[derive(Debug, Serialize, Clone, PartialEq, Eq, Hash)]
 pub enum StreamId{
     Rtsp{
@@ -64,6 +68,14 @@ pub enum PubDataType {
     Both,
 }
 
+#[async_trait]
+pub trait HandleStreamTransmit : Send + Sync{
+    async fn send_prior_data(
+        &self,
+        sender: FrameDataSender,
+        sub_type: SubscribeType,
+    ) -> Result<(), StreamHubError>;
+}
 
 
 

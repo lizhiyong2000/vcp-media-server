@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use log::info;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use vcp_media_common::server::tcp_server::TcpServer;
 use vcp_media_common::Unmarshal;
@@ -14,8 +15,24 @@ use vcp_media_common::media::{FrameDataReceiver, FrameDataSender, StreamInformat
 use vcp_media_common::server::{NetworkServer, NetworkSession, ServerSessionType, SessionError, TcpServerHandler};
 use vcp_media_common::uuid::{RandomDigitCount, Uuid};
 use vcp_media_sdp::SessionDescription;
-use crate::common::stream::{PublishType, StreamId, SubscribeType};
+use crate::common::stream::{HandleStreamTransmit, PublishType, StreamId, SubscribeType};
+use crate::manager::stream_hub::StreamHubError;
 
+pub struct  RtspStreamTransmitHandler{
+
+}
+
+impl RtspStreamTransmitHandler {
+
+}
+
+
+#[async_trait]
+impl HandleStreamTransmit for RtspStreamTransmitHandler {
+    async fn send_prior_data(&self, sender: FrameDataSender, sub_type: SubscribeType) -> Result<(), StreamHubError> {
+        todo!()
+    }
+}
 pub struct VcpRtspServerSessionHandler {
     // session: Option<Arc<Mutex<RTSPServerSession>>>,
     // tracks: HashMap<TrackType, RtspTrack>,
@@ -27,6 +44,8 @@ pub struct VcpRtspServerSessionHandler {
     subscribe_info: Option<StreamSubscribeInfo>,
     // frame_sender: Option<FrameDataSender>,
     // frame_receiver: Option<FrameDataReceiver>,
+
+    transmit_handler: Arc<RtspStreamTransmitHandler>,
 }
 impl VcpRtspServerSessionHandler {
     pub fn new(event_producer: StreamHubEventSender) -> Self {
@@ -37,6 +56,7 @@ impl VcpRtspServerSessionHandler {
             sdp: SessionDescription::default(),
             subscribe_info:None,
             publish_info:None,
+            transmit_handler: Arc::new(RtspStreamTransmitHandler{}),
             // session:None,
             // tracks: HashMap::new(),
             // sdp: SessionDescription::default(),
@@ -185,8 +205,8 @@ impl HandleRtspServerSession for VcpRtspServerSessionHandler {
             info:publisher_info,
             sdp: self.sdp.clone(),
             receiver:frame_receiver,
-            result_sender: result_sender,
-            stream_handler: ctx.stream_handler.clone(),
+            result_sender,
+            stream_handler: self.transmit_handler.clone(),
 
         };
 

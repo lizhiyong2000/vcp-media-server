@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 use vcp_media_common::Marshal;
 use vcp_media_common::media::{FrameData, FrameDataReceiver, FrameDataSender, StreamInformation};
 use vcp_media_sdp::SessionDescription;
-use crate::common::stream::StreamId;
+use crate::common::stream::{HandleStreamTransmit, StreamId};
 
 pub struct RtspPushSource {
     stream_id: StreamId,
@@ -19,6 +19,7 @@ pub struct RtspPushSource {
     event_receiver: StreamTransmitEventReceiver,
     exit: broadcast::Sender<()>,
     frame_senders: Arc<Mutex<HashMap<String, FrameDataSender>>>,
+    stream_handler: Arc<dyn HandleStreamTransmit>,
 }
 
 #[async_trait]
@@ -54,7 +55,7 @@ impl StreamSource for RtspPushSource {
 
 
 impl RtspPushSource {
-    pub fn new(stream_id: StreamId, sdp:SessionDescription, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver) -> Self {
+    pub fn new(stream_id: StreamId, sdp:SessionDescription, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver, stream_handler: Arc<dyn HandleStreamTransmit>) -> Self {
         let (tx, _) = broadcast::channel::<()>(1);
         Self {
             stream_id,
@@ -63,6 +64,7 @@ impl RtspPushSource {
             event_receiver,
             exit: tx,
             frame_senders: Arc::new(Default::default()),
+            stream_handler,
         }
     }
 
@@ -90,15 +92,15 @@ impl RtspPushSource {
             match event {
                 StreamTransmitEvent::Subscribe{ sender, info }
                 => {
-                    if let Err(err) = stream_handler
-                        .send_prior_data(sender.clone(), info.subscribe_type)
-                        .await
-                    {
+                    if let Err(err) = self.stream_handler.send_prior_data(sender.clone(), info.subscribe_type).await{
                         log::error!("receive_event_loop send_prior_data err: {}", err);
                         // break;
                     }
+                    else{
+                        self.frame_senders.lock().await.insert(info.subscriber_id, sender);
+                    }
 
-                    self.frame_senders.lock().await.insert(info.subscriber_id, sender);
+
                     // match sender {
                     //     DataSender::Frame {
                     //         sender: frame_sender,

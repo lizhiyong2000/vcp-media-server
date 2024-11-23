@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use crate::manager::message::{RequestResultSender, StreamHubEvent, StreamPublishInfo, StreamSubscribeInfo, StreamTransmitEvent, StreamTransmitEventSender};
 use crate::transmitter::StreamTransmitter;
 use log::info;
@@ -6,10 +7,16 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use vcp_media_common::media::{FrameDataReceiver, FrameDataSender};
 use vcp_media_sdp::SessionDescription;
-use crate::common::stream::{PublishType, StreamId};
+use crate::common::stream::{HandleStreamTransmit, PublishType, StreamId};
 
 #[derive(Debug, Error)]
 pub enum StreamHubError {
+    #[error("StreamUnPublishError")]
+    StreamUnPublishError,
+
+    #[error("StreamUnSubscribeError")]
+    StreamUnSubscribeError,
+
 
     #[error("SendTransmitRequestError")]
     SendTransmitRequestError,
@@ -20,11 +27,10 @@ pub enum StreamHubError {
     #[error("SendTransmitUnSubscribeError")]
     SendTransmitUnSubscribeError,
 
-    #[error("StreamUnPublishError")]
-    StreamUnPublishError,
-
     #[error("StreamUnSubscribeError")]
-    StreamUnSubscribeError,
+    SendTransmitPriorDataError,
+
+
 }
 
 pub struct StreamHub {
@@ -55,11 +61,11 @@ impl StreamHub {
         while let Some(event) = self.event_receiver.recv().await {
 
             match event {
-                StreamHubEvent::Publish{info, sdp, receiver,  result_sender} => {
+                StreamHubEvent::Publish{info, sdp, receiver,  result_sender, stream_handler} => {
                     info!("[EVENT] [StreamHub:Publish]:{:?}", info);
                     // let (sender, receiver) =
                     //     mpsc::unbounded_channel::<FrameData>();
-                    self.handle_publish(info, sdp, receiver).await;
+                    self.handle_publish(info, sdp, receiver, stream_handler).await;
 
                     let result = Ok(());
 
@@ -107,7 +113,7 @@ impl StreamHub {
 
 
     //publish a stream
-    async fn handle_publish(&mut self, info: StreamPublishInfo, sdp:SessionDescription, receiver: FrameDataReceiver) -> Result<(), StreamHubError> {
+    async fn handle_publish(&mut self, info: StreamPublishInfo, sdp:SessionDescription, receiver: FrameDataReceiver, stream_handler: Arc<dyn HandleStreamTransmit>) -> Result<(), StreamHubError> {
         info!("stream hub handle publish:{:?}", info);
 
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
@@ -118,7 +124,7 @@ impl StreamHub {
         let identifier_clone = info.stream_id.clone();
 
         tokio::spawn(async move{
-            if let Err(err) = transceiver.run(PublishType::Push, sdp, receiver, event_receiver).await {
+            if let Err(err) = transceiver.run(PublishType::Push, sdp, receiver, event_receiver, stream_handler).await {
                 log::error!(
                 "transceiver run error, identifier: {}, error: {}",
                 identifier_clone,

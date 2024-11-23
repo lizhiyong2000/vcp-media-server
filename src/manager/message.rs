@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::sync::mpsc::UnboundedSender;
 use vcp_media_common::media::{FrameDataReceiver, FrameDataSender, StreamInformation};
 use vcp_media_sdp::SessionDescription;
-use crate::common::stream::{PublishType, StreamId, SubscribeType};
+use crate::common::stream::{HandleStreamTransmit, PublishType, StreamId, SubscribeType};
 // use tokio::sync::broadcast::error::SendError;
 use crate::manager::stream_hub::StreamHubError;
 
@@ -90,17 +90,6 @@ pub struct StreamPullInfo {}
 //     }
 // }
 
-#[async_trait]
-pub trait TStreamHandler: Send + Sync {
-    async fn send_prior_data(
-        &self,
-        sender: FrameDataSender,
-        sub_type: SubscribeType,
-    ) -> Result<(), StreamHubError>;
-    // async fn get_statistic_data(&self) -> Option<StatisticsStream>;
-    // async fn send_information(&self, sender: InformationSender);
-}
-
 // #[derive()]
 pub enum StreamHubEvent {
     Publish{
@@ -108,7 +97,7 @@ pub enum StreamHubEvent {
         sdp:SessionDescription,
         receiver: FrameDataReceiver,
         result_sender:PublishResultSender,
-        stream_handler: Arc<dyn TStreamHandler>,
+        stream_handler: Arc<dyn HandleStreamTransmit>,
     },
     UnPublish{
         info:StreamPublishInfo,
