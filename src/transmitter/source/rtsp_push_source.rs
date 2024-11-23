@@ -90,13 +90,13 @@ impl RtspPushSource {
             match event {
                 StreamTransmitEvent::Subscribe{ sender, info }
                 => {
-                    // if let Err(err) = stream_handler
-                    //     .send_prior_data(sender.clone(), info.sub_type)
-                    //     .await
-                    // {
-                    //     log::error!("receive_event_loop send_prior_data err: {}", err);
-                    //     break;
-                    // }
+                    if let Err(err) = stream_handler
+                        .send_prior_data(sender.clone(), info.subscribe_type)
+                        .await
+                    {
+                        log::error!("receive_event_loop send_prior_data err: {}", err);
+                        // break;
+                    }
 
                     self.frame_senders.lock().await.insert(info.subscriber_id, sender);
                     // match sender {

@@ -33,6 +33,8 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use vcp_media_common::media::{FrameData, FrameDataReceiver, FrameDataSender};
+use crate::session::cache::Cache;
+use crate::session::cache::errors::CacheError;
 
 enum ServerSessionState {
     Handshake,
@@ -73,6 +75,123 @@ impl RtmpServerSessionContext {
     }
 }
 
+
+
+#[derive(Default)]
+pub struct RtmpStreamHandler {
+    /*cache is used to save RTMP sequence/gops/meta data
+    which needs to be send to client(player) */
+    /*The cache will be used in different threads(save
+    cache in one thread and send cache data to different clients
+    in other threads) */
+    pub cache: Mutex<Option<Cache>>,
+}
+
+impl RtmpStreamHandler {
+    pub fn new() -> Self {
+        Self {
+            cache: Mutex::new(None),
+        }
+    }
+
+    pub async fn set_cache(&self, cache: Cache) {
+        *self.cache.lock().await = Some(cache);
+    }
+
+    pub async fn save_video_data(
+        &self,
+        chunk_body: &BytesMut,
+        timestamp: u32,
+    ) -> Result<(), CacheError> {
+        if let Some(cache) = &mut *self.cache.lock().await {
+            cache.save_video_data(chunk_body, timestamp).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn save_audio_data(
+        &self,
+        chunk_body: &BytesMut,
+        timestamp: u32,
+    ) -> Result<(), CacheError> {
+        if let Some(cache) = &mut *self.cache.lock().await {
+            cache.save_audio_data(chunk_body, timestamp).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn save_metadata(&self, chunk_body: &BytesMut, timestamp: u32) {
+        if let Some(cache) = &mut *self.cache.lock().await {
+            cache.save_metadata(chunk_body, timestamp);
+        }
+    }
+}
+
+#[async_trait]
+impl TStreamHandler for RtmpStreamHandler {
+    async fn send_prior_data(
+        &self,
+        data_sender: FrameDataSenderDataSender,
+        sub_type: SubscribeType,
+    ) -> Result<(), StreamHubError> {
+        let sender = match data_sender {
+            DataSender::Frame { sender } => sender,
+            DataSender::Packet { sender: _ } => {
+                return Err(StreamHubError {
+                    value: StreamHubErrorValue::NotCorrectDataSenderType,
+                });
+            }
+        };
+        if let Some(cache) = &mut *self.cache.lock().await {
+            if let Some(meta_body_data) = cache.get_metadata() {
+                log::info!("send_prior_data: meta_body_data: ");
+                sender.send(meta_body_data).map_err(|_| StreamHubError {
+                    value: StreamHubErrorValue::SendError,
+                })?;
+            }
+            if let Some(audio_seq_data) = cache.get_audio_seq() {
+                log::info!("send_prior_data: audio_seq_data: ",);
+                sender.send(audio_seq_data).map_err(|_| StreamHubError {
+                    value: StreamHubErrorValue::SendError,
+                })?;
+            }
+            if let Some(video_seq_data) = cache.get_video_seq() {
+                log::info!("send_prior_data: video_seq_data:");
+                sender.send(video_seq_data).map_err(|_| StreamHubError {
+                    value: StreamHubErrorValue::SendError,
+                })?;
+            }
+            match sub_type {
+                SubscribeType::RtmpPull
+                | SubscribeType::RtmpRemux2HttpFlv
+                | SubscribeType::RtmpRemux2Hls => {
+                    if let Some(gops_data) = cache.get_gops_data() {
+                        for gop in gops_data {
+                            for channel_data in gop.get_frame_data() {
+                                sender.send(channel_data).map_err(|_| StreamHubError {
+                                    value: StreamHubErrorValue::SendError,
+                                })?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+    async fn get_statistic_data(&self) -> Option<StatisticsStream> {
+        //if let Some(cache) = &mut *self.cache.lock().await {
+        //    return Some(cache.av_statistics.get_avstatistic_data().await);
+        //}
+
+        None
+    }
+
+    async fn send_information(&self, _: InformationSender) {}
+}
+
 pub struct RtmpServerSession {
     id: String,
     remote_addr: SocketAddr,
@@ -93,6 +212,8 @@ pub struct RtmpServerSession {
 
     data_sender: FrameDataSender,
     data_receiver: FrameDataReceiver,
+
+
 
     handler: Option<Box<dyn RtmpServerSessionHandler>>,
 }

@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use vcp_media_common::server::tcp_server::TcpServer;
 use vcp_media_common::Unmarshal;
 use vcp_media_rtsp::session::errors::RtspSessionError;
-use vcp_media_rtsp::session::server_session::{RtspServerSession, RtspServerSessionContext, RtspServerSessionHandler};
+use vcp_media_rtsp::session::server_session::{RtspServerSession, RtspServerSessionContext, HandleRtspServerSession};
 
 use crate::manager::message::{StreamHubEvent, StreamHubEventSender, StreamPublishInfo, StreamSubscribeInfo};
 use vcp_media_common::http::HttpRequest as RtspRequest;
@@ -69,7 +69,7 @@ impl VcpRtspServerSessionHandler {
 }
 
 #[async_trait]
-impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
+impl HandleRtspServerSession for VcpRtspServerSessionHandler {
     // fn get_frame_sender(&mut self) -> Option<FrameDataSender> {
     //     return self.frame_sender.clone()
     // }
@@ -85,8 +85,8 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
     //     }
     // }
 
-    async fn handle_close(&mut self, context: &mut RtspServerSessionContext) -> Result<(), RtspSessionError>{
-        match context.session_type {
+    async fn handle_close(&mut self, ctx: &mut RtspServerSessionContext) -> Result<(), RtspSessionError>{
+        match ctx.session_type {
             ServerSessionType::Pull => {
 
                 if let Some(sub_info) = self.subscribe_info.as_mut() {
@@ -111,7 +111,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         Ok(())
     }
 
-    async fn handle_rtp_over_rtsp_message(&mut self, context: &mut RtspServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError> {
+    async fn handle_rtp_over_rtsp_message(&mut self, ctx: &mut RtspServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError> {
         // let mut cur_reader = BytesReader::new(session.reader.read_bytes(length)?);
         //
         // for track in self.tracks.values_mut() {
@@ -129,11 +129,11 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         Ok(())
     }
 
-    async fn handle_options(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_options(&mut self, ctx: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_describe(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<SessionDescription, RtspSessionError> {
+    async fn handle_describe(&mut self, ctx: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<SessionDescription, RtspSessionError> {
 
         let (sender, mut receiver) = mpsc::unbounded_channel();
 
@@ -161,7 +161,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
 
     }
 
-    async fn handle_announce(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest, frame_receiver:FrameDataReceiver) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_announce(&mut self, ctx: &mut RtspServerSessionContext, rtsp_request: &RtspRequest, frame_receiver:FrameDataReceiver) -> Result<Option<RtspResponse>, RtspSessionError> {
 
         if let Some(request_body) = &rtsp_request.body {
             if let sdp = SessionDescription::unmarshal(request_body)? {
@@ -176,7 +176,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         let publisher_info = StreamPublishInfo {
             stream_id: StreamId::Rtsp {path},
             publish_type: PublishType::Push,
-            publisher_id: context.session_id.clone(),
+            publisher_id: ctx.session_id.clone(),
         };
 
         self.publish_info = Some(publisher_info.clone());
@@ -186,6 +186,8 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
             sdp: self.sdp.clone(),
             receiver:frame_receiver,
             result_sender: result_sender,
+            stream_handler: ctx.stream_handler.clone(),
+
         };
 
         self.event_producer.send(publish_event);
@@ -201,11 +203,11 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         Ok(None)
     }
 
-    async fn handle_setup(&mut self, context: &mut RtspServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_setup(&mut self, ctx: &mut RtspServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_play(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest, frame_sender: FrameDataSender) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_play(&mut self, ctx: &mut RtspServerSessionContext, rtsp_request: &RtspRequest, frame_sender: FrameDataSender) -> Result<Option<RtspResponse>, RtspSessionError> {
 
         let (event_result_sender, event_result_receiver) = oneshot::channel();
         let path = rtsp_request.uri.path.to_string();
@@ -213,7 +215,7 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
         let subscribe_info = StreamSubscribeInfo {
             stream_id: StreamId::Rtsp {path},
             subscribe_type: SubscribeType::Pull,
-            subscriber_id: context.session_id.clone(),
+            subscriber_id: ctx.session_id.clone(),
         };
         self.subscribe_info = Some(subscribe_info.clone());
         let subscribe_event = StreamHubEvent::Subscribe {
@@ -233,11 +235,11 @@ impl RtspServerSessionHandler for VcpRtspServerSessionHandler {
     }
 
 
-    async fn handle_record(&mut self, context: &mut RtspServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_record(&mut self, ctx: &mut RtspServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_teardown(&mut self, context: &mut RtspServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_teardown(&mut self, ctx: &mut RtspServerSessionContext, _rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 }

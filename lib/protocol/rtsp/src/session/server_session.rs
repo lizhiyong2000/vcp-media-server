@@ -49,7 +49,7 @@ pub struct InterleavedBinaryData {
 
 
 #[async_trait]
-pub trait RtspServerSessionHandler : Send + Sync {
+pub trait HandleRtspServerSession: Send + Sync {
 
     // fn get_frame_sender(&mut self)->Option<FrameDataSender>;
     // fn get_frame_receiver(&mut self)->Option<FrameDataReceiver>;
@@ -173,7 +173,7 @@ pub struct RtspServerSession {
     tracks: HashMap<TrackType, RtspTrack>,
     sdp: SessionDescription,
     session_id: Option<Uuid>,
-    handler: Option<Box<dyn RtspServerSessionHandler>>,
+    handler: Option<Box<dyn HandleRtspServerSession>>,
 }
 
 
@@ -216,7 +216,7 @@ impl RtspServerSession {
         id: String,
         stream: TcpStream,
         remote: SocketAddr,
-        handler: Option<Box<dyn RtspServerSessionHandler>>
+        handler: Option<Box<dyn HandleRtspServerSession>>
         // event_producer: StreamHubEventSender,
         // auth: Option<Auth>,
     ) -> Self {

@@ -1,4 +1,6 @@
 use std::fmt::{Debug, Write};
+use std::sync::Arc;
+use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
 // 0.17.1
@@ -88,6 +90,16 @@ pub struct StreamPullInfo {}
 //     }
 // }
 
+#[async_trait]
+pub trait TStreamHandler: Send + Sync {
+    async fn send_prior_data(
+        &self,
+        sender: FrameDataSender,
+        sub_type: SubscribeType,
+    ) -> Result<(), StreamHubError>;
+    // async fn get_statistic_data(&self) -> Option<StatisticsStream>;
+    // async fn send_information(&self, sender: InformationSender);
+}
 
 // #[derive()]
 pub enum StreamHubEvent {
@@ -96,6 +108,7 @@ pub enum StreamHubEvent {
         sdp:SessionDescription,
         receiver: FrameDataReceiver,
         result_sender:PublishResultSender,
+        stream_handler: Arc<dyn TStreamHandler>,
     },
     UnPublish{
         info:StreamPublishInfo,

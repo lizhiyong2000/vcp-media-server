@@ -1,3 +1,4 @@
 pub mod server_session;
-mod errors;
-mod define;
+pub mod errors;
+pub mod define;
+pub mod cache;
