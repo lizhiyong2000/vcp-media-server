@@ -124,7 +124,7 @@ impl NetworkSession for RtmpServerSession {
     }
 
     async fn close(&mut self) {
-        todo!()
+        info!("close session {}", self.id());
     }
 }
 

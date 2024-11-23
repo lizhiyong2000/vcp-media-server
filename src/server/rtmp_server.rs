@@ -160,6 +160,10 @@ impl RtmpServerSessionHandler for VcpRtmpServerSessionHandler {
 
         self.publish_info = Some(publisher_info.clone());
 
+        self.transmit_handler
+            .set_cache(Cache::new(5))
+            .await;
+
         let publish_event = StreamHubEvent::Publish{
             info:publisher_info,
             sdp: SessionDescription::default(),
@@ -169,6 +173,8 @@ impl RtmpServerSessionHandler for VcpRtmpServerSessionHandler {
         };
 
         self.event_producer.send(publish_event);
+
+
 
         let sender = match result_receiver.await {
             Ok(x) => {
