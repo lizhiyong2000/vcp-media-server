@@ -1,6 +1,4 @@
-use crate::common::define::{ StreamTransmitEventReceiver};
-use crate::manager::message;
-use crate::manager::message::{StreamTransmitEvent};
+use crate::manager::message::{StreamTransmitEvent, StreamTransmitEventReceiver};
 use crate::transmitter::source::StreamSource;
 use crate::transmitter::StreamTransmitError;
 use async_trait::async_trait;
@@ -12,14 +10,16 @@ use tokio::sync::broadcast;
 use vcp_media_common::Marshal;
 use vcp_media_common::media::{FrameData, FrameDataReceiver, FrameDataSender, StreamInformation};
 use vcp_media_sdp::SessionDescription;
+use crate::common::stream::{HandleStreamTransmit, StreamId};
 
 pub struct RtspPushSource {
-    stream_id: String,
+    stream_id: StreamId,
     sdp: SessionDescription,
     data_receiver: FrameDataReceiver,
     event_receiver: StreamTransmitEventReceiver,
     exit: broadcast::Sender<()>,
     frame_senders: Arc<Mutex<HashMap<String, FrameDataSender>>>,
+    stream_handler: Arc<dyn HandleStreamTransmit>,
 }
 
 #[async_trait]
@@ -55,7 +55,7 @@ impl StreamSource for RtspPushSource {
 
 
 impl RtspPushSource {
-    pub fn new(stream_id: String, sdp:SessionDescription, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver) -> Self {
+    pub fn new(stream_id: StreamId, sdp:SessionDescription, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver, stream_handler: Arc<dyn HandleStreamTransmit>) -> Self {
         let (tx, _) = broadcast::channel::<()>(1);
         Self {
             stream_id,
@@ -64,6 +64,7 @@ impl RtspPushSource {
             event_receiver,
             exit: tx,
             frame_senders: Arc::new(Default::default()),
+            stream_handler,
         }
     }
 
@@ -86,20 +87,20 @@ impl RtspPushSource {
     async fn receive_event(&mut self, event: Option<StreamTransmitEvent>) {
         if let Some(event) = event {
 
-            info!("rtsp event received");
+            info!("transmit event received : {:?}", event);
 
             match event {
                 StreamTransmitEvent::Subscribe{ sender, info }
                 => {
-                    // if let Err(err) = stream_handler
-                    //     .send_prior_data(sender.clone(), info.sub_type)
-                    //     .await
-                    // {
-                    //     log::error!("receive_event_loop send_prior_data err: {}", err);
-                    //     break;
-                    // }
+                    if let Err(err) = self.stream_handler.send_prior_data(sender.clone(), info.subscribe_type).await{
+                        log::error!("receive_event_loop send_prior_data err: {}", err);
+                        // break;
+                    }
+                    else{
+                        self.frame_senders.lock().await.insert(info.subscriber_id, sender);
+                    }
 
-                    self.frame_senders.lock().await.insert(info.stream_id, sender);
+
                     // match sender {
                     //     DataSender::Frame {
                     //         sender: frame_sender,
@@ -124,6 +125,10 @@ impl RtspPushSource {
                     // statistics_data.subscriber_count += 1;
                 }
                 StreamTransmitEvent::UnSubscribe{info} => {
+
+                    self.frame_senders.lock().await.remove(&info.subscriber_id);
+
+                    info!("rtsp subscriber {} unsubscribe successful ", info.subscriber_id);
                     // match info.sub_type {
                     //     SubscribeType::RtpPull | SubscribeType::WhepPull => {
                     //         packet_senders.lock().await.remove(&info.id);

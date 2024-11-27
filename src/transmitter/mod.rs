@@ -5,13 +5,15 @@ mod traits;
 mod source;
 mod sink;
 
-use crate::common::define::{ PublishType, StreamTransmitEventReceiver};
 // use crate::transmitter::traits::StreamSource;
 use crate::transmitter::source::rtsp_push_source::RtspPushSource;
 use crate::transmitter::source::StreamSource;
 use sink::fake_sink::FakeSink;
 use vcp_media_common::media::FrameDataReceiver;
 use vcp_media_sdp::SessionDescription;
+use crate::common::stream::{HandleStreamTransmit, PublishType, StreamId};
+use crate::manager::message::StreamTransmitEventReceiver;
+use crate::transmitter::source::rtmp_push_source::RtmpPushSource;
 
 #[derive(Debug, Error)]
 pub enum StreamTransmitError {
@@ -32,7 +34,7 @@ pub enum StreamTransmitError {
 //     RtmpPull,
 // }
 pub struct StreamTransmitter {
-    stream_id: String,
+    stream_id: StreamId,
     // source_type: PublishType,
     // source_element: Box<dyn StreamSource>,
     default_sink: Arc<Box<FakeSink>>,
@@ -40,7 +42,7 @@ pub struct StreamTransmitter {
 }
 
 impl StreamTransmitter {
-    pub fn new(stream_id: String) -> Self {
+    pub fn new(stream_id: StreamId) -> Self {
         // let source = match source_type {
         //     // PublishType::RtmpPush => {
         //     //     // RtmpPushSource::new(stream_id.clone(), data_receiver);
@@ -63,19 +65,30 @@ impl StreamTransmitter {
         }
     }
 
-    pub async fn run(self, source_type: PublishType, sdp:SessionDescription, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver) -> Result<(), StreamTransmitError> {
-        let mut source = match source_type {
+    pub async fn run(self, source_type: PublishType, sdp:SessionDescription, data_receiver: FrameDataReceiver, event_receiver: StreamTransmitEventReceiver, stream_handler: Arc<dyn HandleStreamTransmit>) -> Result<(), StreamTransmitError> {
+        let mut source:Box<dyn StreamSource> = match source_type {
             // PublishType::RtmpPush => {
             //     // RtmpPushSource::new(stream_id.clone(), data_receiver);
             // }
             // PublishType::RtmpPull => {}
-            PublishType::RtspPush => {
-                RtspPushSource::new(self.stream_id.clone(), sdp, data_receiver, event_receiver)
+            PublishType::Push => {
+                match self.stream_id {
+                    StreamId::Rtsp { .. } => {
+                        Box::new(RtspPushSource::new(self.stream_id.clone(), sdp, data_receiver, event_receiver, stream_handler))
+                    }
+                    StreamId::Rtmp { .. } => {
+                        Box::new(RtmpPushSource::new(self.stream_id.clone(), data_receiver, event_receiver, stream_handler))
+                    }
+                }
+
             }
             // PublishType::RtspPull => {}
             // PublishType::WhipPush => {}
             // PublishType::WhepPull => {}
             // PublishType::RtpPush => {}
+            PublishType::Pull => {
+                todo!()
+            }
         };
 
 

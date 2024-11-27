@@ -13,7 +13,7 @@ thiserror = "2.0.3"
 byteorder = "1.5.0"
 serde_derive = "1.0"
 serde = { version = "1.0.101", optional = true, features = ["derive"] }
-tokio = { version = "1.26.0", features = ["full"] }
+tokio = { version = "1.41.1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3.18"
 tracing-error = "0.2.0"
@@ -42,4 +42,4 @@ serde_json = { version = "1", default-features = false, features = [
 
 vcp_media_common = { path = "../../common/" }
 vcp_media_h264 = { path = "../../codec/h264/" }
-vcp_media_flv = { path = "../../codec/flv/" }
+vcp_media_flv = { path = "../../format/flv/" }

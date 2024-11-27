@@ -25,6 +25,7 @@ pub enum ClientSessionType {
 pub enum SessionError {
     #[error("the http request has no request line.")]
     SocketIOError(#[from] std::io::Error),
+    
 }
 
 pub trait ServerSessionHandler{

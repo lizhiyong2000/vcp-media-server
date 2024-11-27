@@ -1,16 +1,13 @@
-use std::fmt::{Debug, Formatter, Write};
-use indexmap::IndexMap;
-use lazy_static::lazy_static;
-use std::sync::Mutex;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use std::fmt::{Debug, Write};
+use std::sync::Arc;
+use async_trait::async_trait;
+use tokio::sync::{mpsc, oneshot};
 
-use strum::IntoEnumIterator;
 // 0.17.1
-use strum_macros::EnumIter;
-use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::UnboundedSender;
 use vcp_media_common::media::{FrameDataReceiver, FrameDataSender, StreamInformation};
 use vcp_media_sdp::SessionDescription;
+use crate::common::stream::{HandleStreamTransmit, PublishType, StreamId, SubscribeType};
 // use tokio::sync::broadcast::error::SendError;
 use crate::manager::stream_hub::StreamHubError;
 
@@ -65,16 +62,16 @@ use crate::manager::stream_hub::StreamHubError;
 
 #[derive(Clone, Debug)]
 pub struct StreamPublishInfo {
-    pub stream_id: String,
-    pub stream_type: String,
-    pub url: String,
+    pub stream_id: StreamId,
+    pub publish_type: PublishType,
+    pub publisher_id: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct StreamSubscribeInfo {
-    pub stream_id: String,
-    pub stream_type: String,
-    pub url: String,
+    pub stream_id: StreamId,
+    pub subscribe_type: SubscribeType,
+    pub subscriber_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -93,7 +90,6 @@ pub struct StreamPullInfo {}
 //     }
 // }
 
-
 // #[derive()]
 pub enum StreamHubEvent {
     Publish{
@@ -101,6 +97,7 @@ pub enum StreamHubEvent {
         sdp:SessionDescription,
         receiver: FrameDataReceiver,
         result_sender:PublishResultSender,
+        stream_handler: Arc<dyn HandleStreamTransmit>,
     },
     UnPublish{
         info:StreamPublishInfo,
@@ -114,7 +111,7 @@ pub enum StreamHubEvent {
         info:StreamSubscribeInfo,
     },
     Request {
-        stream_id: String,
+        stream_id: StreamId,
         result_sender: RequestResultSender,
     },
     // StartRelay(StreamPublishInfo),
@@ -160,66 +157,8 @@ pub enum StreamTransmitEvent {
     }
 }
 
-// #[derive(Debug)]
-// pub struct EventBus<T>  {
-//     // kind: EventKind,
-//     sender: mpsc::UnboundedSender<T>,
-//     receiver: mpsc::UnboundedReceiver<T>,
-// }
-//
-//
-// impl<T> EventBus<T> {
-//     pub fn new() -> Self {
-//         let (sender, receiver) = mpsc::unbounded_channel();
-//         EventBus {sender, receiver }
-//     }
-//
-//     pub fn get_sender(&self) -> mpsc::UnboundedSender<T> {
-//         self.sender.clone()
-//     }
-// }
-//
-// pub struct MessageHub {
-//     stream_hub: EventBus<StreamHubEvent>,
-//     // transmit: EventBus<StreamTransmitEvent>,
-//     // msg_bus: EventBus<>
-// }
-//
-// impl MessageHub {
-//     pub fn new() -> Self {
-//         // let mut msg_buses: IndexMap<EventKind, EventBus> = IndexMap::new();
-//         //
-//         // for event_kind in EventKind::iter() {
-//         //     msg_buses.insert(event_kind, EventBus::new(event_kind));
-//         // }
-//
-//         Self { stream_hub: EventBus::new() }
-//     }
-//     pub fn subscribe_stream_hub(&self, event_kind: EventKind) -> mpsc::UnboundedSender<StreamHubEvent> {
-//         // let msg_bus = self.msg_buses.get(&event_kind).unwrap();
-//         self.stream_hub.receiver.
-//     }
-//
-//     pub fn publish_stream_hub(&self, event: StreamHubEvent) -> Result<(), SendError<StreamHubEvent>> {
-//         // let msg_bus = self.msg_buses.get(&event.kind).unwrap();
-//         self.stream_hub.sender.send(event)
-//     }
-// }
-// // // impl EventSender for MessageHub{
-// // //     fn pub_event(&self) {
-// // //         info!("MessageHub pub event");
-// // //     }
-// // //
-// //
-// lazy_static! {
-//     static ref MESSSAG_HUB: Mutex<MessageHub> = Mutex::new(MessageHub::new());
-// }
-//
-// pub fn subscribe_stream_hub(event_kind: EventKind) -> mpsc::UnboundedSender<StreamHubEvent> {
-//     let msg_hub = MESSSAG_HUB.lock().unwrap();
-//     msg_hub.subscribe_stream_hub(event_kind)
-// }
-// pub fn publish_stream_hub(event: StreamHubEvent) -> Result<(), SendError<StreamHubEvent>>{
-//     let msg_hub = MESSSAG_HUB.lock().unwrap();
-//     msg_hub.publish_stream_hub(event)
-// }
+
+
+pub type StreamTransmitEventSender = mpsc::UnboundedSender<StreamTransmitEvent>;
+pub type StreamTransmitEventReceiver = mpsc::UnboundedReceiver<StreamTransmitEvent>;
+

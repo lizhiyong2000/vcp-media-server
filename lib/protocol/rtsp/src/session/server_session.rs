@@ -49,44 +49,44 @@ pub struct InterleavedBinaryData {
 
 
 #[async_trait]
-pub trait RtspServerSessionHandler : Send + Sync {
+pub trait HandleRtspServerSession: Send + Sync {
 
     // fn get_frame_sender(&mut self)->Option<FrameDataSender>;
     // fn get_frame_receiver(&mut self)->Option<FrameDataReceiver>;
     //
-    async fn handle_close(&mut self, context: &mut RTSPServerSessionContext) -> Result<(), RtspSessionError>{
+    async fn handle_close(&mut self, context: &mut RtspServerSessionContext) -> Result<(), RtspSessionError>{
         Ok(())
     }
 
-    async fn handle_rtp_over_rtsp_message(&mut self, context: &mut RTSPServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>{
+    async fn handle_rtp_over_rtsp_message(&mut self, context: &mut RtspServerSessionContext, channel_identifier: u8, length: usize) -> Result<(), RtspSessionError>{
         Ok(())
     }
 
-    async fn handle_options(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError>{
+    async fn handle_options(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError>{
         Ok(None)
     }
 
-    async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<SessionDescription, RtspSessionError> {
+    async fn handle_describe(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<SessionDescription, RtspSessionError> {
         Ok(SessionDescription::default())
     }
 
-    async fn handle_announce(&mut self, rtsp_request: &RtspRequest, frame_receiver: FrameDataReceiver) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_announce(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest, frame_receiver: FrameDataReceiver) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_setup(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_setup(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_play(&mut self, rtsp_request: &RtspRequest, frame_sender: FrameDataSender) -> Result<Option<RtspResponse>, RtspSessionError>{
+    async fn handle_play(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest, frame_sender: FrameDataSender) -> Result<Option<RtspResponse>, RtspSessionError>{
         Ok(None)
     }
 
-    async fn handle_record(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_record(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 
-    async fn handle_teardown(&mut self, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
+    async fn handle_teardown(&mut self, context: &mut RtspServerSessionContext, rtsp_request: &RtspRequest) -> Result<Option<RtspResponse>, RtspSessionError> {
         Ok(None)
     }
 }
@@ -115,7 +115,7 @@ impl InterleavedBinaryData {
     }
 }
 
-pub struct RTSPServerSessionContext{
+pub struct RtspServerSessionContext {
     // pub io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
     // pub reader: BytesReader,
     // pub writer: BytesWriter,
@@ -125,9 +125,9 @@ pub struct RTSPServerSessionContext{
 }
 
 
-impl RTSPServerSessionContext {
+impl RtspServerSessionContext {
 
-    fn new(session_id:String) -> Self {
+    pub fn new(session_id:String) -> Self {
         Self{
             session_id,
             session_type: ServerSessionType::Unknown,
@@ -163,25 +163,22 @@ impl RTSPServerSessionContext {
     // }
 }
 
-pub struct RTSPServerSession {
+pub struct RtspServerSession {
     id: String,
     remote_addr: SocketAddr,
-    context: RTSPServerSessionContext,
+    context: RtspServerSessionContext,
     io: Arc<Mutex<Box<dyn TNetIO + Send + Sync>>>,
     reader: BytesReader,
     writer: AsyncBytesWriter,
     tracks: HashMap<TrackType, RtspTrack>,
     sdp: SessionDescription,
     session_id: Option<Uuid>,
-    handler: Option<Box<dyn RtspServerSessionHandler>>,
-
-    frame_sender: Option<FrameDataSender>,
-    frame_receiver: Option<FrameDataReceiver>,
+    handler: Option<Box<dyn HandleRtspServerSession>>,
 }
 
 
 #[async_trait]
-impl NetworkSession for RTSPServerSession {
+impl NetworkSession for RtspServerSession {
     fn id(&self) -> String {
         return self.id.clone();
     }
@@ -207,19 +204,19 @@ impl NetworkSession for RTSPServerSession {
     }
 }
 
-impl TcpSession for RTSPServerSession {
+impl TcpSession for RtspServerSession {
     fn from_tcp_socket(sock: TcpStream, remote: SocketAddr) -> Self {
         let id = Uuid::new(RandomDigitCount::Zero).to_string();
         Self::new(id, sock, remote, None)
     }
 }
 
-impl RTSPServerSession {
+impl RtspServerSession {
     pub fn new(
         id: String,
         stream: TcpStream,
         remote: SocketAddr,
-        handler: Option<Box<dyn RtspServerSessionHandler>>
+        handler: Option<Box<dyn HandleRtspServerSession>>
         // event_producer: StreamHubEventSender,
         // auth: Option<Auth>,
     ) -> Self {
@@ -236,7 +233,7 @@ impl RTSPServerSession {
         Self {
             id: id.clone(),
             io: io.clone(),
-            context: RTSPServerSessionContext::new(id),
+            context: RtspServerSessionContext::new(id),
             reader: BytesReader::new(BytesMut::default()),
             writer: AsyncBytesWriter::new(io),
             remote_addr: remote,
@@ -244,8 +241,6 @@ impl RTSPServerSession {
             sdp: SessionDescription::default(),
             session_id: None,
             handler,
-            frame_sender: None,
-            frame_receiver: None,
         }
     }
 
@@ -422,7 +417,7 @@ impl RTSPServerSession {
     async fn handle_options(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let custom_response = {
             if let Some(h) =  self.handler.as_mut(){
-                h.handle_options(rtsp_request).await?
+                h.handle_options(&mut self.context, rtsp_request).await?
             } else {
                 None
             }
@@ -446,7 +441,7 @@ impl RTSPServerSession {
 
     async fn handle_describe(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         if let Some(h) =  self.handler.as_mut() {
-            let sdp = h.handle_describe(rtsp_request).await?;
+            let sdp = h.handle_describe(&mut self.context, rtsp_request).await?;
             self.sdp = sdp.clone();
             self.new_tracks()?;
         }
@@ -500,7 +495,7 @@ impl RTSPServerSession {
 
         let custom_response = {
             if let Some(h) =  self.handler.as_mut(){
-                h.handle_announce(rtsp_request, receiver).await?
+                h.handle_announce(&mut self.context, rtsp_request, receiver).await?
             } else {
                 None
             }
@@ -593,7 +588,7 @@ impl RTSPServerSession {
 
         let custom_response = {
             if let Some(h) =  self.handler.as_mut(){
-                h.handle_setup(rtsp_request).await?
+                h.handle_setup(&mut self.context, rtsp_request).await?
             } else {
                 None
             }
@@ -703,7 +698,7 @@ impl RTSPServerSession {
 
         let custom_response = {
             if let Some(h) =  self.handler.as_mut(){
-                h.handle_play(rtsp_request, sender).await?
+                h.handle_play(&mut self.context, rtsp_request, sender).await?
             } else {
                 None
             }
@@ -827,7 +822,7 @@ impl RTSPServerSession {
     async fn handle_record(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let custom_response = {
             if let Some(h) =  self.handler.as_mut(){
-                h.handle_record(rtsp_request).await?
+                h.handle_record(&mut self.context, rtsp_request).await?
             } else {
                 None
             }
@@ -867,7 +862,7 @@ impl RTSPServerSession {
     async fn handle_teardown(&mut self, rtsp_request: &RtspRequest) -> Result<(), RtspSessionError> {
         let custom_response = {
             if let Some(h) =  self.handler.as_mut(){
-                h.handle_teardown(rtsp_request).await?
+                h.handle_teardown(&mut self.context, rtsp_request).await?
             } else {
                 None
             }
