@@ -1,0 +1,6 @@
+[package]
+name = "vcp_media_h265"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

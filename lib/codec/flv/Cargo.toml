@@ -1,12 +1,12 @@
 [package]
-name = "vcp-media-flv"
+name = "vcp_media_flv"
 description = "flv library."
 version = "0.3.0"
 authors = ["HarlanC <wawacry@qq.com"]
 repository = "https://github.com/harlanc/xiu"
 license = "MIT"
 readme = "README.md"
-categories = ["flv"]
+categories = ["multimedia::video"]
 keywords = ["flv", "video", "streaming"]
 edition = "2018"
 
@@ -19,5 +19,5 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 log = "0.4"
 indexmap = "2.2.6"
 
-vcp-media-common = { path = "../../common/" }
-vcp-media-h264 = { path = "../h264/" }
+vcp_media_common = { path = "../../common/" }
+vcp_media_h264 = { path = "../h264/" }

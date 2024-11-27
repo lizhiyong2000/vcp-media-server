@@ -1,5 +1,5 @@
 [package]
-name = "vcp-media-h264"
+name = "vcp_media_h264"
 version = "0.1.0"
 edition = "2021"
 authors = ["HarlanC <wawacry@qq.com>"]
@@ -16,4 +16,4 @@ log = "0.4"
 anyhow = "1.0.91"
 thiserror = "2.0.3"
 
-vcp-media-common = { path = "../../common/" }
+vcp_media_common = { path = "../../common/" }

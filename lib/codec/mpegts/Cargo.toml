@@ -1,5 +1,5 @@
 [package]
-name = "vcp-media-mpegts"
+name = "vcp_media_mpegts"
 description = "mpegts library."
 version = "0.2.0"
 authors = ["HarlanC <wawacry@qq.com"]
@@ -15,4 +15,4 @@ byteorder = "1.4.2"
 bytes = "1.0.0"
 anyhow = "1.0.91"
 thiserror = "2.0.3"
-vcp-media-common = { path = "../../common/" }
+vcp_media_common = { path = "../../common/" }
