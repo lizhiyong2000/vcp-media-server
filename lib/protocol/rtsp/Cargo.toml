@@ -1,5 +1,5 @@
 [package]
-name = "vcp-media-rtsp"
+name = "vcp_media_rtsp"
 version = "0.1.0"
 edition = "2021"
 
@@ -30,6 +30,6 @@ indexmap = "2.2.6"
 md5 = "0.7.0"
 http = "1.1.0"
 
-vcp-media-common = { path = "../../common/" }
-vcp-media-rtp = { path = "../rtp/" }
-vcp-media-sdp = { path = "../sdp/" }
+vcp_media_common = { path = "../../common/" }
+vcp_media_rtp = { path = "../rtp/" }
+vcp_media_sdp = { path = "../sdp/" }

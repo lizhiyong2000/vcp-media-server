@@ -16,6 +16,7 @@ use manager::stream_hub::StreamHub;
 use std::sync::Arc;
 use tokio::signal;
 
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let guard = logger::setup_log();

@@ -1,5 +1,5 @@
 [package]
-name = "vcp-media-sdp"
+name = "vcp_media_sdp"
 version = "0.1.0"
 edition = "2021"
 
@@ -30,5 +30,5 @@ indexmap = "2.2.6"
 md5 = "0.7.0"
 http = "1.1.0"
 
-vcp-media-common = { path = "../../common/" }
+vcp_media_common = { path = "../../common/" }
 

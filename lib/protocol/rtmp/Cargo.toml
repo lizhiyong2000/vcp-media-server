@@ -1,5 +1,5 @@
 [package]
-name = "vcp-media-rtmp"
+name = "vcp_media_rtmp"
 version = "0.1.0"
 edition = "2021"
 
@@ -40,6 +40,6 @@ serde_json = { version = "1", default-features = false, features = [
     "std",
 ] }
 
-vcp-media-common = { path = "../../common/" }
-vcp-media-h264 = { path = "../../codec/h264/" }
-vcp-media-flv = { path = "../../codec/flv/" }
+vcp_media_common = { path = "../../common/" }
+vcp_media_h264 = { path = "../../codec/h264/" }
+vcp_media_flv = { path = "../../codec/flv/" }
