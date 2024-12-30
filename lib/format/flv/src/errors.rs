@@ -2,7 +2,7 @@ use {
     thiserror::Error,
     vcp_media_common::bytesio::bits_errors::BitError,
     vcp_media_common::bytesio::bytes_errors::{BytesReadError, BytesWriteError},
-    vcp_media_h264::errors::H264Error
+    vcp_media_h264::decoder::errors::H264Error
     ,
 };
 

@@ -10,6 +10,9 @@ pub mod avcc;
 pub mod nal;
 pub mod push;
 pub mod rbsp;
+pub mod sps;
+pub mod errors;
+pub mod utils;
 
 /// Contextual data that needs to be tracked between evaluations of different portions of H264
 /// syntax.

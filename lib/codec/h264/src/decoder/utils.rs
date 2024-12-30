@@ -1,4 +1,4 @@
-use super::errors::H264Error;
+use crate::decoder::errors::H264Error;
 use vcp_media_common::bytesio::bits_reader::BitsReader;
 
 // ue(v) in 9.1 Parsing process for Exp-Golomb codes

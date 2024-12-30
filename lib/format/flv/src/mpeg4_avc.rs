@@ -6,7 +6,7 @@ use {
     vcp_media_common::bytesio::{bytes_reader::BytesReader, bytes_writer::BytesWriter},
 };
 
-use vcp_media_h264::sps::SpsParser;
+use vcp_media_h264::decoder::sps::SpsParser;
 
 const H264_START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 
