@@ -1,4 +1,3 @@
-pub mod errors;
-pub mod pps;
-pub mod sps;
-pub mod utils;
+pub mod common;
+pub mod encoder;
+pub mod decoder;
