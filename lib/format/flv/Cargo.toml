@@ -19,5 +19,5 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 log = "0.4"
 indexmap = "2.2.6"
 
-vcp_media_common = { path = "../../common/" }
-vcp_media_h264 = { path = "../h264/" }
+vcp_media_common = { path = "../../common" }
+vcp_media_h264 = { path = "../../codec/h264" }

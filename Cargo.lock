@@ -378,10 +378,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4567c8db10ae91089c99af84c68c38da3ec2f087c3f82960bcdbf3656b6f4d7"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "wasi",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -395,12 +393,6 @@ name = "hashbrown"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a9bfc1af68b1726ea47d3d5109de126281def866b33970e10fbab11b5dafab3"
-
-[[package]]
-name = "heck"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermit-abi"
@@ -932,25 +924,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "strum"
-version = "0.26.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
-
-[[package]]
-name = "strum_macros"
-version = "0.26.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "rustversion",
- "syn",
-]
-
-[[package]]
 name = "subtle"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1176,16 +1149,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tracing-error"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d686ec1c0f384b1277f097b2f279a2ecc11afe8c133c1aabf036a27cb4cd206e"
-dependencies = [
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "tracing-log"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1217,17 +1180,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42ff0bf0c66b8238c6f3b578df37d0b7848e55df8577b3f74f92a69acceeb825"
 
 [[package]]
-name = "ulid"
-version = "1.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04f903f293d11f31c0c29e4148f6dc0d033a7f80cebc0282bea147611667d289"
-dependencies = [
- "getrandom",
- "rand",
- "web-time",
-]
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1243,19 +1195,13 @@ checksum = "830b7e5d4d90034032940e4ace0d9a9a057e7a45cd94e6c007832e39edb82f6d"
 name = "vcp_media_common"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
- "base64",
  "byteorder",
  "bytes",
  "chrono",
  "futures",
- "hex",
- "http",
  "indexmap",
- "lazy_static",
  "log",
- "md5",
  "rand",
  "serde",
  "serde_derive",
@@ -1264,7 +1210,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-appender",
- "tracing-error",
  "tracing-subscriber",
 ]
 
@@ -1287,8 +1232,6 @@ dependencies = [
 name = "vcp_media_h264"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "byteorder",
  "bytes",
  "log",
  "thiserror 2.0.3",
@@ -1314,32 +1257,18 @@ dependencies = [
 name = "vcp_media_rtmp"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
- "base64",
  "byteorder",
  "bytes",
  "chrono",
- "futures",
  "hex",
  "hmac",
- "http",
  "indexmap",
- "lazy_static",
  "log",
- "md5",
  "rand",
- "serde",
- "serde_derive",
- "serde_json",
  "sha2",
  "thiserror 2.0.3",
  "tokio",
- "tokio-util",
- "tracing",
- "tracing-appender",
- "tracing-error",
- "tracing-subscriber",
  "vcp_media_common",
  "vcp_media_flv",
  "vcp_media_h264",
@@ -1349,29 +1278,12 @@ dependencies = [
 name = "vcp_media_rtp"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
- "base64",
  "byteorder",
  "bytes",
- "chrono",
- "futures",
- "hex",
- "http",
- "indexmap",
- "lazy_static",
  "log",
- "md5",
- "rand",
- "serde",
- "serde_derive",
  "thiserror 2.0.3",
  "tokio",
- "tokio-util",
- "tracing",
- "tracing-appender",
- "tracing-error",
- "tracing-subscriber",
  "vcp_media_common",
 ]
 
@@ -1379,29 +1291,17 @@ dependencies = [
 name = "vcp_media_rtsp"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
- "base64",
  "byteorder",
  "bytes",
  "chrono",
  "futures",
- "hex",
  "http",
- "indexmap",
  "lazy_static",
  "log",
- "md5",
  "rand",
- "serde",
- "serde_derive",
  "thiserror 2.0.3",
  "tokio",
- "tokio-util",
- "tracing",
- "tracing-appender",
- "tracing-error",
- "tracing-subscriber",
  "vcp_media_common",
  "vcp_media_rtp",
  "vcp_media_sdp",
@@ -1411,29 +1311,11 @@ dependencies = [
 name = "vcp_media_sdp"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
  "base64",
- "byteorder",
  "bytes",
- "chrono",
- "futures",
  "hex",
- "http",
- "indexmap",
- "lazy_static",
  "log",
- "md5",
- "rand",
- "serde",
- "serde_derive",
  "thiserror 2.0.3",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-appender",
- "tracing-error",
- "tracing-subscriber",
  "vcp_media_common",
 ]
 
@@ -1441,36 +1323,19 @@ dependencies = [
 name = "vcp_media_server"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
- "base64",
- "byteorder",
  "bytes",
- "chrono",
  "futures",
- "hex",
  "http",
  "indexmap",
- "lazy_static",
  "log",
  "md5",
- "rand",
  "serde",
- "serde_derive",
- "strum",
- "strum_macros",
  "thiserror 2.0.3",
  "tokio",
- "tokio-util",
- "tracing",
- "tracing-appender",
- "tracing-error",
- "tracing-subscriber",
- "ulid",
  "vcp_media_common",
  "vcp_media_rtmp",
- "vcp_media_rtp",
  "vcp_media_rtsp",
  "vcp_media_sdp",
 ]
@@ -1541,16 +1406,6 @@ name = "wasm-bindgen-shared"
 version = "0.2.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65fc09f10666a9f147042251e0dda9c18f166ff7de300607007e96bdebc1068d"
-
-[[package]]
-name = "web-time"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
-dependencies = [
- "js-sys",
- "wasm-bindgen",
-]
 
 [[package]]
 name = "winapi"
