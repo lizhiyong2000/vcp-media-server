@@ -156,6 +156,7 @@ impl<H: AccumulatedNalHandler> NalFragmentHandler for NalAccumulator<H> {
             }
         }
         if end {
+            // println!("nal length:{:?}", self.buf.len());
             self.buf.clear();
             self.interest = NalInterest::Buffer;
         }

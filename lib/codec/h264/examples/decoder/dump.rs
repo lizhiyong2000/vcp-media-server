@@ -43,23 +43,24 @@ fn main() {
         let nal_header = nal.header().unwrap();
         let nal_unit_type = nal_header.nal_unit_type();
 
+        hex_dump(&nal);
+
         // Decode the NAL types that we're interested in
         match nal_unit_type {
             UnitType::SeqParameterSet => {
-                hex_dump(&nal);
+
                 let data = SeqParameterSet::from_bits(nal.rbsp_bits()).unwrap();
-                println!("{:#?}", data);
+                // println!("{:#?}", data);
                 // Don't forget to tell stream_context that we have a new SPS.
                 // If you want to handle it separately, you can clone the struct before passing along,
                 // But if you only care about it when a slice calls for it, you don't have to handle it here.
                 ctx.put_seq_param_set(data);
             }
             UnitType::PicParameterSet => {
-                hex_dump(&nal);
                 // Same as when parsing an SPS, except it borrows the stream context so it can pick out
                 // the SPS that this PPS references
                 let data = PicParameterSet::from_bits(&ctx, nal.rbsp_bits()).unwrap();
-                println!("{:#?}", data);
+                // println!("{:#?}", data);
                 // Same as with an SPS, tell the context that we've found a PPS
                 ctx.put_pic_param_set(data);
             }
@@ -77,7 +78,7 @@ fn main() {
                     nal_header,
                 )
                 .unwrap();
-                println!("{:#?}", header);
+                // println!("{:#?}", header);
             }
             UnitType::SEI => {
                 let mut scratch = vec![];
@@ -88,12 +89,12 @@ fn main() {
                             match sei.payload_type {
                                 HeaderType::BufferingPeriod => {
                                     let bp = BufferingPeriod::read(&ctx, &sei);
-                                    println!("{:#?}", bp);
+                                    // println!("{:#?}", bp);
                                 }
                                 HeaderType::PicTiming => {
                                     let pt =
                                         PicTiming::read(ctx.sps().next().expect("first sps"), &sei);
-                                    println!("{:#?}", pt);
+                                    // println!("{:#?}", pt);
                                 }
                                 HeaderType::UserDataRegisteredItuTT35 => {
                                     match ItuTT35::read(&sei) {
@@ -102,10 +103,10 @@ fn main() {
                                                 ItuTT35::UnitedStates => {
                                                     // TODO: check for ATSC provider code, look
                                                     //       at caption data etc
-                                                    println!("{:#?}", ud);
+                                                    // println!("{:#?}", ud);
                                                 }
                                                 _ => {
-                                                    println!("{:#?}", ud);
+                                                    // println!("{:#?}", ud);
                                                 }
                                             }
                                         }
@@ -115,7 +116,7 @@ fn main() {
                                     }
                                 }
                                 _ => {
-                                    println!("{:#?}", sei);
+                                    // println!("{:#?}", sei);
                                 }
                             }
                         }
@@ -127,7 +128,7 @@ fn main() {
                 }
             }
             _ => {
-                println!("Unhandled: {:?}", nal_unit_type);
+                // println!("Unhandled: {:?}", nal_unit_type);
             }
         }
         NalInterest::Ignore
@@ -149,13 +150,20 @@ fn main() {
 }
 
 fn hex_dump(nal: &RefNal) {
+
     let mut nal_rbsp_bytes = vec![];
     nal.rbsp_bytes()
         .read_to_end(&mut nal_rbsp_bytes)
         .expect("read NAL");
+    // println!(
+    //     "{:?}: {:02x}",
+    //     nal.header().unwrap().nal_unit_type(),
+    //     &nal_rbsp_bytes[..].plain_hex(false)
+    // );
+
     println!(
-        "{:?}: {:02x}",
+        "{:?}: {:?}",
         nal.header().unwrap().nal_unit_type(),
-        &nal_rbsp_bytes[..].plain_hex(false)
+        nal.len()
     );
 }

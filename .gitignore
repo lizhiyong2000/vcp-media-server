@@ -3,3 +3,5 @@ target/
 .vscode/
 .idea/
 Cargo.lock
+*.dump
+lib/codec/h264/h264.dump

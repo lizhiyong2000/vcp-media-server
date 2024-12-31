@@ -263,6 +263,7 @@ impl ProfileIdc {
     pub fn has_chroma_info(self) -> bool {
         match self.0 {
             100 | 110 | 122 | 244 | 44 | 83 | 86 => true,
+            // 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 => {
             _ => false,
         }
     }

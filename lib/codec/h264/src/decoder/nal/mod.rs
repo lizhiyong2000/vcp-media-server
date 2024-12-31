@@ -251,6 +251,14 @@ impl<'a> RefNal<'a> {
             complete,
         }
     }
+
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        let len:usize =  self.tail.iter().map(|b| b.len()).sum();
+        let length = self.head.len() + len;
+        length
+    }
 }
 impl<'a> Nal for RefNal<'a> {
     type BufRead = RefNalReader<'a>;
