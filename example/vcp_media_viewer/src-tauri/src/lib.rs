@@ -1,6 +1,8 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
-fn greet(name: &str) -> String {
+fn greet(webview_window: tauri::WebviewWindow,
+         name: &str) -> String {
+    println!("WebviewWindow: {}", webview_window.label());
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
