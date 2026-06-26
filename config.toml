@@ -1,0 +1,122 @@
+[rtmp]
+port = 1935
+
+[rtsp]
+port = 554
+
+[webrtc]
+port = 9080
+
+[http]
+port = 8081
+
+[hls]
+enabled = true
+segment_duration = 4
+max_segments = 10
+output_dir = "./hls"
+
+[http_flv]
+enabled = true
+
+[log]
+level = "info"
+path = "./logs/media-server.log"
+max_size_mb = 10
+max_files = 5
+
+[log.modules]
+rtsp = "debug"
+core = "debug"
+
+[hub]
+max_streams = 1000
+buffer_size = 1024
+
+[[streams]]
+id = "live"
+name = "主直播流"
+source = "Push"
+protocol = "RTSP"
+enabled = true
+
+[streams.transcode]
+codec = "H264"
+bitrate = 2000000
+resolution = [1280, 720]
+fps = 30
+
+[[streams.filters]]
+type = "watermark"
+id = "global_watermark"
+enabled = false
+text = "Media Server"
+position = "bottom-right"
+font_size = 24
+opacity = 0.7
+
+[[streams.outputs]]
+protocol = "RTSP"
+enabled = true
+
+[[streams.outputs]]
+protocol = "RTMP"
+endpoint = "rtmp://localhost:1935/live_hd"
+enabled = false
+
+[streams.outputs.transcode]
+bitrate = 3000000
+resolution = [1920, 1080]
+
+[[streams.outputs]]
+protocol = "RTMP"
+endpoint = "rtmp://localhost:1935/live_sd"
+enabled = false
+
+[streams.outputs.transcode]
+bitrate = 1000000
+resolution = [640, 360]
+
+[[streams.outputs]]
+protocol = "WebRTC"
+endpoint = "ws://localhost:9080/webrtc/live"
+enabled = false
+
+[streams.outputs.transcode]
+codec = "VP8"
+bitrate = 1500000
+
+[[streams.outputs.filters]]
+type = "fps_control"
+id = "webrtc_fps"
+enabled = true
+target_fps = 30
+
+[[streams.tracks]]
+codec = "H264"
+payload_type = 96
+clock_rate = 90000
+
+[[streams.tracks]]
+codec = "AAC"
+payload_type = 97
+clock_rate = 44100
+
+[[streams]]
+id = "pull_test"
+name = "拉流测试"
+source = "Pull"
+protocol = "RTSP"
+pull_url = "rtsp://localhost:554/live"
+enabled = false
+
+[[streams.outputs]]
+protocol = "RTMP"
+endpoint = "rtmp://localhost:1935/pull_test"
+enabled = false
+
+[streams.outputs.transcode]
+codec = "H264"
+bitrate = 2000000
+resolution = [1280, 720]
+fps = 30
