@@ -275,76 +275,57 @@ impl RtmpServer {
                 if data.is_empty() { return Ok(None); }
                 let frame_type_str = video_frame_type(data[0]);
                 let codec_str = video_codec_name(data[0]);
-                let data_type = data[0];
-                match data_type {
-                    0x17 | 0x27 => {
+                let avc_packet_type = if data.len() > 1 { data[1] } else { 0xFF };
+
+                match avc_packet_type {
+                    0x00 => {
                         // AVC sequence header (SPS/PPS)
-                        if data.len() > 1 && data[1] == 0x00 {
-                            info!("[RTMP] [{}] <<< VIDEO AVC SequenceHeader ({}+{})", peer_addr, frame_type_str, codec_str);
-                            // Extract SPS/PPS from AVCDecoderConfigurationRecord
-                            if data.len() > 13 {
-                                let config_data = &data[5..]; // skip 5 bytes header
-                                if config_data.len() > 7 {
-                                    let num_sps = (config_data[5] & 0x1F) as usize;
-                                    let mut offset = 6;
-                                    for _ in 0..num_sps {
+                        info!("[RTMP] [{}] <<< VIDEO AVC SequenceHeader ({}+{})", peer_addr, frame_type_str, codec_str);
+                        if data.len() > 13 {
+                            let config_data = &data[5..]; // skip frame_type + avc_type + composition_time
+                            if config_data.len() > 7 {
+                                let num_sps = (config_data[5] & 0x1F) as usize;
+                                let mut offset = 6;
+                                let mut sps_data = Vec::new();
+                                for _ in 0..num_sps {
+                                    if offset + 2 > config_data.len() { break; }
+                                    let sps_len = ((config_data[offset] as usize) << 8) | config_data[offset + 1] as usize;
+                                    offset += 2;
+                                    if offset + sps_len > config_data.len() { break; }
+                                    sps_data = config_data[offset..offset + sps_len].to_vec();
+                                    offset += sps_len;
+                                }
+                                let mut pps_data = Vec::new();
+                                if offset < config_data.len() {
+                                    let num_pps = config_data[offset] & 0x1F;
+                                    offset += 1;
+                                    for _ in 0..num_pps as usize {
                                         if offset + 2 > config_data.len() { break; }
-                                        let sps_len = ((config_data[offset] as usize) << 8) | config_data[offset+1] as usize;
+                                        let pps_len = ((config_data[offset] as usize) << 8) | config_data[offset + 1] as usize;
                                         offset += 2;
-                                        if offset + sps_len > config_data.len() { break; }
-                                        let sps = &config_data[offset..offset+sps_len];
-                                        // Store SPS
-                                        conn.stream_manager.set_stream_sps_pps(&conn.stream_id, sps.to_vec(), vec![]);
-                                        offset += sps_len;
+                                        if offset + pps_len > config_data.len() { break; }
+                                        pps_data = config_data[offset..offset + pps_len].to_vec();
+                                        offset += pps_len;
                                     }
-                                    // Read PPS
-                                    if offset < config_data.len() {
-                                        let num_pps = (config_data[offset] & 0x1F) as usize;
-                                        offset += 1;
-                                        for _ in 0..num_pps {
-                                            if offset + 2 > config_data.len() { break; }
-                                            let pps_len = ((config_data[offset] as usize) << 8) | config_data[offset+1] as usize;
-                                            offset += 2;
-                                            if offset + pps_len > config_data.len() { break; }
-                                            let pps = &config_data[offset..offset+pps_len];
-                                            // Get existing SPS and update with PPS
-                                            if let Some(stream) = conn.stream_manager.get_stream(&conn.stream_id) {
-                                                if let Some(sps) = stream.sps {
-                                                    conn.stream_manager.set_stream_sps_pps(&conn.stream_id, sps, pps.to_vec());
-                                                }
-                                            }
-                                            offset += pps_len;
-                                        }
-                                    }
+                                }
+                                if !sps_data.is_empty() {
+                                    conn.stream_manager.set_stream_sps_pps(&conn.stream_id, sps_data, pps_data);
                                 }
                             }
                         }
                     }
-                    0x08 => {
-                        // Audio data
-                        conn.frames_received += 1;
-                        if conn.is_publishing {
-                            let audio_data = &data[1..];
-                            let frame = MediaFrame::new(
-                                conn.stream_id.clone(), 1, msg.timestamp as u64,
-                                Bytes::copy_from_slice(audio_data), false, CodecType::AAC,
-                            );
-                            conn.stream_manager.publish_frame(frame);
-                        }
-                    }
-                    0x09 => {
+                    0x01 => {
                         // Video NALU (AVC)
                         conn.frames_received += 1;
                         let is_keyframe = (data[0] & 0xF0) == 0x10;
                         let avcc_payload = &data[5..];
-                        
+
                         if conn.frames_received <= 3 || is_keyframe && conn.frames_received % 30 == 0 {
                             debug!("[RTMP] [{}] <<< VIDEO {} {} ts={} size={} frame#{}",
                                 peer_addr, frame_type_str, codec_str,
                                 msg.timestamp, avcc_payload.len(), conn.frames_received);
                         }
                         if conn.is_publishing {
-                            
                             // Convert AVCC format to Annex B (add start codes)
                             let mut annex_b = Vec::with_capacity(avcc_payload.len());
                             let mut offset = 0;
@@ -355,22 +336,23 @@ impl RtmpServer {
                                     | (avcc_payload[offset + 3] as usize);
                                 offset += 4;
                                 if offset + nalu_len > avcc_payload.len() { break; }
-                                // Add Annex B start code
                                 annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
                                 annex_b.extend_from_slice(&avcc_payload[offset..offset + nalu_len]);
                                 offset += nalu_len;
                             }
-                            
-                            let frame = MediaFrame::new(
-                                conn.stream_id.clone(), 0, msg.timestamp as u64,
-                                Bytes::from(annex_b), is_keyframe, CodecType::H264,
-                            );
-                            conn.stream_manager.publish_frame(frame);
+
+                            if !annex_b.is_empty() {
+                                let frame = MediaFrame::new(
+                                    conn.stream_id.clone(), 0, msg.timestamp as u64,
+                                    Bytes::from(annex_b), is_keyframe, CodecType::H264,
+                                );
+                                conn.stream_manager.publish_frame(frame);
+                            }
                         }
                     }
                     _ => {
-                        debug!("[RTMP] [{}] <<< VIDEO unknown sub-type=0x{:02X} ({}bytes)",
-                            peer_addr, data_type, data.len());
+                        debug!("[RTMP] [{}] <<< VIDEO unknown avc_packet_type=0x{:02X} ({}bytes)",
+                            peer_addr, avc_packet_type, data.len());
                     }
                 }
             }
@@ -545,8 +527,8 @@ impl RtmpServer {
                 _= conn.stream_manager.set_publishing(&stream_name);
             }
             "play" => {
-                conn.session.handle_play(args);
-                let play_stream_id = conn.stream_id.clone();
+                let play_stream_id = conn.session.handle_play(args);
+                conn.stream_id = play_stream_id.clone();
                 info!("[RTMP] [{}] --- play stream='{}'", peer_addr, play_stream_id);
 
                 if conn.stream_manager.get_stream(&play_stream_id).is_none() {
