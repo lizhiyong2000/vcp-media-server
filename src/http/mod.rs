@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::core::{StreamManager, Track, CodecType, StreamSourceMode, StreamProtocol};
 use crate::rtsp::{RtspPuller, RtspPusher};
+use crate::rtmp::RtmpPuller;
 use crate::hls::HlsServer;
 use crate::http_flv::{HttpFlvServer, HttpFlvSession, format_chunk};
 
@@ -42,6 +43,7 @@ impl HttpServer {
         info!("[HTTP]   DELETE /api/stream/<id>  - Delete stream");
         info!("[HTTP]   POST /api/rtsp/pull      - RTSP pull from remote URL");
         info!("[HTTP]   POST /api/rtsp/push      - RTSP push to remote URL");
+        info!("[HTTP]   POST /api/rtmp/pull      - RTMP pull from remote URL");
         if self.hls_server.is_some() {
             info!("[HTTP]   GET  /hls/<stream_id>/live.m3u8 - HLS playlist");
             info!("[HTTP]   GET  /hls/<stream_id>/<segment>.ts - HLS segment");
@@ -356,6 +358,43 @@ impl HttpServer {
                 }).to_string();
                 Ok(Self::http_response(200, "OK", &body))
             }
+            ("POST", "/api/rtmp/pull") => {
+                let body_start = request.find("\r\n\r\n").map(|i| &request[i+4..]).unwrap_or("");
+                let parse_result = serde_json::from_str::<serde_json::Value>(body_start);
+
+                let (remote_url, local_stream_id) = if let Ok(json) = &parse_result {
+                    let url = json.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    let stream_id = json.get("stream_id").and_then(|v| v.as_str()).unwrap_or("rtmp_pulled");
+                    (url.to_string(), stream_id.to_string())
+                } else {
+                    return Ok(Self::http_response(400, "Bad Request", "{\"error\":\"Invalid JSON body\"}"));
+                };
+
+                if remote_url.is_empty() {
+                    return Ok(Self::http_response(400, "Bad Request", "{\"error\":\"Missing 'url' parameter\"}"));
+                }
+
+                info!("[HTTP] Starting RTMP pull from {} to stream {}", remote_url, local_stream_id);
+
+                let manager_clone = manager.clone();
+                let remote_url_clone = remote_url.clone();
+                let local_stream_id_clone = local_stream_id.clone();
+
+                tokio::spawn(async move {
+                    let puller = RtmpPuller::new(manager_clone);
+                    if let Err(e) = puller.pull(&remote_url_clone, &local_stream_id_clone).await {
+                        error!("[RTMP Puller] Failed to pull stream: {}", e);
+                    }
+                });
+
+                let body = json!({
+                    "stream_id": local_stream_id,
+                    "remote_url": remote_url,
+                    "play_url": format!("rtmp://127.0.0.1:1935/live/{}", local_stream_id),
+                    "message": "RTMP pull started"
+                }).to_string();
+                Ok(Self::http_response(200, "OK", &body))
+            }
             ("POST", "/api/rtsp/push") => {
                 let body_start = request.find("\r\n\r\n").map(|i| &request[i+4..]).unwrap_or("");
                 let parse_result = serde_json::from_str::<serde_json::Value>(body_start);
@@ -427,6 +466,7 @@ impl HttpServer {
                 endpoints.insert("POST /api/streams".to_string(), json!("Create a new stream"));
                 endpoints.insert("DELETE /api/stream/<id>".to_string(), json!("Delete a stream"));
                 endpoints.insert("POST /api/rtsp/pull".to_string(), json!("Start RTSP pull from remote URL"));
+                endpoints.insert("POST /api/rtmp/pull".to_string(), json!("Start RTMP pull from remote URL"));
                 endpoints.insert("POST /api/rtsp/push".to_string(), json!("Start RTSP push to remote URL"));
                 endpoints.insert("GET /hls/<stream_id>/live.m3u8".to_string(), json!("HLS playlist"));
                 endpoints.insert("GET /hls/<stream_id>/<segment>.ts".to_string(), json!("HLS segment"));

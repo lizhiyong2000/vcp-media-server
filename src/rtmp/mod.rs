@@ -1,6 +1,9 @@
 pub mod amf0;
 pub mod chunk;
 pub mod session;
+pub mod puller;
+
+pub use puller::RtmpPuller;
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut, Buf};
