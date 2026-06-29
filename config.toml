@@ -28,6 +28,7 @@ max_files = 5
 [log.modules]
 rtsp = "debug"
 core = "debug"
+webrtc = "debug"
 
 [hub]
 max_streams = 1000

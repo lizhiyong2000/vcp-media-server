@@ -30,6 +30,11 @@ pub struct Stream {
     // Codec parameters extracted from RTP stream
     pub sps: Option<Vec<u8>>,
     pub pps: Option<Vec<u8>>,
+    /// Most recent keyframe (Annex B), for late WebRTC play subscribers.
+    pub last_keyframe: Option<Vec<u8>>,
+    pub last_keyframe_ts: Option<u64>,
+    /// Frames since the last keyframe (inclusive), for late WebRTC play join.
+    pub gop_frames: Vec<MediaFrame>,
 }
 
 impl Stream {
@@ -369,6 +374,9 @@ impl StreamManager {
             pull_url,
             sps: None,
             pps: None,
+            last_keyframe: None,
+            last_keyframe_ts: None,
+            gop_frames: Vec::new(),
         };
 
         // Create broadcast channel for this stream
@@ -410,25 +418,62 @@ impl StreamManager {
         }
     }
 
+    /// Merge SPS/PPS from a single NALU into stream codec config.
+    pub fn merge_stream_nalu_config(&self, stream_id: &str, nalu: &[u8]) {
+        if nalu.is_empty() {
+            return;
+        }
+        let nal_type = nalu[0] & 0x1F;
+        if nal_type != 7 && nal_type != 8 {
+            return;
+        }
+        let mut streams = self.streams.write();
+        if let Some(stream) = streams.get_mut(stream_id) {
+            match nal_type {
+                7 => stream.sps = Some(nalu.to_vec()),
+                8 => stream.pps = Some(nalu.to_vec()),
+                _ => {}
+            }
+            if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
+                info!(
+                    "[Core] Stream {} codec config ready (sps={} pps={})",
+                    stream_id,
+                    sps.len(),
+                    pps.len()
+                );
+            }
+        }
+    }
+
+    pub fn ensure_stream_broadcast(&self, stream_id: &str) {
+        if self.channels.read().contains_key(stream_id) {
+            debug!("[Core] Broadcast channel already exists for stream '{}'", stream_id);
+            return;
+        }
+        self.set_stream_broadcast(stream_id);
+    }
+
     pub fn set_stream_broadcast(&self, stream_id: &str) {
         let mut streams = self.streams.write();
         if let Some(stream) = streams.get_mut(stream_id) {
-            let (tx, rx) = broadcast::channel(1000);
+            let replacing = {
+                let channels = self.channels.read();
+                channels.contains_key(stream_id)
+            };
+            if replacing {
+                warn!(
+                    "[Core] Replacing broadcast channel for stream '{}' (existing subscribers will stop receiving)",
+                    stream_id
+                );
+            }
+            let (tx, _rx) = broadcast::channel(2048);
 
             {
                 let mut channels = self.channels.write();
                 channels.insert(stream.id.clone(), tx);
             }
+            info!("[Core] Broadcast channel ready for stream '{}'", stream_id);
         }
-
-        
-        // {
-        //     let mut receivers = self._receivers.write();
-        //     receivers.insert(stream_id.clone(), vec![rx]);
-        // }
-
-        // let mut streams = self.streams.write();
-        // streams.insert(stream_id, stream);
     }
 
     pub fn remove_stream(&self, stream_id: &StreamId) -> Option<Stream> {
@@ -598,26 +643,101 @@ impl StreamManager {
         }
     }
 
+    pub fn get_last_keyframe(&self, stream_id: &str) -> Option<(Vec<u8>, u64)> {
+        self.streams.read().get(stream_id).and_then(|s| {
+            Some((s.last_keyframe.clone()?, s.last_keyframe_ts?))
+        })
+    }
+
+    /// Snapshot of frames from the last keyframe onward (for WebRTC play catch-up).
+    pub fn get_gop_frames(&self, stream_id: &str) -> Vec<MediaFrame> {
+        self.streams
+            .read()
+            .get(stream_id)
+            .map(|s| s.gop_frames.clone())
+            .unwrap_or_default()
+    }
+
+    /// Recent GOP tail for play catch-up (from last keyframe, capped).
+    /// Returns empty if the tail is too long — caller waits for a fresh IDR instead.
+    pub fn get_recent_gop_for_play(&self, stream_id: &str, max_frames: usize) -> Vec<MediaFrame> {
+        let gop = self.get_gop_frames(stream_id);
+        if gop.is_empty() || max_frames == 0 {
+            return Vec::new();
+        }
+        let start = gop
+            .iter()
+            .rposition(|f| f.is_keyframe)
+            .unwrap_or(0);
+        let tail = &gop[start..];
+        if tail.len() <= max_frames {
+            tail.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn update_gop_buffer(stream: &mut Stream, frame: &MediaFrame) {
+        if !matches!(frame.codec, CodecType::H264 | CodecType::H265) || frame.track_id != 0 {
+            return;
+        }
+        if frame.is_keyframe {
+            stream.gop_frames.clear();
+        }
+        stream.gop_frames.push(frame.clone());
+        // Never drop frames in the middle of a GOP — that breaks H264 references.
+        // With periodic IDR from the publisher, each GOP stays small.
+    }
+
     pub fn publish_frame(&self, frame: MediaFrame) {
         let stream_id = frame.stream_id.clone();
         debug!("[Core] publish_frame: stream_id={}, track_id={}, timestamp={}, is_keyframe={}, codec={}, data_len={}", 
               stream_id, frame.track_id, frame.timestamp, frame.is_keyframe, frame.codec as u8, frame.data.len());
+
+        {
+            let mut streams = self.streams.write();
+            if let Some(stream) = streams.get_mut(&stream_id) {
+                if frame.is_keyframe && matches!(frame.codec, CodecType::H264 | CodecType::H265) {
+                    stream.last_keyframe = Some(frame.data.to_vec());
+                    stream.last_keyframe_ts = Some(frame.timestamp);
+                    info!(
+                        "[Core] Keyframe stream='{}' ts={} gop_len={}",
+                        stream_id,
+                        frame.timestamp,
+                        stream.gop_frames.len()
+                    );
+                }
+                Self::update_gop_buffer(stream, &frame);
+            }
+        }
         
         let channels = self.channels.read();
         let tx_option = channels.get(&stream_id).cloned();
         
         if let Some(tx) = tx_option {
-            let receivers = tx.receiver_count();
-           if receivers > 0{
-               match tx.send(frame) {
-                   Ok(_) => {
-                       debug!("[Core] Frame sent to {} receivers, stream_id={}", receivers, stream_id);
-                   }
-                   Err(e) => {
-                       error!("[Core] publish_frame: Failed to send frame, stream_id={}, error={}", stream_id, e);
-                   }
-               }
-           }
+            let subscribers = tx.receiver_count();
+            if subscribers > 0 {
+                match tx.send(frame) {
+                    Ok(lagged) => {
+                        debug!(
+                            "[Core] publish_frame: stream_id={} subscribers={} lagged={}",
+                            stream_id, subscribers, lagged
+                        );
+                    }
+                    Err(e) => {
+                        error!("[Core] publish_frame: Failed to send frame, stream_id={}, error={}", stream_id, e);
+                    }
+                }
+            } else {
+                static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n == 1 || n % 100 == 0 {
+                    info!(
+                        "[Core] publish_frame: no subscribers yet for stream_id={} (dropped {} frames, keyframe={})",
+                        stream_id, n, frame.is_keyframe
+                    );
+                }
+            }
         } else {
             warn!("[Core] publish_frame: No broadcast channel for stream_id={}", stream_id);
         }
@@ -651,7 +771,7 @@ impl StreamManager {
         } else {
             warn!("[Core] subscribe: No broadcast channel found for stream_id={}", stream_id);
             // Create broadcast channel for this stream
-            let (tx, rx) = broadcast::channel(1000);
+            let (tx, rx) = broadcast::channel(2048);
 
             {
                 let mut channels = self.channels.write();

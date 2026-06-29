@@ -23,4 +23,5 @@ uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
 async-trait = "0.1"
 time = "0.3.49"
-
+webrtc = "0.12"
+tokio-tungstenite = "0.24"

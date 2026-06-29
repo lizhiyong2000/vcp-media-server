@@ -10,7 +10,7 @@
   2. RTSP 推流 / 播放 ................ TC-RTSP-*
   3. HTTP-FLV 拉流 ................... TC-FLV-*
   4. HLS 拉流 ........................ TC-HLS-*（待补充）
-  5. WebRTC .......................... TC-WEBRTC-*（待补充）
+  5. WebRTC .......................... TC-WEBRTC-*
   附录 A. 脚本命名规范
   附录 B. 通用日志检查
 
@@ -384,14 +384,74 @@ URL 格式：
 
 
 ================================================================================
-5. WebRTC（待补充）
+5. WebRTC 推流 / 播放
 ================================================================================
 
-用例编号    说明
-TC-WEBRTC-01  （待补充）信令连接与播放
+信令地址：ws://127.0.0.1:9080/
+测试页面：http://127.0.0.1:8081/webrtc/webrtc-test.html
 
-信令地址：
-  ws://127.0.0.1:9080/
+信令 JSON 格式（WebSocket 文本帧）：
+  客户端 → 服务端
+    {"type":"publish","stream_id":"<id>","sdp":"<offer sdp>"}
+    {"type":"play","stream_id":"<id>","sdp":"<offer sdp>"}
+    {"type":"ice","candidate":"...","sdp_mid":"0","sdp_mline_index":0}
+  服务端 → 客户端
+    {"type":"answer","sdp":"<answer sdp>"}
+    {"type":"ice","candidate":"...","sdp_mid":"0","sdp_mline_index":0}
+    {"type":"error","message":"..."}
+
+用例编号    说明
+TC-WEBRTC-01  浏览器 WebRTC 推流
+TC-WEBRTC-02  浏览器 WebRTC 播放（播放 WebRTC 或 RTMP 推入的同一 stream_id）
+TC-WEBRTC-03  RTMP 推流 + WebRTC 播放（跨协议）
+
+--------------------------------------------------------------------------------
+TC-WEBRTC-01  浏览器 WebRTC 推流
+--------------------------------------------------------------------------------
+
+前置：服务已启动（cargo run）
+
+1) 打开测试页
+   http://127.0.0.1:8081/webrtc/webrtc-test.html
+
+2) 点击「连接信令」，再点击「开始推流」，允许摄像头/麦克风权限。
+
+3) 日志应出现：
+   [WebRTC] Publish request stream='webrtc_test'
+   [WebRTC] Publish session ready for stream 'webrtc_test'
+   [WebRTC] First published video frame stream=webrtc_test
+
+4) 验证流已注册：
+   curl -s http://127.0.0.1:8081/api/streams | jq .
+
+--------------------------------------------------------------------------------
+TC-WEBRTC-02  浏览器 WebRTC 播放
+--------------------------------------------------------------------------------
+
+前置：TC-WEBRTC-01 已推流，或任意协议已向 stream_id 发布（如 RTMP live/stream1）
+
+1) 新标签页打开测试页（或同一页先停止推流再播放）
+2) stream_id 与推流一致，连接信令后点击「开始播放」
+3) 远端 video 应出现画面；日志：
+   [WebRTC] Play request stream='webrtc_test'
+   [WebRTC] Subscribed to stream 'webrtc_test' for WebRTC play
+   [WebRTC] First played video frame stream=webrtc_test
+
+--------------------------------------------------------------------------------
+TC-WEBRTC-03  RTMP 推流 + WebRTC 播放
+--------------------------------------------------------------------------------
+
+终端 A — RTMP 推流：
+ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=25 -pix_fmt yuv420p \
+  -c:v libx264 -preset ultrafast -tune zerolatency -g 50 \
+  -f flv rtmp://127.0.0.1:1935/live/webrtc_bridge
+
+浏览器 — WebRTC 播放：
+  stream_id = webrtc_bridge
+  http://127.0.0.1:8081/webrtc/webrtc-test.html → 连接 → 开始播放
+
+日志关键字：
+  grep -E "WebRTC|Publish|Play|First published|First played" logs/media-server.log.*
 
 
 ================================================================================
@@ -403,7 +463,7 @@ TC-WEBRTC-01  （待补充）信令连接与播放
     rtsp/   test_rtsp_push.sh | test_rtsp_play.sh | test_rtsp_verify.sh
     flv/    test_flv_play.sh
     hls/    （待补充）
-    webrtc/ （待补充）
+    webrtc/ webrtc-test.html（浏览器测试页，HTTP 8081 托管）
 
   命名规则：test_<协议>_<动作>.sh
     push   — 推流
@@ -420,6 +480,9 @@ grep -E "Publishing|AVC SequenceHeader|play stream=|SEND.*H264" logs/media-serve
 
 # RTSP 关键字
 grep -E "ANNOUNCE|RECORD|DESCRIBE|PLAY|stream_id=" logs/media-server.log.*
+
+# WebRTC 关键字
+grep -E "WebRTC|Publish request|Play request|First published|First played" logs/media-server.log.*
 
 # 错误
 grep -E "StreamNotFound|not found|Connection error|failed" logs/media-server.log.*

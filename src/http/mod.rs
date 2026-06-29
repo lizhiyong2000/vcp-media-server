@@ -44,6 +44,7 @@ impl HttpServer {
         info!("[HTTP]   POST /api/rtsp/pull      - RTSP pull from remote URL");
         info!("[HTTP]   POST /api/rtsp/push      - RTSP push to remote URL");
         info!("[HTTP]   POST /api/rtmp/pull      - RTMP pull from remote URL");
+        info!("[HTTP]   GET  /webrtc/webrtc-test.html - WebRTC test page");
         if self.hls_server.is_some() {
             info!("[HTTP]   GET  /hls/<stream_id>/live.m3u8 - HLS playlist");
             info!("[HTTP]   GET  /hls/<stream_id>/<segment>.ts - HLS segment");
@@ -141,6 +142,19 @@ impl HttpServer {
                 return Ok(());
             }
             
+            // WebRTC test page
+            if path == "/webrtc/webrtc-test.html" || path == "/webrtc/" {
+                const WEBRTC_TEST_HTML: &str = include_str!("../../webrtc/webrtc-test.html");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+                    WEBRTC_TEST_HTML.len(),
+                    WEBRTC_TEST_HTML
+                );
+                socket.write_all(response.as_bytes()).await?;
+                socket.flush().await?;
+                return Ok(());
+            }
+
             // HTTP-FLV request
             if path.starts_with("/flv/") {
                 if let Some(ref flv) = flv_server {

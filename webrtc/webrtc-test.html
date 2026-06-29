@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>vcp-media-server WebRTC Test</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.4rem; }
+    fieldset { margin-bottom: 1rem; }
+    label { display: block; margin: 0.4rem 0 0.2rem; }
+    input[type=text] { width: 100%; box-sizing: border-box; padding: 0.4rem; }
+    button { margin: 0.3rem 0.3rem 0.3rem 0; padding: 0.4rem 0.8rem; }
+    video { width: 100%; max-width: 640px; background: #111; margin-top: 0.5rem; }
+    #log { background: #f4f4f4; padding: 0.5rem; height: 160px; overflow: auto; font-size: 0.85rem; white-space: pre-wrap; }
+    .row { display: flex; gap: 1rem; flex-wrap: wrap; }
+    .col { flex: 1; min-width: 280px; }
+  </style>
+</head>
+<body>
+  <h1>vcp-media-server WebRTC 测试</h1>
+  <p><strong>双页测试：</strong>页面 A 推流、页面 B 播放，必须使用相同 <code>stream_id</code>，且先推流 2–3 秒再播放。播放时服务器会向<strong>推流页</strong>请求关键帧，无需在同一页面。</p>
+
+  <fieldset>
+    <legend>连接</legend>
+    <label>信令地址</label>
+    <input id="wsUrl" type="text" value="ws://127.0.0.1:9080/">
+    <label>流 ID (stream_id)</label>
+    <input id="streamId" type="text" value="webrtc_test">
+    <button id="btnConnect">连接信令</button>
+    <button id="btnDisconnect" disabled>断开</button>
+  </fieldset>
+
+  <div class="row">
+    <div class="col">
+      <fieldset>
+        <legend>推流 (Publish)</legend>
+        <button id="btnPublish" disabled>开始推流</button>
+        <button id="btnStopPublish" disabled>停止推流</button>
+        <video id="localVideo" autoplay muted playsinline></video>
+      </fieldset>
+    </div>
+    <div class="col">
+      <fieldset>
+        <legend>播放 (Play)</legend>
+        <button id="btnPlay" disabled>开始播放</button>
+        <button id="btnStopPlay" disabled>停止播放</button>
+        <video id="remoteVideo" autoplay muted playsinline controls></video>
+      </fieldset>
+    </div>
+  </div>
+
+  <fieldset>
+    <legend>日志</legend>
+    <div id="log"></div>
+  </fieldset>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $('log');
+    function log(msg) {
+      const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.textContent += line + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(line);
+    }
+
+    let ws = null;
+    let publishPc = null;
+    let playPc = null;
+    let localStream = null;
+    let activePc = null; // PC currently negotiating / receiving server ICE
+    let keyframeTimer = null;
+    let keyframeMethod = null; // 'setParameters' | 'generateKeyFrame' | 'replaceTrack' | null
+
+    async function requestPublishKeyframe(label) {
+      if (!publishPc) {
+        log(label + ': 无推流连接');
+        return false;
+      }
+      if (keyframeMethod === 'none') return false;
+      if (publishPc.connectionState !== 'connected') {
+        return false;
+      }
+      const sender = publishPc.getSenders().find((s) => s.track?.kind === 'video');
+      if (!sender) {
+        log(label + ': 无视频 sender');
+        return false;
+      }
+
+      const trySetParameters = async () => {
+        const params = sender.getParameters();
+        if (!params.encodings?.length) return false;
+        await sender.setParameters(params, {
+          encodingOptions: params.encodings.map(() => ({ keyFrame: true })),
+        });
+        return true;
+      };
+
+      const tryGenerateKeyFrame = async () => {
+        if (typeof sender.generateKeyFrame !== 'function') return false;
+        await sender.generateKeyFrame();
+        return true;
+      };
+
+      const tryReplaceTrack = async () => {
+        const track = sender.track;
+        if (!track || track.readyState !== 'live') return false;
+        await sender.replaceTrack(null);
+        await new Promise((r) => setTimeout(r, 30));
+        await sender.replaceTrack(track);
+        return true;
+      };
+
+      const methods = [
+        ['setParameters', trySetParameters],
+        ['generateKeyFrame', tryGenerateKeyFrame],
+      ];
+      if (label.includes('need-keyframe') || label.includes('need_keyframe')) {
+        methods.push(['replaceTrack', tryReplaceTrack]);
+      }
+
+      for (const [name, fn] of methods) {
+        if (keyframeMethod && keyframeMethod !== name) continue;
+        try {
+          if (await fn()) {
+            if (keyframeMethod !== name) {
+              keyframeMethod = name;
+              log(label + ': 关键帧请求方式 → ' + name);
+            }
+            return true;
+          }
+        } catch (e) {
+          if (!keyframeMethod || keyframeMethod === name) {
+            log(label + ': ' + name + ' 失败 ' + e);
+          }
+        }
+      }
+
+      if (!keyframeMethod) {
+        log(label + ': 无法请求关键帧（浏览器不支持），依赖编码器默认 GOP');
+        keyframeMethod = 'none';
+      }
+      return false;
+    }
+
+    function startPublishKeyframeInterval() {
+      stopPublishKeyframeInterval();
+      requestPublishKeyframe('Publish-connected');
+      keyframeTimer = setInterval(() => {
+        requestPublishKeyframe('Publish-interval');
+      }, 3000);
+    }
+
+    function stopPublishKeyframeInterval() {
+      if (keyframeTimer) {
+        clearInterval(keyframeTimer);
+        keyframeTimer = null;
+      }
+    }
+
+    function wsSend(obj) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        log('WebSocket 未连接');
+        return;
+      }
+      ws.send(JSON.stringify(obj));
+    }
+
+    function h264CodecPreferences() {
+      const caps = RTCRtpSender.getCapabilities('video');
+      if (!caps) return [];
+      const h264 = caps.codecs.filter((c) => c.mimeType.toLowerCase() === 'video/h264');
+      const aux = caps.codecs.filter((c) => {
+        const m = c.mimeType.toLowerCase();
+        return m === 'video/rtx' || m === 'video/red' || m === 'video/ulpfec' || m === 'video/flexfec-03';
+      });
+      return [...h264, ...aux];
+    }
+
+    function wireIce(pc, role) {
+      pc.onicecandidate = (ev) => {
+        if (!ev.candidate) return;
+        wsSend({
+          type: 'ice',
+          candidate: ev.candidate.candidate,
+          sdp_mid: ev.candidate.sdpMid,
+          sdp_mline_index: ev.candidate.sdpMLineIndex,
+        });
+      };
+      pc.onconnectionstatechange = () => log(`${role} PC state: ${pc.connectionState}`);
+      pc.oniceconnectionstatechange = () => log(`${role} ICE state: ${pc.iceConnectionState}`);
+    }
+
+    async function addIceCandidate(pc, msg) {
+      if (!pc || !msg.candidate) return;
+      await pc.addIceCandidate({
+        candidate: msg.candidate,
+        sdpMid: msg.sdp_mid,
+        sdpMLineIndex: msg.sdp_mline_index,
+      });
+    }
+
+    $('btnConnect').onclick = () => {
+      const url = $('wsUrl').value.trim();
+      ws = new WebSocket(url);
+      ws.onopen = () => {
+        log('信令已连接: ' + url);
+        $('btnConnect').disabled = true;
+        $('btnDisconnect').disabled = false;
+        $('btnPublish').disabled = false;
+        $('btnPlay').disabled = false;
+      };
+      ws.onclose = () => {
+        log('信令已断开');
+        $('btnConnect').disabled = false;
+        $('btnDisconnect').disabled = true;
+        $('btnPublish').disabled = true;
+        $('btnPlay').disabled = true;
+      };
+      ws.onerror = () => log('WebSocket 错误');
+      ws.onmessage = async (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { log('无效 JSON: ' + ev.data); return; }
+        if (msg.type === 'answer') {
+          if (!activePc) return;
+          await activePc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+          log('收到 answer');
+        } else if (msg.type === 'ice') {
+          if (activePc) await addIceCandidate(activePc, msg);
+        } else if (msg.type === 'need_keyframe') {
+          requestPublishKeyframe('Server-need-keyframe');
+        } else if (msg.type === 'error') {
+          log('服务器错误: ' + msg.message);
+        }
+      };
+    };
+
+    $('btnDisconnect').onclick = () => {
+      if (ws) ws.close();
+      ws = null;
+    };
+
+    $('btnPublish').onclick = async () => {
+      const streamId = $('streamId').value.trim();
+      if (!streamId) return log('请填写 stream_id');
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, frameRate: 25 },
+          audio: false,
+        });
+        $('localVideo').srcObject = localStream;
+        publishPc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        wireIce(publishPc, 'publish');
+        publishPc.addEventListener('connectionstatechange', () => {
+          if (publishPc?.connectionState === 'connected') {
+            startPublishKeyframeInterval();
+          }
+          if (publishPc?.connectionState === 'closed' || publishPc?.connectionState === 'failed') {
+            stopPublishKeyframeInterval();
+          }
+        });
+        const videoTrack = localStream.getVideoTracks()[0];
+        const pubTr = publishPc.addTransceiver(videoTrack, { direction: 'sendonly' });
+        const h264Prefs = h264CodecPreferences();
+        if (h264Prefs.length) {
+          pubTr.setCodecPreferences(h264Prefs);
+          log('Publish: prefer H264 (' + h264Prefs.filter(c => c.mimeType.includes('H264')).length + ' codecs)');
+        }
+        const offer = await publishPc.createOffer({
+          offerToReceiveAudio: false,
+          offerToReceiveVideo: false,
+        });
+        await publishPc.setLocalDescription(offer);
+        activePc = publishPc;
+        wsSend({ type: 'publish', stream_id: streamId, sdp: offer.sdp });
+        log('已发送 publish offer, stream_id=' + streamId);
+        $('btnPublish').disabled = true;
+        $('btnStopPublish').disabled = false;
+      } catch (e) {
+        log('推流失败: ' + e);
+      }
+    };
+
+    $('btnStopPublish').onclick = () => {
+      const streamId = $('streamId').value.trim();
+      stopPublishKeyframeInterval();
+      keyframeMethod = null;
+      if (activePc === publishPc) activePc = null;
+      if (publishPc) { publishPc.close(); publishPc = null; }
+      if (localStream) {
+        localStream.getTracks().forEach((t) => t.stop());
+        localStream = null;
+      }
+      if (streamId) wsSend({ type: 'stop_publish', stream_id: streamId });
+      $('localVideo').srcObject = null;
+      $('btnPublish').disabled = false;
+      $('btnStopPublish').disabled = true;
+      log('推流已停止');
+    };
+
+    $('btnPlay').onclick = async () => {
+      const streamId = $('streamId').value.trim();
+      if (!streamId) return log('请填写 stream_id');
+      try {
+        playPc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        wireIce(playPc, 'play');
+        const playTr = playPc.addTransceiver('video', { direction: 'recvonly' });
+        const h264Prefs = h264CodecPreferences();
+        if (h264Prefs.length) {
+          playTr.setCodecPreferences(h264Prefs);
+          log('Play: prefer H264');
+        }
+        const remoteStream = new MediaStream();
+        $('remoteVideo').srcObject = remoteStream;
+        playPc.ontrack = (ev) => {
+          log('收到远端 track: ' + ev.track.kind + ' id=' + ev.track.id + ' readyState=' + ev.track.readyState);
+          remoteStream.addTrack(ev.track);
+          ev.track.onmute = () => log('track muted: ' + ev.track.kind);
+          ev.track.onunmute = () => log('track unmuted: ' + ev.track.kind);
+          $('remoteVideo').play().catch((e) => log('video.play(): ' + e));
+        };
+        const offer = await playPc.createOffer();
+        await playPc.setLocalDescription(offer);
+        activePc = playPc;
+        wsSend({ type: 'play', stream_id: streamId, sdp: offer.sdp });
+        log('已发送 play offer, stream_id=' + streamId);
+        $('btnPlay').disabled = true;
+        $('btnStopPlay').disabled = false;
+      } catch (e) {
+        log('播放失败: ' + e);
+      }
+    };
+
+    $('btnStopPlay').onclick = () => {
+      const streamId = $('streamId').value.trim();
+      if (activePc === playPc) activePc = null;
+      if (playPc) { playPc.close(); playPc = null; }
+      if (streamId) wsSend({ type: 'stop_play', stream_id: streamId });
+      $('remoteVideo').srcObject = null;
+      $('btnPlay').disabled = false;
+      $('btnStopPlay').disabled = true;
+      log('播放已停止');
+    };
+  </script>
+</body>
+</html>

@@ -53,10 +53,10 @@ fn init_logging(config: &Config) -> Result<()> {
     
     if let Some(modules) = &config.log.modules {
         for (module, level) in modules {
-            let target = if module.starts_with("media_server") {
+            let target = if module.contains("::") {
                 module.clone()
             } else {
-                format!("media_server::{}", module)
+                format!("vcp_media_server::{}", module)
             };
             let level_filter = parse_log_level(level);
             filter = filter.add_directive(format!("{}={}", target, level_filter).parse()?);
