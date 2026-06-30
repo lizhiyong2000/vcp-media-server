@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn, error, debug};
 
-use crate::core::{StreamManager, CodecType, MediaFrame, StreamSourceMode, StreamProtocol, StreamStatus, drain_broadcast_lag, recv_flv_batch};
+use crate::core::{StreamManager, CodecType, MediaFrame, StreamSourceMode, StreamProtocol, StreamStatus, drain_broadcast_lag, recv_flv_batch, default_live_tracks};
 use session::{RtmpSession, SessionState};
 use chunk::RtmpMessage;
 
@@ -514,9 +514,12 @@ impl RtmpServer {
 
                 if conn.stream_manager.get_stream(&stream_name).is_none() {
                     conn.stream_manager.create_stream(&stream_name, StreamSourceMode::Push, StreamProtocol::RTMP, None);
+                    conn.stream_manager.set_stream_tracks(&stream_name, default_live_tracks());
                     let _ = conn.stream_manager.set_unpublished(&stream_name);
                     info!("[RTMP] [{}] Created new stream: '{}'", peer_addr, stream_name);
 
+                } else if conn.stream_manager.get_stream(&stream_name).map(|s| s.tracks.is_empty()).unwrap_or(false) {
+                    conn.stream_manager.set_stream_tracks(&stream_name, default_live_tracks());
                 }
 
                 // // ========== 新增：先发送 Stream Begin ==========

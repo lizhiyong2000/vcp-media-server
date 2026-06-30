@@ -269,6 +269,14 @@ impl Track {
     }
 }
 
+/// Default H264 + AAC tracks for push streams without explicit SDP (e.g. RTMP publish).
+pub fn default_live_tracks() -> Vec<Track> {
+    vec![
+        Track::new(0, CodecType::H264, 96, 90_000),
+        Track::new(1, CodecType::AAC, 97, 44_100),
+    ]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecType {
     H264,

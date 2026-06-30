@@ -236,22 +236,7 @@ impl RtspServer {
                 session.pps = pps.clone();
 
                 let tracks_to_create = if tracks.is_empty() {
-                    vec![
-                        Track {
-                            id: 0,
-                            codec: CodecType::H264,
-                            payload_type: 96,
-                            clock_rate: 90000,
-                            extra_params: std::collections::HashMap::new(),
-                        },
-                        Track {
-                            id: 1,
-                            codec: CodecType::AAC,
-                            payload_type: 97,
-                            clock_rate: 44100,
-                            extra_params: std::collections::HashMap::new(),
-                        },
-                    ]
+                    crate::core::default_live_tracks()
                 } else {
                     tracks
                 };
@@ -455,7 +440,12 @@ impl RtspServer {
         };
         
         if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
-            for (idx, track) in stream.tracks.iter().enumerate() {
+            let tracks = if stream.tracks.is_empty() {
+                crate::core::default_live_tracks()
+            } else {
+                stream.tracks.clone()
+            };
+            for (idx, track) in tracks.iter().enumerate() {
                 let (media_type, codec_name, clock_rate) = match track.codec {
                     CodecType::H264 => ("video", "H264", 90000),
                     CodecType::H265 => ("video", "H265", 90000),
