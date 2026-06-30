@@ -5,6 +5,10 @@ use tracing::debug;
 
 use crate::core::{CodecType, MediaFrame};
 
+/// AAC sample rate index (44100 Hz)
+const AAC_SAMPLE_RATE_INDEX: u8 = 4;
+const AAC_CHANNELS: u8 = 2;
+
 /// Standard TS packet size
 const TS_PACKET_SIZE: usize = 188;
 /// Sync byte for TS packets
@@ -68,6 +72,9 @@ impl TsMuxer {
             pcr_clock: 0,
         }
     }
+
+    /// Prepare for a new TS segment file. PAT/PMT are re-emitted; CC/PCR stay continuous.
+    pub fn reset_for_new_segment(&mut self) {}
 
     /// Generate a PAT (Program Association Table) packet
     pub fn generate_pat(&mut self) -> Vec<u8> {
@@ -156,14 +163,27 @@ impl TsMuxer {
         };
 
         let is_video = matches!(frame.codec, CodecType::H264 | CodecType::H265);
-        let pes = build_pes(frame, is_video);
+        let payload = if matches!(frame.codec, CodecType::AAC) {
+            wrap_aac_adts(&frame.data)
+        } else {
+            frame.data.to_vec()
+        };
+        let frame_for_pes = MediaFrame::new(
+            frame.stream_id.clone(),
+            frame.track_id,
+            frame.timestamp,
+            bytes::Bytes::from(payload),
+            frame.is_keyframe,
+            frame.codec,
+        );
+        let pes = build_pes(&frame_for_pes, is_video);
 
         let cc = if is_video {
             &mut self.continuity_counter_video
         } else {
             &mut self.continuity_counter_audio
         };
-        pes_to_ts_packets(&pes, pid, is_video, frame.is_keyframe, cc, self.pcr_clock)
+        pes_to_ts_packets(&pes, pid, is_video, cc, self.pcr_clock)
     }
 
     /// Update PCR clock
@@ -189,17 +209,14 @@ fn build_pes(frame: &MediaFrame, is_video: bool) -> Vec<u8> {
     pes.push(stream_id);
 
     let has_pts = true;
-    let has_dts = is_video && frame.is_keyframe;
+    // No B-frames: DTS equals PTS on every video access unit
+    let has_dts = is_video;
     let optional_header_len = if has_pts && has_dts { 10 } else if has_pts { 5 } else { 0 };
 
     let pes_data_len = 3 + optional_header_len + frame.data.len();
-    if is_video {
-        pes.extend_from_slice(&[0x00, 0x00]); // unbounded
-    } else {
-        let len = pes_data_len as u16;
-        pes.push((len >> 8) as u8);
-        pes.push((len & 0xFF) as u8);
-    }
+    // Unbounded PES length avoids size mismatch for variable ADTS/H264 payloads
+    pes.extend_from_slice(&[0x00, 0x00]);
+    let _ = pes_data_len;
 
     let mut flags1: u8 = 0x80;
     if is_video { flags1 |= 0x04; }
@@ -238,25 +255,27 @@ fn build_pes(frame: &MediaFrame, is_video: bool) -> Vec<u8> {
     pes
 }
 
-/// Fragment a PES packet into TS packets
-fn pes_to_ts_packets(pes: &[u8], pid: u16, is_video: bool, is_keyframe: bool, cc: &mut u8, pcr_clock: u64) -> Vec<u8> {
+/// Fragment a PES packet into TS packets (188 bytes each, with proper stuffing).
+fn pes_to_ts_packets(pes: &[u8], pid: u16, is_video: bool, cc: &mut u8, pcr_clock: u64) -> Vec<u8> {
     let mut output = Vec::new();
     let mut offset = 0;
     let mut first = true;
 
     while offset < pes.len() {
-        let mut packet = [0u8; TS_PACKET_SIZE];
+        let mut packet = [0xFFu8; TS_PACKET_SIZE];
         packet[0] = SYNC_BYTE;
         packet[1] = ((pid >> 8) as u8) & 0x1F;
         packet[2] = (pid & 0xFF) as u8;
         *cc = (*cc + 1) & 0x0F;
 
+        let mut payload_start = 4usize;
+
         if first {
             packet[1] |= 0x40; // PUSI
-            if is_video && is_keyframe {
-                packet[3] = 0x30 | *cc; // adaptation + payload
-                packet[4] = 7;
-                packet[5] = 0x10; // PCR flag
+            if is_video {
+                packet[3] = 0x30 | *cc;
+                packet[4] = 7; // adaptation_field_length
+                packet[5] = 0x10; // PCR
                 let pcr = pcr_clock;
                 packet[6] = ((pcr >> 25) & 0xFF) as u8;
                 packet[7] = ((pcr >> 17) & 0xFF) as u8;
@@ -264,27 +283,34 @@ fn pes_to_ts_packets(pes: &[u8], pid: u16, is_video: bool, is_keyframe: bool, cc
                 packet[9] = ((pcr >> 1) & 0xFF) as u8;
                 packet[10] = ((pcr & 0x01) as u8) << 7 | 0x7E;
                 packet[11] = 0x00;
-                let header_end = 12;
-                let remaining = TS_PACKET_SIZE - header_end;
-                let copy_len = std::cmp::min(remaining, pes.len() - offset);
-                packet[header_end..header_end + copy_len].copy_from_slice(&pes[offset..offset + copy_len]);
-                offset += copy_len;
+                payload_start = 12;
             } else {
                 packet[3] = 0x10 | *cc;
-                let remaining = TS_PACKET_SIZE - 4;
-                let copy_len = std::cmp::min(remaining, pes.len() - offset);
-                packet[4..4 + copy_len].copy_from_slice(&pes[offset..offset + copy_len]);
-                offset += copy_len;
             }
             first = false;
         } else {
             packet[3] = 0x10 | *cc;
-            let remaining = TS_PACKET_SIZE - 4;
-            let copy_len = std::cmp::min(remaining, pes.len() - offset);
-            packet[4..4 + copy_len].copy_from_slice(&pes[offset..offset + copy_len]);
-            offset += copy_len;
         }
 
+        let capacity = TS_PACKET_SIZE - payload_start;
+        let copy_len = std::cmp::min(capacity, pes.len() - offset);
+
+        if copy_len < capacity {
+            // Stuffing via adaptation field
+            let adapt_len = capacity - copy_len;
+            if payload_start == 4 {
+                packet[3] = 0x30 | *cc;
+                packet[4] = (adapt_len - 1) as u8;
+                if adapt_len >= 2 {
+                    packet[5] = 0x00;
+                }
+                payload_start = 4 + adapt_len;
+            }
+        }
+
+        packet[payload_start..payload_start + copy_len]
+            .copy_from_slice(&pes[offset..offset + copy_len]);
+        offset += copy_len;
         output.extend_from_slice(&packet);
     }
 
@@ -349,4 +375,29 @@ fn ts_packet(pid: u16, payload_start: bool, payload: &[u8], cc: &mut u8) -> Vec<
     }
 
     packets
+}
+
+/// Wrap raw AAC (RTMP-style, no ADTS) in a 7-byte ADTS header for MPEG-TS.
+fn wrap_aac_adts(aac_raw: &[u8]) -> Vec<u8> {
+    if aac_raw.is_empty() {
+        return Vec::new();
+    }
+    // Already has ADTS sync word
+    if aac_raw.len() >= 2 && aac_raw[0] == 0xFF && (aac_raw[1] & 0xF0) == 0xF0 {
+        return aac_raw.to_vec();
+    }
+
+    let frame_len = aac_raw.len() + 7;
+    let mut adts = Vec::with_capacity(frame_len);
+    adts.push(0xFF);
+    adts.push(0xF1); // MPEG-4, layer 0, no CRC
+    adts.push(
+        (0 << 6) | ((AAC_SAMPLE_RATE_INDEX & 0x0F) << 2) | ((AAC_CHANNELS >> 2) & 0x01),
+    );
+    adts.push(((AAC_CHANNELS & 0x03) << 6) | ((frame_len >> 11) as u8));
+    adts.push(((frame_len >> 3) & 0xFF) as u8);
+    adts.push((((frame_len & 0x07) as u8) << 5) | 0x1F);
+    adts.push(0xFC);
+    adts.extend_from_slice(aac_raw);
+    adts
 }

@@ -5,6 +5,7 @@ mod peer;
 mod rtp_h264;
 mod sdp_h264;
 pub use sdp_h264::parse_sprop_parameter_sets;
+pub use outbound_h264::annex_b_with_config;
 mod play_relay;
 mod player;
 mod publisher;

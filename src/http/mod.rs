@@ -99,15 +99,24 @@ impl HttpServer {
             if path.starts_with("/hls/") && path.ends_with(".m3u8") {
                 if let Some(ref hls) = hls_server {
                     let stream_id = path.trim_start_matches("/hls/").trim_end_matches("/live.m3u8");
-                    if let Some(playlist) = hls.get_playlist(stream_id) {
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\n\r\n{}",
-                            playlist.len(), playlist
-                        );
+                    if manager.get_stream(&stream_id.to_string()).is_none() {
+                        let response = Self::http_response(404, "Not Found", "Stream not found");
                         socket.write_all(response.as_bytes()).await?;
                         socket.flush().await?;
                         return Ok(());
                     }
+                    let _ = hls.ensure_stream(stream_id, false).await;
+
+                    let playlist = hls
+                        .get_playlist(stream_id)
+                        .unwrap_or_else(|| hls.empty_playlist());
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
+                        playlist.len(), playlist
+                    );
+                    socket.write_all(response.as_bytes()).await?;
+                    socket.shutdown().await?;
+                    return Ok(());
                 }
                 let response = Self::http_response(404, "Not Found", "");
                 socket.write_all(response.as_bytes()).await?;
@@ -124,13 +133,13 @@ impl HttpServer {
                         let filename = path_parts[1];
                         if let Some(seg_path) = hls.get_segment_path(stream_id, filename) {
                             if let Ok(data) = tokio::fs::read(&seg_path).await {
-                                let mut response = format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
                                     data.len()
                                 );
                                 socket.write_all(response.as_bytes()).await?;
                                 socket.write_all(&data).await?;
-                                socket.flush().await?;
+                                socket.shutdown().await?;
                                 return Ok(());
                             }
                         }

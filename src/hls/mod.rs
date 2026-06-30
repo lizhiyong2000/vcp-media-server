@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use parking_lot::RwLock;
 use tokio::fs;
-use tokio::time::{Duration, Instant};
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 
-use crate::core::{StreamManager, MediaFrame, CodecType, StreamId};
+use crate::core::{StreamManager, MediaFrame, CodecType};
+use crate::webrtc::annex_b_with_config;
 use self::m3u8::M3u8Generator;
 use self::ts_muxer::TsMuxer;
 
@@ -29,7 +29,7 @@ impl Default for HlsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            segment_duration: 4.0,
+            segment_duration: 2.0,
             max_segments: 10,
             output_dir: "./hls".to_string(),
         }
@@ -43,25 +43,40 @@ struct HlsSession {
     playlist: M3u8Generator,
     /// Current segment buffer
     segment_buffer: Vec<u8>,
-    /// Current segment start time
-    segment_start_time: Option<Instant>,
-    /// Current segment duration accumulator (from timestamps)
+    /// Current segment duration accumulator (from video timestamps)
     segment_duration_acc: f64,
-    /// Last timestamp seen
-    last_timestamp: u64,
-    /// Whether we've sent the initial PAT/PMT
-    pat_pmt_sent: bool,
     /// Output directory for this stream
     output_dir: PathBuf,
     /// Whether this session is active
     active: bool,
+    /// Drop video until the first keyframe (late HLS join)
+    primed: bool,
+    /// Session-wide video mux timeline (ms), never reset at segment splits
+    session_video_mux_ms: u64,
+    /// Last raw RTMP video timestamp used for delta accumulation
+    last_raw_video_ts: Option<u64>,
+    /// Session-wide AAC frame count for continuous audio PTS
+    session_audio_frames: u64,
+    /// Last raw video timestamp for segment duration (ms)
+    last_video_timestamp: u64,
+}
+
+/// A completed TS segment ready to write to disk.
+struct CompletedSegment {
+    data: Vec<u8>,
+    filename: String,
+    duration: f64,
+    seq: u64,
 }
 
 impl HlsSession {
     fn new(stream_id: &str, config: &HlsConfig) -> Result<Self> {
         let output_dir = PathBuf::from(&config.output_dir).join(stream_id);
-        
-        // Create output directory
+
+        // Remove stale segments from a previous server run
+        if output_dir.exists() {
+            let _ = std::fs::remove_dir_all(&output_dir);
+        }
         std::fs::create_dir_all(&output_dir)?;
 
         Ok(Self {
@@ -69,117 +84,130 @@ impl HlsSession {
             muxer: TsMuxer::new(),
             playlist: M3u8Generator::new(config.segment_duration, config.max_segments),
             segment_buffer: Vec::new(),
-            segment_start_time: None,
             segment_duration_acc: 0.0,
-            last_timestamp: 0,
-            pat_pmt_sent: false,
             output_dir,
             active: true,
+            primed: false,
+            session_video_mux_ms: 0,
+            last_raw_video_ts: None,
+            session_audio_frames: 0,
+            last_video_timestamp: 0,
         })
     }
 
-    /// Process an incoming media frame
-    fn on_frame(&mut self, frame: &MediaFrame) -> Result<Vec<u8>> {
-        if !self.active {
-            return Ok(Vec::new());
-        }
+    /// Reset muxer and per-segment bookkeeping for a new TS file.
+    fn begin_new_segment(&mut self) {
+        self.segment_duration_acc = 0.0;
+        self.muxer.reset_for_new_segment();
+    }
 
-        let now = Instant::now();
-
-        // Initialize segment start time
-        if self.segment_start_time.is_none() {
-            self.segment_start_time = Some(now);
-            let pat_pmt = self.muxer.generate_pat_pmt(true, true);
-            self.segment_buffer.extend(pat_pmt);
-            self.pat_pmt_sent = true;
-        }
-
-        // Calculate duration from timestamps
-        if self.last_timestamp > 0 && frame.timestamp > self.last_timestamp {
-            let delta_ms = (frame.timestamp - self.last_timestamp) as f64;
-            let delta_sec = if frame.timestamp > 1000000 {
-                delta_ms / 90000.0
-            } else {
-                delta_ms / 1000.0
-            };
-            self.segment_duration_acc += delta_sec;
-        }
-        self.last_timestamp = frame.timestamp;
-
-        // Check if we should start a new segment (on keyframe + duration threshold)
-        let should_split = frame.is_keyframe 
-            && self.segment_duration_acc >= self.playlist.target_duration();
-
-        let mut segment_data_to_write: Option<Vec<u8>> = None;
-        let mut segment_filename: Option<String> = None;
-        let mut segment_duration: f64 = 0.0;
-
-        if should_split {
-            // Finalize current segment
-            if !self.segment_buffer.is_empty() {
-                let seq = self.playlist.next_sequence();
-                let filename = M3u8Generator::get_segment_filename(seq);
-                let duration = self.segment_duration_acc;
-                
-                self.playlist.add_segment(duration, filename.clone());
-                
-                segment_data_to_write = Some(std::mem::take(&mut self.segment_buffer));
-                segment_filename = Some(filename);
-                segment_duration = duration;
+    fn mux_timestamp_ms(&mut self, frame: &MediaFrame) -> u64 {
+        match frame.codec {
+            CodecType::AAC => {
+                let pts = self.session_audio_frames * 1024 * 1000 / 44100;
+                self.session_audio_frames += 1;
+                pts
             }
-            
-            // Start new segment with PAT/PMT
-            let pat_pmt = self.muxer.generate_pat_pmt(true, true);
-            self.segment_buffer.extend(pat_pmt);
-            self.segment_duration_acc = 0.0;
-            self.segment_start_time = None;
-            self.pat_pmt_sent = false;
+            CodecType::H264 | CodecType::H265 => {
+                if let Some(last) = self.last_raw_video_ts {
+                    if frame.timestamp > last {
+                        let delta = frame.timestamp - last;
+                        if delta > 0 && delta < 2000 {
+                            self.session_video_mux_ms += delta;
+                        }
+                    }
+                }
+                self.last_raw_video_ts = Some(frame.timestamp);
+                self.session_video_mux_ms
+            }
+            _ => frame.timestamp,
+        }
+    }
+
+    fn prepare_frame_for_mux(&mut self, frame: &MediaFrame) -> MediaFrame {
+        let ts = self.mux_timestamp_ms(frame);
+        MediaFrame::new(
+            frame.stream_id.clone(),
+            frame.track_id,
+            ts,
+            frame.data.clone(),
+            frame.is_keyframe,
+            frame.codec,
+        )
+    }
+
+    /// Process an incoming media frame; returns a completed segment when splitting.
+    fn on_frame(&mut self, frame: &MediaFrame) -> Result<Option<CompletedSegment>> {
+        if !self.active {
+            return Ok(None);
         }
 
-        // Update PCR
-        self.muxer.update_pcr(frame.timestamp);
+        // Skip AAC sequence header / tiny config payloads
+        if frame.codec == CodecType::AAC && frame.data.len() < 8 {
+            return Ok(None);
+        }
 
-        // Convert frame to TS packets
-        let ts_data = self.muxer.frame_to_ts(frame);
+        if !self.primed {
+            if !matches!(frame.codec, CodecType::H264 | CodecType::H265) || !frame.is_keyframe {
+                return Ok(None);
+            }
+            self.primed = true;
+        }
+
+        // Initialize segment with PAT/PMT
+        if self.segment_buffer.is_empty() {
+            let pat_pmt = self.muxer.generate_pat_pmt(true, true);
+            self.segment_buffer.extend(pat_pmt);
+        }
+
+        // Track segment duration from video timestamps only (audio/video RTMP clocks differ)
+        if matches!(frame.codec, CodecType::H264 | CodecType::H265) {
+            if self.last_video_timestamp > 0 && frame.timestamp > self.last_video_timestamp {
+                let delta_ms = frame.timestamp - self.last_video_timestamp;
+                if delta_ms > 0 && delta_ms < 2000 {
+                    self.segment_duration_acc += delta_ms as f64 / 1000.0;
+                }
+            }
+            self.last_video_timestamp = frame.timestamp;
+        }
+
+        // First segment uses a shorter threshold for faster startup
+        let split_threshold = if self.playlist.segment_count() == 0 {
+            (self.playlist.target_duration() * 0.5).clamp(1.0, 2.0)
+        } else {
+            self.playlist.target_duration()
+        };
+
+        let should_split = frame.is_keyframe
+            && self.segment_duration_acc >= split_threshold;
+
+        let mut completed: Option<CompletedSegment> = None;
+
+        if should_split && !self.segment_buffer.is_empty() {
+            let seq = self.playlist.next_sequence();
+            let filename = M3u8Generator::slot_filename(seq, self.playlist.max_segments());
+            let duration = self.segment_duration_acc.max(0.1);
+            let data = std::mem::take(&mut self.segment_buffer);
+
+            completed = Some(CompletedSegment {
+                data,
+                filename,
+                duration,
+                seq,
+            });
+
+            // Start new segment (continuous timestamps, fresh TS continuity counters)
+            self.begin_new_segment();
+            let pat_pmt = self.muxer.generate_pat_pmt(true, true);
+            self.segment_buffer.extend(pat_pmt);
+        }
+
+        let mux_frame = self.prepare_frame_for_mux(frame);
+        self.muxer.update_pcr(mux_frame.timestamp);
+        let ts_data = self.muxer.frame_to_ts(&mux_frame);
         self.segment_buffer.extend(ts_data);
 
-        // Return segment data if we need to write it
-        if let (Some(data), Some(filename)) = (segment_data_to_write, segment_filename) {
-            // We'll handle writing in the async wrapper
-            Ok(data)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    /// Finalize the current segment and return data + metadata for writing
-    fn finalize_current_segment(&mut self) -> Option<(Vec<u8>, String, f64)> {
-        if self.segment_buffer.is_empty() {
-            return None;
-        }
-
-        let seq = self.playlist.next_sequence();
-        let filename = M3u8Generator::get_segment_filename(seq);
-        let duration = self.segment_duration_acc;
-        let data = std::mem::take(&mut self.segment_buffer);
-
-        self.playlist.add_segment(duration, filename.clone());
-
-        Some((data, filename, duration))
-    }
-
-    /// Write segment data to disk (called from async context)
-    async fn write_segment(&self, data: &[u8], filename: &str, duration: f64) -> Result<()> {
-        let filepath = self.output_dir.join(filename);
-        fs::write(&filepath, data).await?;
-        info!("[HLS] [{}] Wrote segment: {} ({:.2}s, {} bytes)", 
-              self.stream_id, filename, duration, data.len());
-
-        // Write updated M3U8
-        let m3u8_path = self.output_dir.join("live.m3u8");
-        let m3u8_content = self.playlist.generate();
-        fs::write(&m3u8_path, &m3u8_content).await?;
-        Ok(())
+        Ok(completed)
     }
 
     /// Get the M3U8 playlist content
@@ -209,8 +237,41 @@ impl HlsServer {
         }
     }
 
+    /// Ensure HLS generation is running; `reset` clears prior session and files.
+    pub async fn ensure_stream(&self, stream_id: &str, reset: bool) -> Result<bool> {
+        if self.stream_manager.get_stream(&stream_id.to_string()).is_none() {
+            return Ok(false);
+        }
+        if reset && self.has_stream(stream_id) {
+            self.stop_stream(stream_id).await?;
+        }
+        if self.has_stream(stream_id) {
+            return Ok(true);
+        }
+        self.start_stream(stream_id).await?;
+        Ok(true)
+    }
+
+    /// Restart HLS from a clean slate (e.g. new RTMP publish).
+    pub async fn restart_stream(&self, stream_id: &str) -> Result<()> {
+        self.ensure_stream(stream_id, true).await?;
+        Ok(())
+    }
+
+    /// Empty live playlist while waiting for the first segment.
+    pub fn empty_playlist(&self) -> String {
+        let target = self.config.segment_duration.ceil() as u64;
+        format!(
+            "#EXTM3U\r\n#EXT-X-VERSION:3\r\n#EXT-X-TARGETDURATION:{target}\r\n#EXT-X-MEDIA-SEQUENCE:0\r\n"
+        )
+    }
+
     /// Start HLS generation for a stream
     pub async fn start_stream(&self, stream_id: &str) -> Result<()> {
+        if self.has_stream(stream_id) {
+            return Ok(());
+        }
+
         info!("[HLS] Starting HLS generation for stream: {}", stream_id);
 
         let session = HlsSession::new(stream_id, &self.config)?;
@@ -232,6 +293,7 @@ impl HlsServer {
 
         let stream_id_owned = stream_id.to_string();
         let sessions_clone = self.sessions.clone();
+        let stream_manager = self.stream_manager.clone();
 
         tokio::spawn(async move {
             info!("[HLS] [{}] HLS frame processing loop started", stream_id_owned);
@@ -240,7 +302,23 @@ impl HlsServer {
             let mut rx = rx;
             loop {
                 match rx.recv().await {
-                    Ok(frame) => {
+                    Ok(mut frame) => {
+                        if frame.codec == CodecType::H264 && frame.is_keyframe {
+                            if let Some(stream) = stream_manager.get_stream(&stream_id_owned) {
+                                if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
+                                    let data = annex_b_with_config(sps, pps, &frame.data);
+                                    frame = MediaFrame::new(
+                                        frame.stream_id,
+                                        frame.track_id,
+                                        frame.timestamp,
+                                        bytes::Bytes::from(data),
+                                        frame.is_keyframe,
+                                        frame.codec,
+                                    );
+                                }
+                            }
+                        }
+
                         frame_count += 1;
                         
                         // Process frame synchronously (no await while holding lock)
@@ -252,16 +330,19 @@ impl HlsServer {
 
                             if let Some(session) = session_guard {
                                 let mut sess = session.write();
-                                let result = sess.on_frame(&frame);
-                                match result {
-                                    Ok(data) if !data.is_empty() => {
-                                        // Segment was finalized
-                                        let seg_info = sess.finalize_current_segment();
-                                        seg_info.map(|(data, filename, duration)| {
-                                            (data, filename, duration, sess.output_dir.clone())
-                                        })
+                                match sess.on_frame(&frame) {
+                                    Ok(Some(seg)) => Some((
+                                        seg.data,
+                                        seg.filename,
+                                        seg.duration,
+                                        seg.seq,
+                                        sess.output_dir.clone(),
+                                    )),
+                                    Ok(None) => None,
+                                    Err(e) => {
+                                        error!("[HLS] [{}] Frame error: {}", stream_id_owned, e);
+                                        None
                                     }
-                                    _ => None,
                                 }
                             } else {
                                 info!("[HLS] [{}] Session removed, stopping", stream_id_owned);
@@ -270,23 +351,37 @@ impl HlsServer {
                         };
 
                         // Write segment to disk outside of lock
-                        if let Some((data, filename, duration, output_dir)) = segment_to_write {
+                        if let Some((data, filename, duration, seq, output_dir)) = segment_to_write {
                             let filepath = output_dir.join(&filename);
-                            if let Err(e) = fs::write(&filepath, &data).await {
+                            let tmp_path = output_dir.join(format!("{}.part", filename));
+                            let write_ok = if let Err(e) = fs::write(&tmp_path, &data).await {
                                 error!("[HLS] [{}] Failed to write segment: {}", stream_id_owned, e);
+                                false
+                            } else if let Err(e) = fs::rename(&tmp_path, &filepath).await {
+                                error!("[HLS] [{}] Failed to finalize segment: {}", stream_id_owned, e);
+                                let _ = fs::remove_file(&tmp_path).await;
+                                false
                             } else {
-                                info!("[HLS] [{}] Wrote segment: {} ({:.2}s, {} bytes)", 
+                                debug!("[HLS] [{}] Wrote segment: {} ({:.2}s, {} bytes)",
                                       stream_id_owned, filename, duration, data.len());
-                            }
-                            // Update M3U8
-                            let m3u8_path = output_dir.join("live.m3u8");
-                            let m3u8_content = {
-                                let sessions = sessions_clone.read();
-                                sessions.get(&stream_id_owned).map(|s| s.read().get_playlist())
+                                true
                             };
-                            if let Some(content) = m3u8_content {
-                                if let Err(e) = fs::write(&m3u8_path, &content).await {
-                                    error!("[HLS] [{}] Failed to write M3U8: {}", stream_id_owned, e);
+
+                            if write_ok {
+                                let playlist_content = {
+                                    let sessions = sessions_clone.read();
+                                    sessions.get(&stream_id_owned).map(|s| {
+                                        let mut sess = s.write();
+                                        sess.playlist.add_segment(duration, seq);
+                                        sess.get_playlist()
+                                    })
+                                };
+                                if let Some(content) = playlist_content {
+                                    let m3u8_path = output_dir.join("live.m3u8");
+                                    let tmp = output_dir.join("live.m3u8.part");
+                                    if fs::write(&tmp, &content).await.is_ok() {
+                                        let _ = fs::rename(&tmp, &m3u8_path).await;
+                                    }
                                 }
                             }
                         }
@@ -312,19 +407,32 @@ impl HlsServer {
         Ok(())
     }
 
-    /// Get the M3U8 playlist for a stream
+    /// Get the M3U8 playlist (in-memory, only lists committed segments).
     pub fn get_playlist(&self, stream_id: &str) -> Option<String> {
         let sessions = self.sessions.read();
-        sessions.get(stream_id).map(|s| s.read().get_playlist())
+        let session = sessions.get(stream_id)?;
+        let sess = session.read();
+        if sess.playlist.segment_count() == 0 {
+            return None;
+        }
+        Some(sess.get_playlist())
     }
 
     /// Get the segment file path for a stream
     pub fn get_segment_path(&self, stream_id: &str, filename: &str) -> Option<PathBuf> {
         let sessions = self.sessions.read();
-        sessions.get(stream_id).map(|s| {
-            let sess = s.read();
-            sess.output_dir().join(filename)
-        })
+        if let Some(s) = sessions.get(stream_id) {
+            let path = s.read().output_dir().join(filename);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        let path = PathBuf::from(&self.config.output_dir).join(stream_id).join(filename);
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
     }
 
     /// Check if a stream has an active HLS session

@@ -2,6 +2,29 @@
   vcp-media-server 测试用例手册
 ================================================================================
 
+已实现功能（概览）
+--------------------------------------------------------------------------------
+  协议 / 能力                          说明
+  ───────────────────────────────────  ─────────────────────────────────────
+  RTMP 推流 / 播放                     ffmpeg 等客户端 publish / play
+  RTMP 拉流转发                        HTTP API 从远端 RTMP 拉流并本地 relay
+  RTSP 推流 / 播放                     ANNOUNCE+RECORD 推流，DESCRIBE+PLAY 播放
+  RTSP 拉流 / 推流                     HTTP API 从远端拉流或向远端推流
+  HTTP-FLV 拉流                        /flv/<stream_id>，需先推流入库
+  HLS 拉流                             /hls/<id>/live.m3u8，按需切片 MPEG-TS
+  WebRTC 推流 / 播放                   WebSocket 信令 + 浏览器 H264 互通
+  WebRTC 跨协议播放                    RTMP / RTSP 推入 → WebRTC 浏览器播放
+  WebRTC 多页面同时播放                同一 stream_id 多播放器独立 relay
+  WebRTC 同页推播                      单测试页可同时推流与播放（双 PC）
+  流管理与 HTTP API                    /api/streams、拉流/推流控制接口
+  内置 WebRTC 测试页                   http://127.0.0.1:8081/webrtc/webrtc-test.html
+
+  核心机制：
+    · 统一 StreamManager 广播，多协议写入、多协议读出
+    · H264 Annex B / RTP 解析、SPS/PPS 提取与 fmtp 注入
+    · WebRTC 播放低延迟：跳至 live 边缘、帧合并、IDR 起播
+    · 推流端关键帧请求（need_keyframe → setParameters / generateKeyFrame）
+
 本文档收录各协议推流 / 播放测试命令与脚本，按用例分节，便于后续扩展。
 
 目录
@@ -9,7 +32,7 @@
   1. RTMP 推流 / 拉流 ................ TC-RTMP-*
   2. RTSP 推流 / 播放 ................ TC-RTSP-*
   3. HTTP-FLV 拉流 ................... TC-FLV-*
-  4. HLS 拉流 ........................ TC-HLS-*（待补充）
+  4. HLS 拉流 ........................ TC-HLS-*
   5. WebRTC .......................... TC-WEBRTC-*
   附录 A. 脚本命名规范
   附录 B. 通用日志检查
@@ -373,14 +396,57 @@ ffplay http://127.0.0.1:8081/flv/stream1
 
 
 ================================================================================
-4. HLS 拉流（待补充）
+4. HLS 拉流
 ================================================================================
 
 用例编号    说明
-TC-HLS-01   （待补充）推流后 m3u8 播放
+TC-HLS-01   RTMP 推流后 m3u8 播放
 
-URL 格式：
-  http://127.0.0.1:8081/hls/<stream_id>/live.m3u8
+配置（config.toml [hls]）：
+  enabled = true
+  segment_duration = 4        # 目标切片时长（秒），在关键帧处切分
+  max_segments = 10           # 播放列表保留的最大切片数
+  output_dir = "./hls"        # 本地切片目录
+
+----------------------------------------------------------------------------
+4.1 URL 格式
+----------------------------------------------------------------------------
+  http://<host>:<port>/hls/<stream_id>/live.m3u8
+  http://<host>:<port>/hls/<stream_id>/segment_<n>.ts
+
+  示例：http://127.0.0.1:8081/hls/stream1/live.m3u8
+
+  说明：
+  - 首次请求 live.m3u8 会按需启动 HLS 切片（需已有推流）
+  - 切片在关键帧 + 达到 segment_duration 时生成
+  - 推流时建议 -g 与帧率匹配（如 25fps 用 -g 25），便于按时切分
+
+----------------------------------------------------------------------------
+4.2 TC-HLS-01  推流 + HLS 播放
+----------------------------------------------------------------------------
+# 终端 1：启动服务
+cargo run
+
+# 终端 2：RTMP 推流（关键帧间隔 1s，便于 4s 切片）
+ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=25 \
+  -f lavfi -i sine=frequency=1000:sample_rate=44100 \
+  -c:v libx264 -preset ultrafast -tune zerolatency -g 25 \
+  -c:a aac -ar 44100 -ac 2 \
+  -f flv rtmp://127.0.0.1:1935/live/stream1
+
+# 终端 3：HLS 播放（首次拉流约需 4–6 秒生成首片）
+ffplay http://127.0.0.1:8081/hls/stream1/live.m3u8
+
+# 无界面验证
+ffmpeg -i http://127.0.0.1:8081/hls/stream1/live.m3u8 -t 5 -f null -
+
+# 查看 m3u8
+curl http://127.0.0.1:8081/hls/stream1/live.m3u8
+
+预期：
+  - m3u8 含 #EXTINF 与 segment_N.ts 条目
+  - ./hls/stream1/ 下生成 segment_*.ts 与 live.m3u8
+  - ffplay / ffmpeg 能正常解码播放
 
 
 ================================================================================

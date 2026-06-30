@@ -1,6 +1,6 @@
 /// M3U8 playlist generator for HLS
 use std::collections::VecDeque;
-use tracing::info;
+use tracing::debug;
 
 /// A single segment in the playlist
 #[derive(Debug, Clone)]
@@ -46,29 +46,33 @@ impl M3u8Generator {
         self.target_duration
     }
 
-    /// Add a new segment to the playlist
-    pub fn add_segment(&mut self, duration: f64, filename: String) -> u64 {
-        let seq = self.next_sequence;
-        self.next_sequence += 1;
+    /// Add a committed segment to the playlist (slot-based filename, overwrites on disk).
+    pub fn add_segment(&mut self, duration: f64, sequence: u64) {
+        let filename = Self::slot_filename(sequence, self.max_segments);
 
         let segment = Segment {
-            sequence: seq,
+            sequence,
             duration,
             filename,
         };
 
         self.segments.push_back(segment);
+        self.next_sequence = sequence + 1;
 
-        // Remove old segments if we exceed max
         while self.segments.len() > self.max_segments {
-            self.segments.pop_front();
-            self.media_sequence += 1;
+            if self.segments.pop_front().is_some() {
+                self.media_sequence += 1;
+            }
         }
 
-        info!("[HLS] Added segment seq={}, duration={:.2}s, total segments={}", 
-              seq, duration, self.segments.len());
-
-        seq
+        debug!(
+            "[HLS] Added segment seq={}, slot={}, duration={:.2}s, media_seq={}, window={}",
+            sequence,
+            sequence % self.max_segments as u64,
+            duration,
+            self.media_sequence,
+            self.segments.len()
+        );
     }
 
     /// Generate the M3U8 playlist content
@@ -77,6 +81,7 @@ impl M3u8Generator {
 
         output.push_str("#EXTM3U\r\n");
         output.push_str("#EXT-X-VERSION:3\r\n");
+        output.push_str("#EXT-X-INDEPENDENT-SEGMENTS\r\n");
         output.push_str(&format!("#EXT-X-TARGETDURATION:{}\r\n", self.target_duration.ceil() as u64));
         output.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\r\n", self.media_sequence));
 
@@ -113,8 +118,13 @@ impl M3u8Generator {
         self.next_sequence
     }
 
-    /// Get the filename for a given sequence number
-    pub fn get_segment_filename(sequence: u64) -> String {
-        format!("segment_{}.ts", sequence)
+    /// Slot-based segment filename (fixed pool, overwritten each lap).
+    pub fn slot_filename(sequence: u64, max_segments: usize) -> String {
+        let slots = max_segments.max(1) as u64;
+        format!("segment_{}.ts", sequence % slots)
+    }
+
+    pub fn max_segments(&self) -> usize {
+        self.max_segments
     }
 }

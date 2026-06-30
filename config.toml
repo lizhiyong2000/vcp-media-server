@@ -12,7 +12,7 @@ port = 8081
 
 [hls]
 enabled = true
-segment_duration = 4
+segment_duration = 2
 max_segments = 10
 output_dir = "./hls"
 

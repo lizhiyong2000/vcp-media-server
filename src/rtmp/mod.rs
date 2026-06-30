@@ -80,6 +80,7 @@ fn fmt_amf0(val: &amf0::Amf0Value) -> String {
 
 struct RtmpConnection {
     stream_manager: Arc<StreamManager>,
+    hls_server: Option<Arc<crate::hls::HlsServer>>,
     session: RtmpSession,
     writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     chunk_size: usize,
@@ -93,11 +94,13 @@ struct RtmpConnection {
 impl RtmpConnection {
     fn new(
         stream_manager: Arc<StreamManager>,
+        hls_server: Option<Arc<crate::hls::HlsServer>>,
         writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
         peer_addr: &str,
     ) -> Self {
         Self {
             stream_manager,
+            hls_server,
             session: RtmpSession::new(peer_addr),
             writer,
             chunk_size: 4096,
@@ -113,11 +116,16 @@ impl RtmpConnection {
 pub struct RtmpServer {
     stream_manager: Arc<StreamManager>,
     port: u16,
+    hls_server: Option<Arc<crate::hls::HlsServer>>,
 }
 
 impl RtmpServer {
-    pub fn new(stream_manager: Arc<StreamManager>, port: u16) -> Self {
-        Self { stream_manager, port }
+    pub fn new(
+        stream_manager: Arc<StreamManager>,
+        port: u16,
+        hls_server: Option<Arc<crate::hls::HlsServer>>,
+    ) -> Self {
+        Self { stream_manager, port, hls_server }
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -137,8 +145,9 @@ impl RtmpServer {
                     info!("[RTMP] New connection from {}", peer_addr);
                     info!("[RTMP] Connection ID: {:?}", socket.peer_addr());
                     let manager = self.stream_manager.clone();
+                    let hls = self.hls_server.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(socket, manager, peer_addr).await {
+                        if let Err(e) = Self::handle_connection(socket, manager, hls, peer_addr).await {
                             error!("[RTMP] Connection error from {}: {}", peer_addr, e);
                         }
                     });
@@ -151,11 +160,16 @@ impl RtmpServer {
         }
     }
 
-    async fn handle_connection(socket: TcpStream, manager: Arc<StreamManager>, peer_addr: std::net::SocketAddr) -> Result<()> {
+    async fn handle_connection(
+        socket: TcpStream,
+        manager: Arc<StreamManager>,
+        hls_server: Option<Arc<crate::hls::HlsServer>>,
+        peer_addr: std::net::SocketAddr,
+    ) -> Result<()> {
         let (mut reader, writer) = socket.into_split();
         let writer = Arc::new(Mutex::new(writer));
         let mut buf = BytesMut::with_capacity(8192);
-        let mut conn = RtmpConnection::new(manager.clone(), writer.clone(), &peer_addr.to_string());
+        let mut conn = RtmpConnection::new(manager.clone(), hls_server, writer.clone(), &peer_addr.to_string());
         let mut chunk_size: usize = 128;
         let mut bytes_received = 0;
         let mut handshake_done = false;
@@ -380,8 +394,8 @@ impl RtmpServer {
                         peer_addr, msg.timestamp, data.len(), conn.frames_received);
                 }
                 conn.frames_received += 1;
-                if conn.is_publishing {
-                    // Skip audio tag header
+                if conn.is_publishing && !is_header {
+                    // Skip audio tag header; do not mux AAC sequence header as media
                     let audio_data = if data.len() > 1 && data[0] == 0xAF && data[1] == 0x01 {
                         &data[2..]
                     } else if data.len() > 1 {
@@ -528,6 +542,13 @@ impl RtmpServer {
                 // conn.stream_manager.add_stream(&stream_name);
                 conn.stream_manager.set_stream_broadcast(&stream_name);
                 _= conn.stream_manager.set_publishing(&stream_name);
+
+                if let Some(hls) = conn.hls_server.clone() {
+                    let name = stream_name.clone();
+                    tokio::spawn(async move {
+                        let _ = hls.restart_stream(&name).await;
+                    });
+                }
             }
             "play" => {
                 let play_stream_id = conn.session.handle_play(args);

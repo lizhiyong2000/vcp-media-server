@@ -143,20 +143,28 @@ async fn main() -> Result<()> {
         info!("Created stream: {} (source: {:?}, protocol: {:?})", stream_config.id, source_clone, protocol_clone);
     }
 
-    let rtmp_server = rtmp::RtmpServer::new(stream_manager.clone(), config.rtmp.port);
     let rtsp_server = rtsp::RtspServer::new(stream_manager.clone(), config.rtsp.port);
     let webrtc_server = webrtc::WebrtcServer::new(stream_manager.clone(), config.webrtc.port);
     
     // Initialize HLS server
     let hls_config = config.hls.as_ref().map(|h| HlsModuleConfig {
         enabled: h.enabled,
-        segment_duration: h.segment_duration.unwrap_or(4.0),
+        segment_duration: h.segment_duration.unwrap_or(2.0),
         max_segments: h.max_segments.unwrap_or(10),
         output_dir: h.output_dir.clone().unwrap_or("./hls".to_string()),
     }).unwrap_or_default();
     
     let hls_server = Arc::new(hls::HlsServer::new(stream_manager.clone(), hls_config.clone()));
-    let hls_server_http = hls_server.clone();
+    let hls_server_http = if hls_config.enabled {
+        Some(hls_server.clone())
+    } else {
+        None
+    };
+    let hls_server_rtmp = if hls_config.enabled {
+        Some(hls_server.clone())
+    } else {
+        None
+    };
     
     // Initialize HTTP-FLV server
     let http_flv_server = Arc::new(http_flv::HttpFlvServer::new(stream_manager.clone()));
@@ -165,9 +173,11 @@ async fn main() -> Result<()> {
     let http_server = http::HttpServer::new(
         stream_manager.clone(), 
         config.http.port,
-        Some(hls_server_http),
+        hls_server_http,
         Some(http_flv_server_http),
     );
+
+    let rtmp_server = rtmp::RtmpServer::new(stream_manager.clone(), config.rtmp.port, hls_server_rtmp);
 
     tokio::spawn(async move {
         if let Err(e) = rtmp_server.start().await {
