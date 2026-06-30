@@ -136,6 +136,16 @@ pub fn contains_idr_nalu(data: &[u8]) -> bool {
     contains_nalu_type(data, 5)
 }
 
+/// True if buffer contains a VCL NAL (non-IDR slice or IDR).
+pub fn contains_vcl_nalu(data: &[u8]) -> bool {
+    for (start, _) in iter_annex_b_nal_ranges(data) {
+        if matches!(nalu_type(data, start), Some(1) | Some(5)) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn contains_sps_or_pps_nalu(data: &[u8]) -> bool {
     contains_nalu_type(data, 7) || contains_nalu_type(data, 8)
 }

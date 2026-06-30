@@ -13,8 +13,8 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 
 use crate::core::{CodecType, MediaFrame, StreamManager};
 use super::h264_util::{
-    contains_idr_nalu, contains_sps_or_pps_nalu, describe_annex_b, duration_from_rtp_timestamps,
-    ensure_annex_b, extract_sps_pps, is_parameter_set_only, iter_annex_b_nal_ranges,
+    contains_idr_nalu, contains_sps_or_pps_nalu, describe_annex_b, ensure_annex_b, extract_sps_pps,
+    is_parameter_set_only, is_rtp_timestamp_after, is_rtp_timestamp_before, iter_annex_b_nal_ranges,
     looks_like_h265_misread_as_h264,
 };
 use super::outbound_h264::{annex_b_with_config, OutboundH264Track};
@@ -27,6 +27,9 @@ use super::signaling::ServerSignal;
 use webrtc::api::API;
 
 pub use super::play_relay::cancel_play_relay;
+
+/// Fixed playout interval — keeps WebRTC sample timing stable (25 fps ≈ 40 ms).
+const PLAY_FRAME_DURATION: Duration = Duration::from_millis(40);
 
 pub struct PlaySession {
     pub answer_sdp: String,
@@ -212,13 +215,18 @@ fn collect_available_frames(
 fn drain_to_latest_idr(rx: &mut tokio::sync::broadcast::Receiver<MediaFrame>) -> Option<MediaFrame> {
     use tokio::sync::broadcast::error::TryRecvError;
 
-    let mut latest_idr = None;
+    let mut latest_idr: Option<MediaFrame> = None;
     loop {
         match rx.try_recv() {
             Ok(frame) => {
-                if is_idr_frame(&frame) {
-                    latest_idr = Some(frame);
+                if !is_idr_frame(&frame) {
+                    continue;
                 }
+                latest_idr = Some(match latest_idr {
+                    None => frame,
+                    Some(prev) if is_rtp_timestamp_after(frame.timestamp, prev.timestamp) => frame,
+                    Some(prev) => prev,
+                });
             }
             Err(TryRecvError::Lagged(_)) => continue,
             Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
@@ -294,7 +302,7 @@ async fn relay_stream_to_track(
     let mut streaming = false;
     let mut pace_next = Instant::now();
     let mut last_sent_ts: Option<u64> = None;
-    let wait_start = Instant::now();
+    let mut wait_start = Instant::now();
     const KEYFRAME_WAIT: Duration = Duration::from_secs(10);
 
     info!("[WebRTC] Play relay loop started for stream='{}'", stream_id);
@@ -325,6 +333,8 @@ async fn relay_stream_to_track(
                     );
                     streaming = false;
                     pace_next = Instant::now();
+                    wait_start = Instant::now();
+                    last_sent_ts = None;
                     request_publisher_keyframe(&stream_id);
                     pending.clear();
                     if let Some(idr) = drain_to_latest_idr(&mut rx) {
@@ -367,9 +377,32 @@ async fn relay_stream_to_track(
             continue;
         }
 
+        if streaming {
+            if let Some(prev) = last_sent_ts {
+                if is_rtp_timestamp_before(frame.timestamp, prev) && !is_idr {
+                    debug!(
+                        "[WebRTC] Play drop stale frame stream='{}' ts={} last={}",
+                        stream_id, frame.timestamp, prev
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+
         if !streaming {
             let can_start = is_idr || frame.is_keyframe;
             if !can_start {
+                if rtp_sent > 0 {
+                    skipped += 1;
+                    if skipped == 1 || skipped % 50 == 0 {
+                        debug!(
+                            "[WebRTC] Play wait IDR (resync) stream='{}' ts={} skipped={}",
+                            stream_id, frame.timestamp, skipped
+                        );
+                    }
+                    continue;
+                }
                 if wait_start.elapsed() < KEYFRAME_WAIT {
                     skipped += 1;
                     if skipped == 1 || skipped % 25 == 0 {
@@ -389,6 +422,7 @@ async fn relay_stream_to_track(
                 );
             }
             streaming = true;
+            last_sent_ts = None;
             sample_data = prepend_stream_config(&manager, &stream_id, &sample_data);
             info!(
                 "[WebRTC] Play streaming started stream='{}' ts={} [{}] idr={} replay={}",
@@ -398,7 +432,7 @@ async fn relay_stream_to_track(
             sample_data = prepend_stream_config(&manager, &stream_id, &sample_data);
         }
 
-        let duration = duration_from_rtp_timestamps(last_sent_ts, frame.timestamp);
+        let duration = PLAY_FRAME_DURATION;
         let now = Instant::now();
         if pace_next > now {
             tokio::time::sleep(pace_next - now).await;
@@ -499,28 +533,7 @@ async fn recv_next_frame(
             }
             result = rx.recv() => {
                 match result {
-                    Ok(mut frame) => {
-                        let mut skipped = 0u64;
-                        let mut lagged = 0u64;
-                        loop {
-                            use tokio::sync::broadcast::error::TryRecvError;
-                            match rx.try_recv() {
-                                Ok(f) => {
-                                    frame = f;
-                                    skipped += 1;
-                                }
-                                Err(TryRecvError::Lagged(n)) => lagged = lagged.saturating_add(n),
-                                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
-                            }
-                        }
-                        if lagged > 0 {
-                            return Ok(RecvNext::Lagged(lagged));
-                        }
-                        if skipped > 0 {
-                            return Ok(RecvNext::Lagged(skipped));
-                        }
-                        return Ok(RecvNext::Frame(frame));
-                    }
+                    Ok(frame) => return Ok(RecvNext::Frame(frame)),
                     Err(RecvError::Lagged(n)) => {
                         if n > 0 {
                             return Ok(RecvNext::Lagged(n));
@@ -537,6 +550,10 @@ fn store_live_nalu_config(manager: &StreamManager, stream_id: &str, data: &[u8])
     let (sps, pps) = extract_sps_pps(data);
     if let (Some(sps), Some(pps)) = (sps, pps) {
         manager.set_stream_sps_pps(stream_id, sps, pps);
+        return;
+    }
+    // Only fill missing SPS/PPS — do not overwrite SDP/sequence-header config from stray RTP NALUs.
+    if stream_has_config(manager, stream_id) {
         return;
     }
     for (start, end) in iter_annex_b_nal_ranges(data) {

@@ -404,6 +404,8 @@ URL 格式：
 TC-WEBRTC-01  浏览器 WebRTC 推流
 TC-WEBRTC-02  浏览器 WebRTC 播放（播放 WebRTC 或 RTMP 推入的同一 stream_id）
 TC-WEBRTC-03  RTMP 推流 + WebRTC 播放（跨协议）
+TC-WEBRTC-04  RTSP 推流 + WebRTC 播放（跨协议）
+TC-WEBRTC-05  RTSP 拉流 + WebRTC 播放（跨协议）
 
 --------------------------------------------------------------------------------
 TC-WEBRTC-01  浏览器 WebRTC 推流
@@ -452,6 +454,40 @@ ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=25 -pix_fmt yuv420p \
 
 日志关键字：
   grep -E "WebRTC|Publish|Play|First published|First played" logs/media-server.log.*
+
+--------------------------------------------------------------------------------
+TC-WEBRTC-04  RTSP 推流 + WebRTC 播放
+--------------------------------------------------------------------------------
+
+终端 A — RTSP 推流（ffmpeg ANNOUNCE/RECORD）：
+ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=25 -pix_fmt yuv420p \
+  -c:v libx264 -preset ultrafast -tune zerolatency -g 50 -an \
+  -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:554/live/rtsp_webrtc
+
+浏览器 — WebRTC 播放：
+  stream_id = rtsp_webrtc
+  http://127.0.0.1:8081/webrtc/webrtc-test.html → 连接 → 开始播放
+
+日志应出现：
+  [RTSP-Push] First access unit stream='rtsp_webrtc' ...
+  [WebRTC] Play streaming started stream='rtsp_webrtc' ...
+
+--------------------------------------------------------------------------------
+TC-WEBRTC-05  RTSP 拉流 + WebRTC 播放
+--------------------------------------------------------------------------------
+
+1) 先有一个可拉取的 RTSP 源（本地或其他 ffmpeg 推到的地址）
+2) HTTP API 拉流到本地 stream_id：
+curl -X POST http://127.0.0.1:8081/api/rtsp/pull \
+  -H 'Content-Type: application/json' \
+  -d '{"remote_url":"rtsp://127.0.0.1:554/live/rtsp_webrtc","local_stream_id":"rtsp_pull_play"}'
+
+3) 浏览器 WebRTC 播放 stream_id = rtsp_pull_play
+
+日志应出现：
+  [RTSP Puller] SUCCESS: RTSP Pull started for stream rtsp_pull_play
+  [RTSP-Pull] First access unit stream='rtsp_pull_play' ...
+  [WebRTC] Play streaming started stream='rtsp_pull_play' ...
 
 
 ================================================================================

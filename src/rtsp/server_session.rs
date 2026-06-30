@@ -8,6 +8,7 @@ use tracing::{info, warn, error, debug};
 use bytes::BytesMut;
 
 use crate::core::{StreamManager, MediaFrame, CodecType};
+use crate::webrtc::H264RtpIngest;
 use super::{RtspRequest, RtspResponse, RtspSession, TransportMode, RtspServer};
 use super::common::RtspCommon;
 
@@ -42,6 +43,7 @@ pub struct RtspServerSession {
     // H264 codec parameters
     sps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     pps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
+    h264_ingest: Option<H264RtpIngest>,
     // Track the session state for SDP generation
     sdp_generated: Arc<parking_lot::RwLock<bool>>,
 }
@@ -74,6 +76,7 @@ impl RtspServerSession {
             udp_sockets: None,
             sps_cache: Arc::new(parking_lot::RwLock::new(None)),
             pps_cache: Arc::new(parking_lot::RwLock::new(None)),
+            h264_ingest: None,
             sdp_generated: Arc::new(parking_lot::RwLock::new(false)),
         }
     }
@@ -579,122 +582,77 @@ impl RtspServerSession {
             let track_id = channel / 2;
             let rtp_payload = &data[4..];
 
-            if rtp_payload.len() >= 12 {
-                let version = (rtp_payload[0] >> 6) & 0x03;
-                let padding = (rtp_payload[0] >> 5) & 0x01;
-                let extension = (rtp_payload[0] >> 4) & 0x01;
-                let csrc_count = rtp_payload[0] & 0x0F;
-                let is_keyframe = (rtp_payload[1] & 0x80) != 0;
-                let payload_type = rtp_payload[1] & 0x7F;
-                let seq_num = ((rtp_payload[2] as u16) << 8) | (rtp_payload[3] as u16);
-                let rtp_timestamp = ((rtp_payload[4] as u32) << 24)
-                    | ((rtp_payload[5] as u32) << 16)
-                    | ((rtp_payload[6] as u32) << 8)
-                    | (rtp_payload[7] as u32);
-                let ssrc = ((rtp_payload[8] as u32) << 24)
-                    | ((rtp_payload[9] as u32) << 16)
-                    | ((rtp_payload[10] as u32) << 8)
-                    | (rtp_payload[11] as u32);
-
-                info!("[RTSP] [{}] Parsed RTP packet: stream_id={}, track_id={}, version={}, padding={}, extension={}, csrc_count={}, payload_type={}, seq={}, timestamp={}, ssrc={}, is_keyframe={}, payload_len={}", 
-                       self.peer_addr, stream_id, track_id, version, padding, extension, csrc_count, payload_type, seq_num, rtp_timestamp, ssrc, is_keyframe, rtp_payload.len());
-
-                let codec = if track_id == 0 { CodecType::H264 } else { CodecType::AAC };
-
-                // Skip RTP header (12 bytes) to get actual media payload
-                let media_payload = &rtp_payload[12..];
-                
-                // Calculate header extensions size if present
-                let mut payload_offset = 12;
-                if extension != 0 && media_payload.len() >= 4 {
-                    let ext_length = ((media_payload[2] as usize) << 8 | media_payload[3] as usize) * 4 + 4;
-                    payload_offset += ext_length;
-                }
-                
-                let actual_payload = &media_payload[payload_offset - 12..];
-                
-                // Extract SPS/PPS from H264 RTP payload for video tracks
-                // Handle both single NAL units and FU-A fragmentation
-                // SPS (NAL type 7) and PPS (NAL type 8) are not keyframes but contain codec parameters
-                if track_id == 0 && actual_payload.len() > 0 {
-                    debug!("[RTSP SPS/PPS] [{}] Attempting to extract SPS/PPS from H264 payload, length={} bytes", 
-                           self.peer_addr, actual_payload.len());
-                    
-                    let (sps, pps) = Self::extract_h264_sps_pps_from_payload(actual_payload);
-                    
-                    if let Some(sps_data) = sps {
-                        let mut cached = self.sps_cache.write();
-                        if cached.is_none() {
-                            info!("[RTSP SPS/PPS] [{}] Successfully extracted SPS ({} bytes) from RTP payload", 
-                                  self.peer_addr, sps_data.len());
-                            debug!("[RTSP SPS/PPS] [{}] SPS content (first 20 bytes): {:02X?}", 
-                                   self.peer_addr, &sps_data[..std::cmp::min(20, sps_data.len())]);
-                            *cached = Some(sps_data.clone());
-                            
-                            let pps_to_use = pps.clone().or_else(|| {
-                                self.pps_cache.read().clone()
-                            }).unwrap_or_else(|| {
-                                warn!("[RTSP SPS/PPS] [{}] No PPS available, using default", self.peer_addr);
-                                vec![0x38, 0xCE, 0x6C]
-                            });
-                            
-                            info!("[RTSP SPS/PPS] [{}] Setting SPS/PPS to StreamManager for stream {}", 
-                                  self.peer_addr, stream_id);
-                            self.manager.set_stream_sps_pps(stream_id, sps_data, pps_to_use);
-                        } else {
-                            debug!("[RTSP SPS/PPS] [{}] SPS already cached, skipping update", self.peer_addr);
-                        }
-                    } else {
-                        debug!("[RTSP SPS/PPS] [{}] No SPS found in payload", self.peer_addr);
-                    }
-                    
-                    if let Some(pps_data) = pps {
-                        let mut cached = self.pps_cache.write();
-                        if cached.is_none() {
-                            info!("[RTSP SPS/PPS] [{}] Successfully extracted PPS ({} bytes) from RTP payload", 
-                                  self.peer_addr, pps_data.len());
-                            debug!("[RTSP SPS/PPS] [{}] PPS content (first 20 bytes): {:02X?}", 
-                                   self.peer_addr, &pps_data[..std::cmp::min(20, pps_data.len())]);
-                            *cached = Some(pps_data.clone());
-                            
-                            if let Some(sps_data) = self.sps_cache.read().clone() {
-                                info!("[RTSP SPS/PPS] [{}] SPS already cached, updating StreamManager with complete SPS/PPS", 
-                                      self.peer_addr);
-                                self.manager.set_stream_sps_pps(stream_id, sps_data, pps_data);
-                            } else {
-                                debug!("[RTSP SPS/PPS] [{}] PPS cached but SPS not yet available", self.peer_addr);
-                            }
-                        } else {
-                            debug!("[RTSP SPS/PPS] [{}] PPS already cached, skipping update", self.peer_addr);
-                        }
-                    } else {
-                        debug!("[RTSP SPS/PPS] [{}] No PPS found in payload", self.peer_addr);
-                    }
-                } else if track_id == 0 {
-                    debug!("[RTSP SPS/PPS] [{}] Skipping SPS/PPS extraction: payload empty ({} bytes)", 
-                           self.peer_addr, actual_payload.len());
-                }
-                
-                let interleaved_data = data.to_vec();
-                let frame = MediaFrame {
-                    stream_id: stream_id.clone(),
-                    track_id: track_id as u8,
-                    timestamp: rtp_timestamp as u64,
-                    data: actual_payload.to_vec().into(),
-                    is_keyframe,
-                    codec,
-                    rtp_data: Some(interleaved_data.clone().into()),
-                };
-
-                info!("[RTSP] [{}] Publishing frame: stream_id={}, track_id={}, timestamp={}, is_keyframe={}, codec={}, payload_len={}, interleaved_len={}", 
-                       self.peer_addr, frame.stream_id, frame.track_id, frame.timestamp, frame.is_keyframe, frame.codec as u8, frame.data.len(), interleaved_data.len());
-                self.manager.publish_frame(frame);
-                info!("[RTSP] [{}] Frame published successfully", self.peer_addr);
-            } else {
-                warn!("[RTSP] [{}] RTP payload too short: {} bytes, need at least 12 bytes for header", self.peer_addr, rtp_payload.len());
+            if rtp_payload.len() < 12 {
+                warn!(
+                    "[RTSP] [{}] RTP payload too short: {} bytes",
+                    self.peer_addr,
+                    rtp_payload.len()
+                );
+                return;
             }
+
+            let marker = (rtp_payload[1] & 0x80) != 0;
+            let rtp_timestamp = u32::from_be_bytes([
+                rtp_payload[4],
+                rtp_payload[5],
+                rtp_payload[6],
+                rtp_payload[7],
+            ]);
+
+            if track_id == 0 {
+                if self.h264_ingest.is_none() {
+                    self.h264_ingest = Some(H264RtpIngest::new(
+                        Arc::clone(&self.manager),
+                        stream_id.clone(),
+                        "RTSP-Push",
+                    ));
+                }
+                if let Some(ingest) = &mut self.h264_ingest {
+                    ingest.ingest_rtp_packet(rtp_payload);
+                }
+                self.sync_codec_cache_from_manager(stream_id);
+                return;
+            }
+
+            // Audio / other tracks: pass through as before
+            let payload_type = rtp_payload[1] & 0x7F;
+            let codec = if payload_type == 97 {
+                CodecType::AAC
+            } else {
+                CodecType::AAC
+            };
+            let media_payload = crate::webrtc::rtp_h264_media_payload(rtp_payload)
+                .map(|(p, _, _)| p)
+                .unwrap_or(&rtp_payload[12..]);
+
+            let frame = MediaFrame {
+                stream_id: stream_id.clone(),
+                track_id: track_id as u8,
+                timestamp: rtp_timestamp as u64,
+                data: media_payload.to_vec().into(),
+                is_keyframe: marker,
+                codec,
+                rtp_data: Some(data.to_vec().into()),
+            };
+            self.manager.publish_frame(frame);
         } else {
-            warn!("[RTSP] [{}] Received RTP data but stream_id not set, dropping packet", self.peer_addr);
+            warn!(
+                "[RTSP] [{}] Received RTP data but stream_id not set, dropping packet",
+                self.peer_addr
+            );
+        }
+    }
+
+    fn sync_codec_cache_from_manager(&self, stream_id: &str) {
+        if let Some(stream) = self.manager.get_stream(&stream_id.to_string()) {
+            if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
+                if self.sps_cache.read().is_none() {
+                    *self.sps_cache.write() = Some(sps.clone());
+                }
+                if self.pps_cache.read().is_none() {
+                    *self.pps_cache.write() = Some(pps.clone());
+                }
+            }
         }
     }
 

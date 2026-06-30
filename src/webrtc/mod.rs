@@ -1,13 +1,17 @@
 mod h264_util;
+mod h264_rtp_ingest;
 mod outbound_h264;
 mod peer;
 mod rtp_h264;
 mod sdp_h264;
+pub use sdp_h264::parse_sprop_parameter_sets;
 mod play_relay;
 mod player;
 mod publisher;
 mod publish_signaling;
 mod signaling;
+
+pub use h264_rtp_ingest::{H264RtpIngest, rtp_h264_media_payload};
 
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};

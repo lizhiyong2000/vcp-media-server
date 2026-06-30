@@ -430,8 +430,8 @@ impl StreamManager {
         let mut streams = self.streams.write();
         if let Some(stream) = streams.get_mut(stream_id) {
             match nal_type {
-                7 => stream.sps = Some(nalu.to_vec()),
-                8 => stream.pps = Some(nalu.to_vec()),
+                7 if stream.sps.is_none() => stream.sps = Some(nalu.to_vec()),
+                8 if stream.pps.is_none() => stream.pps = Some(nalu.to_vec()),
                 _ => {}
             }
             if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {

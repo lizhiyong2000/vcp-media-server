@@ -211,13 +211,7 @@ impl RtspServer {
                 // Save SPS/PPS to session
                 session.sps = sps.clone();
                 session.pps = pps.clone();
-                
-                // Save SPS/PPS to stream so it can be used in DESCRIBE responses
-                if let (Some(sps_data), Some(pps_data)) = (&sps, &pps) {
-                    manager.set_stream_sps_pps(&stream_id, sps_data.clone(), pps_data.clone());
-                    info!("[RTSP] [{}] ANNOUNCE SPS/PPS saved to stream {}", peer_addr, stream_id);
-                }
-                
+
                 let tracks_to_create = if tracks.is_empty() {
                     vec![
                         Track {
@@ -238,11 +232,17 @@ impl RtspServer {
                 } else {
                     tracks
                 };
-                
+
                 info!("[RTSP] [{}] ANNOUNCE creating stream with {} tracks", peer_addr, tracks_to_create.len());
                 manager.create_stream(&stream_id, StreamSourceMode::Push, StreamProtocol::RTSP, None);
                 manager.set_stream_tracks(&stream_id, tracks_to_create.clone());
-                
+
+                // Must set SPS/PPS after create_stream (stream must exist in manager).
+                if let (Some(sps_data), Some(pps_data)) = (&sps, &pps) {
+                    manager.set_stream_sps_pps(&stream_id, sps_data.clone(), pps_data.clone());
+                    info!("[RTSP] [{}] ANNOUNCE SPS/PPS saved to stream {}", peer_addr, stream_id);
+                }
+
                 info!("[RTSP] [{}] ANNOUNCE added {} tracks to stream", peer_addr, tracks_to_create.len());
                 
                 let _ = manager.set_unpublished(&stream_id);
@@ -260,6 +260,9 @@ impl RtspServer {
                 if session.session_id.is_none() {
                     session.session_id = Some(rand_id());
                 }
+
+                manager.ensure_stream_broadcast(&stream_id);
+                let _ = manager.set_publishing(&stream_id);
                 
                 let session_id = session.session_id.as_ref().unwrap();
                 let response = Self::build_record_response(cseq, session_id);

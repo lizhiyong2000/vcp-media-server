@@ -6,6 +6,7 @@ use tokio::time::Duration;
 use tracing::{info, warn, error, debug};
 
 use crate::core::{StreamManager, Track, CodecType, MediaFrame, StreamSourceMode, StreamProtocol};
+use crate::webrtc::H264RtpIngest;
 use super::client_session::RtspClientSession;
 use super::RtspRequest;
 
@@ -70,6 +71,21 @@ impl RtspPuller {
         info!("[RTSP Puller] [Step 3/4] Creating stream {} with {} tracks", local_stream_id, tracks_to_create.len());
         self.stream_manager.create_stream(local_stream_id, StreamSourceMode::Pull, StreamProtocol::RTSP, Some(remote_url.to_string()));
         let _ = self.stream_manager.set_unpublished(local_stream_id);
+        self.stream_manager.ensure_stream_broadcast(local_stream_id);
+
+        // Prime SPS/PPS from remote SDP when available (helps WebRTC play before first IDR).
+        use crate::webrtc::parse_sprop_parameter_sets;
+        let (sdp_sps, sdp_pps) = parse_sprop_parameter_sets(sdp);
+        if let (Some(sps), Some(pps)) = (sdp_sps, sdp_pps) {
+            info!(
+                "[RTSP Puller] Primed SPS/PPS from SDP stream='{}' sps={} pps={}",
+                local_stream_id,
+                sps.len(),
+                pps.len()
+            );
+            self.stream_manager
+                .set_stream_sps_pps(local_stream_id, sps, pps);
+        }
 
         info!("[RTSP Puller] [Step 3/4] Setting up {} tracks...", tracks_to_create.len());
         for (idx, _track) in tracks_to_create.iter().enumerate() {
@@ -109,11 +125,11 @@ impl RtspPuller {
     }
 
     async fn rtp_receive_loop(mut reader: tokio::net::tcp::OwnedReadHalf, manager: Arc<StreamManager>, stream_id: String) {
-        let mut buffer = BytesMut::with_capacity(8192);
         let mut rtsp_response = String::new();
         let mut frame_count: u64 = 0;
         let mut bytes_received: u64 = 0;
         let mut last_log_time = std::time::Instant::now();
+        let mut h264_ingest = H264RtpIngest::new(manager.clone(), stream_id.clone(), "RTSP-Pull");
         
         info!("[RTSP Puller] [RTP Loop] Starting RTP receive loop for stream {}", stream_id);
         
@@ -135,54 +151,52 @@ impl RtspPuller {
                 let length = ((header[1] as usize) << 8) | (header[2] as usize);
                 bytes_received += length as u64;
 
-                let mut payload = vec![0u8; length];
-                if let Err(e) = reader.read_exact(&mut payload).await {
+                let mut rtp_payload = vec![0u8; length];
+                if let Err(e) = reader.read_exact(&mut rtp_payload).await {
                     error!("[RTSP Puller] [RTP Loop] RTP payload read error: {}", e);
                     break;
                 }
 
-                buffer.clear();
-                buffer.extend_from_slice(&[0x24]);
-                buffer.extend_from_slice(&header);
-                buffer.extend_from_slice(&payload);
-
                 let track_id = channel / 2;
-                let rtp_payload = &buffer[4..];
 
-                if rtp_payload.len() >= 12 {
-                    frame_count += 1;
-                    let is_keyframe = (rtp_payload[1] & 0x80) != 0;
+                if track_id == 0 && rtp_payload.len() >= 12 {
+                    if h264_ingest.ingest_rtp_packet(&rtp_payload) {
+                        frame_count += 1;
+                    }
+                } else if rtp_payload.len() >= 12 {
+                    let marker = (rtp_payload[1] & 0x80) != 0;
+                    let ts = u64::from(u32::from_be_bytes(
+                        rtp_payload[4..8].try_into().unwrap_or([0; 4]),
+                    ));
                     let payload_type = rtp_payload[1] & 0x7F;
-                    
-                    let ts = u64::from(u32::from_be_bytes(rtp_payload[4..8].try_into().unwrap()));
-                    let codec = if payload_type == 96 {
-                        CodecType::H264
-                    } else if payload_type == 97 {
+                    let codec = if payload_type == 97 {
                         CodecType::AAC
                     } else {
-                        CodecType::H264
+                        CodecType::AAC
                     };
-                    
+                    let media = crate::webrtc::rtp_h264_media_payload(&rtp_payload)
+                        .map(|(p, _, _)| p)
+                        .unwrap_or(&rtp_payload[12..]);
                     let frame = MediaFrame {
                         stream_id: stream_id.clone(),
                         track_id,
                         timestamp: ts,
-                        data: payload.clone().into(),
-                        is_keyframe,
+                        data: media.to_vec().into(),
+                        is_keyframe: marker,
                         codec,
                         rtp_data: None,
                     };
-                    
                     manager.publish_frame(frame);
+                    frame_count += 1;
+                }
                     
-                    let elapsed = last_log_time.elapsed();
-                    if elapsed >= Duration::from_secs(10) {
-                        let fps = frame_count as f64 / elapsed.as_secs_f64();
-                        let bps = bytes_received as f64 / elapsed.as_secs_f64();
-                        info!("[RTSP Puller] [RTP Loop] Stats - Frames: {}, Bytes: {}, FPS: {:.2}, BPS: {:.2} KB/s", 
-                              frame_count, bytes_received, fps, bps / 1024.0);
-                        last_log_time = std::time::Instant::now();
-                    }
+                let elapsed = last_log_time.elapsed();
+                if elapsed >= Duration::from_secs(10) {
+                    let fps = frame_count as f64 / elapsed.as_secs_f64();
+                    let bps = bytes_received as f64 / elapsed.as_secs_f64();
+                    info!("[RTSP Puller] [RTP Loop] Stats - Frames: {}, Bytes: {}, FPS: {:.2}, BPS: {:.2} KB/s", 
+                          frame_count, bytes_received, fps, bps / 1024.0);
+                    last_log_time = std::time::Instant::now();
                 }
             } else {
                 rtsp_response.push(first_byte[0] as char);
@@ -192,6 +206,9 @@ impl RtspPuller {
                 }
             }
         }
+
+        h264_ingest.flush_remaining();
+        let _ = manager.set_unpublished(&stream_id);
         
         info!("[RTSP Puller] [RTP Loop] RTP receive loop ended for stream {}", stream_id);
     }
