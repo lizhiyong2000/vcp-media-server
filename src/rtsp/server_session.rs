@@ -252,12 +252,27 @@ impl RtspServerSession {
     pub async fn start(mut self) {
         info!("[RTSP] [{}] Starting session handler", self.peer_addr);
 
-        if let Err(e) = self.read_loop().await {
+        let result = self.read_loop().await;
+        self.cleanup_on_disconnect();
+
+        if let Err(e) = result {
             error!("[RTSP] [{}] Session error: {}", self.peer_addr, e);
         }
 
         self.running = false;
         info!("[RTSP] [{}] Session handler stopped", self.peer_addr);
+    }
+
+    /// Stop PLAY egress when the client disconnects without TEARDOWN.
+    fn cleanup_on_disconnect(&mut self) {
+        if self.rtp_sender_abort.is_some() || self.session.rtp_task_started {
+            info!(
+                "[RTSP] [{}] Client disconnected — stopping PLAY RTP sender",
+                self.peer_addr
+            );
+        }
+        self.abort_rtp_sender();
+        self.session.playing = false;
     }
 
     async fn read_loop(&mut self) -> Result<()> {
@@ -799,7 +814,7 @@ impl RtspServerSession {
                 let mut pending: Option<MediaFrame> =
                     prime_rtsp_play_rx(&mut rx, &manager, &stream_id).await;
 
-                loop {
+                'rtp: loop {
                     let frame = if let Some(f) = pending.take() {
                         f
                     } else {
@@ -819,7 +834,7 @@ impl RtspServerSession {
                                 }
                                 continue;
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break 'rtp,
                         }
                     };
 
@@ -855,7 +870,7 @@ impl RtspServerSession {
                                 }
                             }
                             if send_failed {
-                                break;
+                                break 'rtp;
                             }
                         }
                         continue;
@@ -868,8 +883,11 @@ impl RtspServerSession {
                         }
                         let interleaved = RtspCommon::wrap_interleaved(&packet, frame.track_id);
                         if write_tx.send(interleaved).await.is_err() {
-                            error!("[RTSP] [{}] Failed to send RTP packet", stream_id);
-                            break;
+                            info!(
+                                "[RTSP] [{}] PLAY client {} disconnected — stopping RTP sender",
+                                stream_id, peer_addr
+                            );
+                            break 'rtp;
                         }
                     }
                     if frame_count <= 10 || frame.is_keyframe || frame_count % 100 == 0 {

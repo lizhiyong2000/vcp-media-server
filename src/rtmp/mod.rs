@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn, error, debug};
 
-use crate::core::{StreamManager, CodecType, MediaFrame, StreamSourceMode, StreamProtocol, StreamStatus};
+use crate::core::{StreamManager, CodecType, MediaFrame, StreamSourceMode, StreamProtocol, StreamStatus, drain_broadcast_lag, recv_flv_batch};
 use session::{RtmpSession, SessionState};
 use chunk::RtmpMessage;
 
@@ -89,6 +89,7 @@ struct RtmpConnection {
     frames_received: usize,
     is_publishing: bool,
     stream_id: String,
+    play_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl RtmpConnection {
@@ -109,6 +110,7 @@ impl RtmpConnection {
             frames_received: 0,
             is_publishing: false,
             stream_id: String::new(),
+            play_abort: None,
         }
     }
 }
@@ -183,6 +185,9 @@ impl RtmpServer {
             
             if len == 0 {
                 info!("[RTMP] [{}] Connection closed, bytes={}, frames={}", peer_addr, bytes_received, conn.frames_received);
+                if let Some(handle) = conn.play_abort.take() {
+                    handle.abort();
+                }
                 break;
             }
 
@@ -590,71 +595,116 @@ impl RtmpServer {
                     let stream_id_clone = play_stream_id.clone();
                     let chunk_size_val = conn.session.chunk_size;
                     let server_stream_id = conn.session.server_stream_id;
+                    if let Some(handle) = conn.play_abort.take() {
+                        handle.abort();
+                    }
                     if let Some(mut rx) = conn.stream_manager.subscribe(&play_stream_id) {
                         info!("[RTMP] [{}] Subscribed to stream '{}'", peer_addr, play_stream_id);
+
+                        let dropped = drain_broadcast_lag(&mut rx);
+                        if dropped > 0 {
+                            info!(
+                                "[RTMP] [{}] Flushed {} stale frames before live edge",
+                                peer_addr, dropped
+                            );
+                        }
 
                         // Send Stream Begin
                         let mut w = conn.writer.lock().await;
 
                         // Send onStatus(NetStream.Play.Start)
                         let status = session::build_on_status("NetStream.Play.Start", "Play started.", "status");
-                        let response = chunk::encode_message(0x14, 0, conn.session.server_stream_id, &status, conn.session.chunk_size, 3);
+                        let response = chunk::encode_message(0x14, 0, conn.session.server_stream_id, &status, conn.session.chunk_size, chunk::CSID_COMMAND);
                         w.write_all(&response).await?;
-
-                        // // Send |RtmpSampleAccess
-                        // let mut access = Vec::new();
-                        // access.extend_from_slice(&amf0::encode(&[amf0::Amf0Value::String("|RtmpSampleAccess".to_string())]));
-                        // access.extend_from_slice(&amf0::encode(&[amf0::Amf0Value::Boolean(true)]));
-                        // access.extend_from_slice(&amf0::encode(&[amf0::Amf0Value::Boolean(true)]));
-                        // let access_msg = chunk::encode_message(0x12, 0, conn.session.server_stream_id, &access, conn.session.chunk_size, 3);
-                        // w.write_all(&access_msg).await?;
 
                         if let (Some(ref sps), Some(ref pps)) = (&stream.sps, &stream.pps) {
                             let avc_header = session::build_avc_sequence_header(sps, pps);
-                            let header_msg = chunk::encode_message(0x09, 0, conn.session.server_stream_id, &avc_header, conn.session.chunk_size, 3);
+                            let header_msg = chunk::encode_message(
+                                0x09, 0, conn.session.server_stream_id, &avc_header,
+                                conn.session.chunk_size, chunk::CSID_VIDEO,
+                            );
                             w.write_all(&header_msg).await?;
                             info!("[RTMP] [{}] Sent AVC sequence header", peer_addr);
                         }
                         // Send AAC sequence header
                         let aac_header = session::build_aac_sequence_header();
-                        let aac_msg = chunk::encode_message(0x08, 0, conn.session.server_stream_id, &aac_header, conn.session.chunk_size, 3);
+                        let aac_msg = chunk::encode_message(
+                            0x08, 0, conn.session.server_stream_id, &aac_header,
+                            conn.session.chunk_size, chunk::CSID_AUDIO,
+                        );
                         w.write_all(&aac_msg).await?;
 
-                        info!("[RTMP] [{}] >>> SENT play response (onStatus+SampleAccess+AVCHeader+AACHeader)", peer_addr);
+                        info!("[RTMP] [{}] >>> SENT play response (onStatus+AVCHeader+AACHeader)", peer_addr);
                         drop(w);
 
-
-                        tokio::spawn(async move {
-                            let mut frames_sent = 0;
-                            while let Ok(frame) = rx.recv().await {
-                                if frames_sent == 0 {
-                                    info!("[RTMP] >>> SEND first frame: codec={:?} keyframe={} ts={} size={}",
-                                    frame.codec, frame.is_keyframe, frame.timestamp, frame.data.len());
-                                }
-                                let data = match frame.codec {
-                                    CodecType::H264 | CodecType::H265 => session::frame_to_rtmp_video(&frame),
-                                    CodecType::AAC | CodecType::Opus | CodecType::G711 => session::frame_to_rtmp_audio(&frame),
-                                    _ => continue,
-                                };
-                                let msg_type = match frame.codec {
-                                    CodecType::H264 | CodecType::H265 => 0x09u8,
-                                    _ => 0x08u8,
-                                };
-                                let rtmp_msg = chunk::encode_message(
-                                    msg_type, frame.timestamp as u32, server_stream_id,
-                                    &data, chunk_size_val, 3,
-                                );
-                                let mut guard = writer_clone.lock().await;
-                                if guard.write_all(&rtmp_msg).await.is_err() {
-                                    break;
-                                }
-                                frames_sent += 1;
-                                if frames_sent % 100 == 0 {
-                                    info!("[RTMP] >>> SEND {} frames to player (codec={:?} ts={})",
-                                    frames_sent, frame.codec, frame.timestamp);
+                        let peer_log = peer_addr.to_string();
+                        let handle = tokio::spawn(async move {
+                            let mut frames_sent = 0u64;
+                            let mut clock = session::RtmpPlayClock::default();
+                            loop {
+                                match recv_flv_batch(&mut rx).await {
+                                    Ok(frames) => {
+                                        for frame in frames {
+                                            if frame.codec == CodecType::AAC && frame.data.len() < 8 {
+                                                continue;
+                                            }
+                                            if frames_sent == 0 {
+                                                info!(
+                                                    "[RTMP] >>> SEND first frame: codec={:?} keyframe={} raw_ts={} size={}",
+                                                    frame.codec, frame.is_keyframe, frame.timestamp, frame.data.len()
+                                                );
+                                            }
+                                            let data = match frame.codec {
+                                                CodecType::H264 | CodecType::H265 => {
+                                                    session::frame_to_rtmp_video(&frame)
+                                                }
+                                                CodecType::AAC | CodecType::Opus | CodecType::G711 => {
+                                                    session::frame_to_rtmp_audio(&frame)
+                                                }
+                                                _ => continue,
+                                            };
+                                            if data.is_empty() {
+                                                continue;
+                                            }
+                                            let (msg_type, csid) = match frame.codec {
+                                                CodecType::H264 | CodecType::H265 => (0x09u8, chunk::CSID_VIDEO),
+                                                _ => (0x08u8, chunk::CSID_AUDIO),
+                                            };
+                                            let rtmp_ts = clock.map(&frame);
+                                            let rtmp_msg = chunk::encode_message(
+                                                msg_type,
+                                                rtmp_ts,
+                                                server_stream_id,
+                                                &data,
+                                                chunk_size_val,
+                                                csid,
+                                            );
+                                            let mut guard = writer_clone.lock().await;
+                                            if guard.write_all(&rtmp_msg).await.is_err() {
+                                                info!("[RTMP] [{}] Play client disconnected", peer_log);
+                                                return;
+                                            }
+                                            frames_sent += 1;
+                                            if frames_sent % 100 == 0 {
+                                                info!(
+                                                    "[RTMP] >>> SEND {} frames to player (codec={:?} rtmp_ts={})",
+                                                    frames_sent, frame.codec, rtmp_ts
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        info!(
+                                            "[RTMP] [{}] Play lagged {} frames — jump to live edge",
+                                            peer_log, n
+                                        );
+                                        drain_broadcast_lag(&mut rx);
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 }
                             }
                         });
+                        conn.play_abort = Some(handle.abort_handle());
                     }else{
                         warn!("[RTMP] [{}] Subscribe to stream '{}' error", peer_addr, play_stream_id);
                         let status = session::build_on_status("NetStream.Play.StreamNotFound", "Stream not found", "error");

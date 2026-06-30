@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 
-use crate::core::{StreamManager, MediaFrame, CodecType, flv_timestamp_ms};
+use crate::core::{StreamManager, MediaFrame, CodecType, media_timestamp_delta_ms};
 use crate::rtmp::session::{frame_to_rtmp_audio, frame_to_rtmp_video};
 
 /// FLV file header (9 bytes)
@@ -163,19 +163,17 @@ fn generate_metadata_tag(stream_id: &str, has_video: bool, has_audio: bool) -> V
 }
 
 /// Convert a MediaFrame to FLV video tag data (Annex B → AVCC, same as RTMP play path).
-fn frame_to_flv_video(frame: &MediaFrame) -> Vec<u8> {
+fn frame_to_flv_video(frame: &MediaFrame, timestamp: u32) -> Vec<u8> {
     let data = frame_to_rtmp_video(frame);
     if data.is_empty() {
         return Vec::new();
     }
-    let timestamp = flv_timestamp_ms(frame.codec, frame.timestamp);
     generate_flv_tag(0x09, timestamp, &data)
 }
 
 /// Convert a MediaFrame to FLV audio tag data
-fn frame_to_flv_audio(frame: &MediaFrame) -> Vec<u8> {
+fn frame_to_flv_audio(frame: &MediaFrame, timestamp: u32) -> Vec<u8> {
     let data = frame_to_rtmp_audio(frame);
-    let timestamp = flv_timestamp_ms(frame.codec, frame.timestamp);
     generate_flv_tag(0x08, timestamp, &data)
 }
 
@@ -185,6 +183,10 @@ pub struct HttpFlvSession {
     header_sent: bool,
     metadata_sent: bool,
     sequence_header_sent: bool,
+    /// Continuous FLV tag timeline from session start (not publisher absolute clock).
+    flv_out_ms: u64,
+    last_raw_video_ts: Option<u64>,
+    session_audio_frames: u64,
 }
 
 impl HttpFlvSession {
@@ -194,7 +196,33 @@ impl HttpFlvSession {
             header_sent: false,
             metadata_sent: false,
             sequence_header_sent: false,
+            flv_out_ms: 0,
+            last_raw_video_ts: None,
+            session_audio_frames: 0,
         }
+    }
+
+    /// Map publisher timestamps to a continuous session-local FLV timeline.
+    fn tag_timestamp_ms(&mut self, frame: &MediaFrame) -> u32 {
+        match frame.codec {
+            CodecType::H264 | CodecType::H265 => {
+                if let Some(last) = self.last_raw_video_ts {
+                    if frame.timestamp > last {
+                        let delta = media_timestamp_delta_ms(last, frame.timestamp);
+                        if delta > 0 && delta < 2000 {
+                            self.flv_out_ms += delta;
+                        }
+                    }
+                }
+                self.last_raw_video_ts = Some(frame.timestamp);
+            }
+            CodecType::AAC => {
+                self.flv_out_ms = self.session_audio_frames * 1024 * 1000 / 44100;
+                self.session_audio_frames += 1;
+            }
+            _ => {}
+        }
+        (self.flv_out_ms & 0xFFFF_FFFF) as u32
     }
 
     /// Generate the initial HTTP response headers for FLV streaming
@@ -244,10 +272,11 @@ impl HttpFlvSession {
     }
 
     /// Convert a media frame to FLV tag
-    pub fn frame_to_flv(&self, frame: &MediaFrame) -> Vec<u8> {
+    pub fn frame_to_flv(&mut self, frame: &MediaFrame) -> Vec<u8> {
+        let timestamp = self.tag_timestamp_ms(frame);
         match frame.codec {
-            CodecType::H264 | CodecType::H265 => frame_to_flv_video(frame),
-            CodecType::AAC | CodecType::Opus | CodecType::G711 => frame_to_flv_audio(frame),
+            CodecType::H264 | CodecType::H265 => frame_to_flv_video(frame, timestamp),
+            CodecType::AAC | CodecType::Opus | CodecType::G711 => frame_to_flv_audio(frame, timestamp),
             _ => Vec::new(),
         }
     }

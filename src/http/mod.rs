@@ -6,7 +6,7 @@ use tokio::time::{sleep, Duration, Instant};
 use tracing::{info, warn, error};
 use serde_json::json;
 
-use crate::core::{StreamManager, Track, CodecType, StreamSourceMode, StreamProtocol};
+use crate::core::{StreamManager, Track, CodecType, StreamSourceMode, StreamProtocol, drain_broadcast_lag, recv_flv_batch};
 use crate::rtsp::{RtspPuller, RtspPusher};
 use crate::rtmp::RtmpPuller;
 use crate::hls::HlsServer;
@@ -182,6 +182,10 @@ impl HttpServer {
                                 return Ok(());
                             }
                         };
+                        let dropped = drain_broadcast_lag(&mut rx);
+                        if dropped > 0 {
+                            info!("[HTTP-FLV] [{}] flushed {} stale frames before live edge", stream_id, dropped);
+                        }
 
                         // Wait for SPS/PPS before responding so players can probe codecs
                         let deadline = Instant::now() + Duration::from_secs(5);
@@ -225,8 +229,9 @@ impl HttpServer {
                         }
 
                         loop {
-                            match rx.recv().await {
-                                Ok(frame) => {
+                            match recv_flv_batch(&mut rx).await {
+                                Ok(frames) => {
+                                    for frame in frames {
                                     if frame.codec == CodecType::AAC && frame.data.len() < 8 {
                                         continue;
                                     }
@@ -253,8 +258,15 @@ impl HttpServer {
                                             break;
                                         }
                                     }
+                                    }
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    info!(
+                                        "[HTTP-FLV] [{}] lagged {} frames — jump to live edge",
+                                        stream_id_owned, n
+                                    );
+                                    drain_broadcast_lag(&mut rx);
+                                }
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
                         }

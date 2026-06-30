@@ -341,3 +341,36 @@ pub fn frame_to_rtmp_audio(frame: &MediaFrame) -> Vec<u8> {
     data.extend_from_slice(&frame.data);
     data
 }
+
+/// Map publisher timestamps (RTMP ms or RTP 90 kHz) to a session-local RTMP timeline.
+#[derive(Default)]
+pub struct RtmpPlayClock {
+    out_ms: u64,
+    last_raw_video_ts: Option<u64>,
+    audio_frames: u64,
+}
+
+impl RtmpPlayClock {
+    pub fn map(&mut self, frame: &MediaFrame) -> u32 {
+        use crate::core::{CodecType, media_timestamp_delta_ms};
+        match frame.codec {
+            CodecType::H264 | CodecType::H265 => {
+                if let Some(last) = self.last_raw_video_ts {
+                    if frame.timestamp > last {
+                        let delta = media_timestamp_delta_ms(last, frame.timestamp);
+                        if delta > 0 && delta < 2000 {
+                            self.out_ms += delta;
+                        }
+                    }
+                }
+                self.last_raw_video_ts = Some(frame.timestamp);
+            }
+            CodecType::AAC => {
+                self.out_ms = self.audio_frames * 1024 * 1000 / 44100;
+                self.audio_frames += 1;
+            }
+            _ => {}
+        }
+        (self.out_ms & 0xFFFF_FFFF) as u32
+    }
+}

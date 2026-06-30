@@ -2,7 +2,10 @@ mod config;
 mod tester;
 mod pusher;
 mod timestamp;
+mod broadcast_edge;
 pub mod protocol;
+
+pub use broadcast_edge::{drain_broadcast_lag, is_playable_video, recv_coalesced_video, recv_flv_batch};
 
 use std::collections::HashMap;
 use parking_lot::RwLock;

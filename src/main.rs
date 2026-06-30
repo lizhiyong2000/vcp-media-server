@@ -152,6 +152,9 @@ async fn main() -> Result<()> {
     }).unwrap_or_default();
 
     let hls_server = Arc::new(hls::HlsServer::new(stream_manager.clone(), hls_config.clone()));
+    if hls_config.enabled {
+        hls_server.start_idle_reaper();
+    }
     let hls_server_publish = if hls_config.enabled {
         Some(hls_server.clone())
     } else {

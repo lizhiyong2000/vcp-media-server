@@ -6,12 +6,13 @@ pub mod ts_muxer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use tokio::fs;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 
-use crate::core::{StreamManager, MediaFrame, CodecType};
+use crate::core::{StreamManager, MediaFrame, CodecType, drain_broadcast_lag};
 use crate::webrtc::annex_b_with_config;
 use self::m3u8::M3u8Generator;
 use self::ts_muxer::TsMuxer;
@@ -93,6 +94,14 @@ impl HlsSession {
             session_audio_frames: 0,
             last_video_timestamp: 0,
         })
+    }
+
+    /// Discard partial segment after falling behind; wait for next IDR to re-prime.
+    fn recover_from_lag(&mut self) {
+        self.segment_buffer.clear();
+        self.segment_duration_acc = 0.0;
+        self.primed = false;
+        self.begin_new_segment();
     }
 
     /// Reset muxer and per-segment bookkeeping for a new TS file.
@@ -222,11 +231,15 @@ impl HlsSession {
     }
 }
 
-/// HLS Server that manages HLS sessions for multiple streams
+/// Stop HLS generation when no playlist/segment requests arrive for this long.
+const HLS_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct HlsServer {
     stream_manager: Arc<StreamManager>,
     config: HlsConfig,
     sessions: Arc<RwLock<HashMap<String, Arc<RwLock<HlsSession>>>>>,
+    task_aborts: Arc<RwLock<HashMap<String, tokio::task::AbortHandle>>>,
+    last_access: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl HlsServer {
@@ -235,7 +248,44 @@ impl HlsServer {
             stream_manager,
             config,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            task_aborts: Arc::new(RwLock::new(HashMap::new())),
+            last_access: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    fn touch(&self, stream_id: &str) {
+        self.last_access
+            .write()
+            .insert(stream_id.to_string(), Instant::now());
+    }
+
+    /// Periodically stop HLS sessions with no recent playlist/segment requests.
+    pub fn start_idle_reaper(self: &Arc<Self>) {
+        let server = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let now = Instant::now();
+                let stale: Vec<String> = {
+                    let access = server.last_access.read();
+                    access
+                        .iter()
+                        .filter(|(_, t)| now.duration_since(**t) > HLS_IDLE_TIMEOUT)
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                };
+                for stream_id in stale {
+                    if server.has_stream(&stream_id) {
+                        info!(
+                            "[HLS] [{}] No viewers for {:?} — stopping HLS generation",
+                            stream_id, HLS_IDLE_TIMEOUT
+                        );
+                        let _ = server.stop_stream(&stream_id).await;
+                    }
+                    server.last_access.write().remove(&stream_id);
+                }
+            }
+        });
     }
 
     /// Ensure HLS generation is running; `reset` clears prior session and files.
@@ -247,9 +297,11 @@ impl HlsServer {
             self.stop_stream(stream_id).await?;
         }
         if self.has_stream(stream_id) {
+            self.touch(stream_id);
             return Ok(true);
         }
         self.start_stream(stream_id).await?;
+        self.touch(stream_id);
         Ok(true)
     }
 
@@ -296,8 +348,9 @@ impl HlsServer {
         let stream_id_owned = stream_id.to_string();
         let sessions_clone = self.sessions.clone();
         let stream_manager = self.stream_manager.clone();
+        let task_aborts = self.task_aborts.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             info!("[HLS] [{}] HLS frame processing loop started", stream_id_owned);
             let mut frame_count: u64 = 0;
 
@@ -393,7 +446,15 @@ impl HlsServer {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("[HLS] [{}] Lagged {} frames", stream_id_owned, n);
+                        warn!(
+                            "[HLS] [{}] Lagged {} frames — jump to live edge",
+                            stream_id_owned, n
+                        );
+                        drain_broadcast_lag(&mut rx);
+                        let sessions = sessions_clone.read();
+                        if let Some(session) = sessions.get(&stream_id_owned) {
+                            session.write().recover_from_lag();
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         info!("[HLS] [{}] Broadcast channel closed", stream_id_owned);
@@ -409,13 +470,20 @@ impl HlsServer {
             if sessions.remove(&stream_id_owned).is_some() {
                 info!("[HLS] [{}] Session removed after loop exit", stream_id_owned);
             }
+            task_aborts.write().remove(&stream_id_owned);
         });
+
+        self.task_aborts
+            .write()
+            .insert(stream_id.to_string(), handle.abort_handle());
+        self.touch(stream_id);
 
         Ok(())
     }
 
     /// Get the M3U8 playlist (in-memory, only lists committed segments).
     pub fn get_playlist(&self, stream_id: &str) -> Option<String> {
+        self.touch(stream_id);
         let sessions = self.sessions.read();
         let session = sessions.get(stream_id)?;
         let sess = session.read();
@@ -427,6 +495,7 @@ impl HlsServer {
 
     /// Get the segment file path for a stream
     pub fn get_segment_path(&self, stream_id: &str, filename: &str) -> Option<PathBuf> {
+        self.touch(stream_id);
         let sessions = self.sessions.read();
         if let Some(s) = sessions.get(stream_id) {
             let path = s.read().output_dir().join(filename);
@@ -456,13 +525,17 @@ impl HlsServer {
 
     /// Stop HLS generation for a stream
     pub async fn stop_stream(&self, stream_id: &str) -> Result<()> {
+        if let Some(handle) = self.task_aborts.write().remove(stream_id) {
+            handle.abort();
+        }
+        self.last_access.write().remove(stream_id);
+
         let session = {
             let mut sessions = self.sessions.write();
             sessions.remove(stream_id)
         };
 
-        if let Some(session) = session {
-            let sess = session.write();
+        if session.is_some() {
             info!("[HLS] Stopped HLS for stream: {}", stream_id);
         }
 

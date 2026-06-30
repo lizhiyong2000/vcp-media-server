@@ -296,6 +296,12 @@ pub fn parse_chunks(
     }
 }
 
+/// RTMP chunk stream IDs (Adobe convention).
+pub const CSID_PROTOCOL: u32 = 2;
+pub const CSID_COMMAND: u32 = 3;
+pub const CSID_AUDIO: u32 = 4;
+pub const CSID_VIDEO: u32 = 6;
+
 /// Encode a complete RTMP message as chunks
 pub fn encode_message(
     msg_type: u8,
