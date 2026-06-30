@@ -8,7 +8,8 @@ use tokio::sync::broadcast;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 
-use crate::core::{StreamManager, MediaFrame, CodecType, StreamId};
+use crate::core::{StreamManager, MediaFrame, CodecType};
+use crate::rtmp::session::{frame_to_rtmp_audio, frame_to_rtmp_video};
 
 /// FLV file header (9 bytes)
 fn generate_flv_header(has_video: bool, has_audio: bool) -> Vec<u8> {
@@ -161,37 +162,19 @@ fn generate_metadata_tag(stream_id: &str, has_video: bool, has_audio: bool) -> V
     generate_flv_tag(0x12, 0, &data)
 }
 
-/// Convert a MediaFrame to FLV video tag data
+/// Convert a MediaFrame to FLV video tag data (Annex B → AVCC, same as RTMP play path).
 fn frame_to_flv_video(frame: &MediaFrame) -> Vec<u8> {
-    let mut data = Vec::new();
-
-    // Frame type + codec
-    let frame_type = if frame.is_keyframe { 0x10 } else { 0x20 };
-    data.push(frame_type | 0x07); // AVC
-    // AVC packet type: NALU = 0x01
-    data.push(0x01);
-    // Composition time offset (3 bytes)
-    data.extend_from_slice(&[0x00, 0x00, 0x00]);
-    // NALU length prefix (4 bytes)
-    let nalu_len = frame.data.len() as u32;
-    data.extend_from_slice(&nalu_len.to_be_bytes());
-    // NALU data
-    data.extend_from_slice(&frame.data);
-
+    let data = frame_to_rtmp_video(frame);
+    if data.is_empty() {
+        return Vec::new();
+    }
     let timestamp = (frame.timestamp & 0xFFFFFFFF) as u32;
     generate_flv_tag(0x09, timestamp, &data)
 }
 
 /// Convert a MediaFrame to FLV audio tag data
 fn frame_to_flv_audio(frame: &MediaFrame) -> Vec<u8> {
-    let mut data = Vec::new();
-    // Sound format: AAC = 0xA0, rate=44k(0x0C), size=16bit(0x02), type=stereo(0x01)
-    data.push(0xAF); // AAC 44kHz 16bit stereo
-    // AAC packet type: raw = 0x01
-    data.push(0x01);
-    // Audio data
-    data.extend_from_slice(&frame.data);
-
+    let data = frame_to_rtmp_audio(frame);
     let timestamp = (frame.timestamp & 0xFFFFFFFF) as u32;
     generate_flv_tag(0x08, timestamp, &data)
 }
@@ -225,6 +208,11 @@ impl HttpFlvSession {
         headers.push_str("Cache-Control: no-cache\r\n");
         headers.push_str("\r\n");
         headers
+    }
+
+    /// Whether AVC/AAC sequence headers still need to be sent
+    pub fn needs_sequence_headers(&self) -> bool {
+        !self.sequence_header_sent
     }
 
     /// Generate the initial FLV data (header + metadata + sequence headers)

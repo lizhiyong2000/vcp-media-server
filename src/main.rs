@@ -167,14 +167,19 @@ async fn main() -> Result<()> {
     };
     
     // Initialize HTTP-FLV server
+    let http_flv_enabled = config.http_flv.as_ref().map(|c| c.enabled).unwrap_or(true);
     let http_flv_server = Arc::new(http_flv::HttpFlvServer::new(stream_manager.clone()));
-    let http_flv_server_http = http_flv_server.clone();
+    let http_flv_server_http = if http_flv_enabled {
+        Some(http_flv_server.clone())
+    } else {
+        None
+    };
     
     let http_server = http::HttpServer::new(
         stream_manager.clone(), 
         config.http.port,
         hls_server_http,
-        Some(http_flv_server_http),
+        http_flv_server_http,
     );
 
     let rtmp_server = rtmp::RtmpServer::new(stream_manager.clone(), config.rtmp.port, hls_server_rtmp);

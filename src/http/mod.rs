@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{sleep, Duration, Instant};
 use tracing::{info, warn, error};
 use serde_json::json;
 
@@ -167,35 +168,92 @@ impl HttpServer {
             // HTTP-FLV request
             if path.starts_with("/flv/") {
                 if let Some(ref flv) = flv_server {
-                    let stream_id = path.trim_start_matches("/flv/");
-                    if let Some((mut session, stream)) = flv.create_session(stream_id) {
-                        // Send HTTP response headers
+                    let stream_id = path.trim_start_matches("/flv/").trim_end_matches('/');
+                    if let Some((mut session, mut stream)) = flv.create_session(stream_id) {
+                        let stream_id_owned = stream_id.to_string();
+                        let mut rx = match flv.subscribe(stream_id) {
+                            Some(rx) => rx,
+                            None => {
+                                let response = Self::http_response(404, "Not Found", "Stream not found");
+                                socket.write_all(response.as_bytes()).await?;
+                                socket.flush().await?;
+                                return Ok(());
+                            }
+                        };
+
+                        // Wait for SPS/PPS before responding so players can probe codecs
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while stream.sps.is_none() || stream.pps.is_none() {
+                            if Instant::now() >= deadline {
+                                let response = Self::http_response(
+                                    503,
+                                    "Service Unavailable",
+                                    "Stream not ready (waiting for video sequence header)",
+                                );
+                                socket.write_all(response.as_bytes()).await?;
+                                socket.flush().await?;
+                                return Ok(());
+                            }
+                            tokio::select! {
+                                _ = sleep(Duration::from_millis(50)) => {}
+                                result = rx.recv() => {
+                                    match result {
+                                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            let response = Self::http_response(404, "Not Found", "Stream ended");
+                                            socket.write_all(response.as_bytes()).await?;
+                                            socket.flush().await?;
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(s) = flv.stream_manager().get_stream(&stream_id_owned) {
+                                stream = s;
+                            }
+                        }
+
                         let http_headers = HttpFlvSession::generate_http_headers();
                         socket.write_all(http_headers.as_bytes()).await?;
-                        
-                        // Send initial FLV data (header + metadata + sequence headers)
+
                         let initial_data = session.generate_initial_data(&stream);
                         if !initial_data.is_empty() {
                             let chunk = format_chunk(&initial_data);
                             socket.write_all(&chunk).await?;
                         }
-                        
-                        // Subscribe to stream and keep sending FLV data
-                        if let Some(mut rx) = flv.subscribe(stream_id) {
-                            loop {
-                                match rx.recv().await {
-                                    Ok(frame) => {
-                                        let flv_data = session.frame_to_flv(&frame);
-                                        if !flv_data.is_empty() {
-                                            let chunk = format_chunk(&flv_data);
-                                            if socket.write_all(&chunk).await.is_err() {
-                                                break;
+
+                        loop {
+                            match rx.recv().await {
+                                Ok(frame) => {
+                                    if frame.codec == CodecType::AAC && frame.data.len() < 8 {
+                                        continue;
+                                    }
+
+                                    if session.needs_sequence_headers() {
+                                        if let Some(stream) = flv.stream_manager().get_stream(&stream_id_owned) {
+                                            let more = session.generate_initial_data(&stream);
+                                            if !more.is_empty() {
+                                                let chunk = format_chunk(&more);
+                                                if socket.write_all(&chunk).await.is_err() {
+                                                    break;
+                                                }
                                             }
                                         }
+                                        if session.needs_sequence_headers() {
+                                            continue;
+                                        }
                                     }
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+
+                                    let flv_data = session.frame_to_flv(&frame);
+                                    if !flv_data.is_empty() {
+                                        let chunk = format_chunk(&flv_data);
+                                        if socket.write_all(&chunk).await.is_err() {
+                                            break;
+                                        }
+                                    }
                                 }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
                         }
                         socket.flush().await?;
