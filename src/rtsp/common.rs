@@ -951,6 +951,39 @@ impl UdpTransport {
 const AAC_HBR_SIZE_LENGTH: u8 = 13;
 const AAC_HBR_INDEX_LENGTH: u8 = 3;
 
+/// Wrap raw AAC frame bytes in RFC 3640 AAC-hbr `mpeg4-generic` RTP payload.
+pub fn wrap_mpeg4_generic_aac_hbr(aac: &[u8]) -> Vec<u8> {
+    let aac = aac_payload_without_adts(aac);
+    if aac.is_empty() {
+        return Vec::new();
+    }
+    let au_header = ((aac.len() as u16) << AAC_HBR_INDEX_LENGTH) as u16;
+    let au_headers_length_bits =
+        (AAC_HBR_SIZE_LENGTH as usize + AAC_HBR_INDEX_LENGTH as usize) as u16;
+
+    let mut payload = Vec::with_capacity(4 + aac.len());
+    payload.extend_from_slice(&au_headers_length_bits.to_be_bytes());
+    payload.extend_from_slice(&au_header.to_be_bytes());
+    payload.extend_from_slice(aac);
+    payload
+}
+
+/// Return AAC raw frame bytes without a leading ADTS header when present.
+pub fn aac_payload_without_adts(data: &[u8]) -> &[u8] {
+    if data.len() >= 7 && data[0] == 0xFF && (data[1] & 0xF0) == 0xF0 {
+        let frame_length = ((data[3] as usize & 0x03) << 11)
+            | (data[4] as usize) << 3
+            | (data[5] as usize >> 5);
+        if frame_length > 7 && frame_length <= data.len() {
+            return &data[7..frame_length];
+        }
+        if data.len() > 7 {
+            return &data[7..];
+        }
+    }
+    data
+}
+
 /// Strip RFC 3640 `mpeg4-generic` AAC-hbr AU headers, returning raw AAC frame bytes.
 pub fn strip_mpeg4_generic_aac(payload: &[u8]) -> Option<Vec<u8>> {
     if payload.is_empty() {
@@ -1019,6 +1052,14 @@ fn read_aac_hbr_au_size(au_header_bytes: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod aac_tests {
     use super::*;
+
+    #[test]
+    fn wrap_aac_hbr_round_trip() {
+        let raw = &[0xDE, 0xAD, 0xBE, 0xEF];
+        let wrapped = wrap_mpeg4_generic_aac_hbr(raw);
+        let stripped = strip_mpeg4_generic_aac(&wrapped).unwrap();
+        assert_eq!(stripped, raw);
+    }
 
     #[test]
     fn strip_aac_hbr_au_header() {

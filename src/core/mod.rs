@@ -717,26 +717,20 @@ impl StreamManager {
         let tx_option = channels.get(&stream_id).cloned();
         
         if let Some(tx) = tx_option {
-            let subscribers = tx.receiver_count();
-            if subscribers > 0 {
-                match tx.send(frame) {
-                    Ok(lagged) => {
+            match tx.send(frame) {
+                Ok(lagged) => {
+                    let subscribers = tx.receiver_count();
+                    if subscribers > 0 {
                         debug!(
                             "[Core] publish_frame: stream_id={} subscribers={} lagged={}",
                             stream_id, subscribers, lagged
                         );
                     }
-                    Err(e) => {
-                        error!("[Core] publish_frame: Failed to send frame, stream_id={}, error={}", stream_id, e);
-                    }
                 }
-            } else {
-                static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if n == 1 || n % 100 == 0 {
-                    info!(
-                        "[Core] publish_frame: no subscribers yet for stream_id={} (dropped {} frames, keyframe={})",
-                        stream_id, n, frame.is_keyframe
+                Err(e) => {
+                    debug!(
+                        "[Core] publish_frame: no active receivers stream_id={} ({})",
+                        stream_id, e
                     );
                 }
             }

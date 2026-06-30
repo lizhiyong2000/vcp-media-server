@@ -2042,6 +2042,7 @@ dependencies = [
  "url",
  "uuid",
  "webrtc",
+ "webrtc-ice",
 ]
 
 [[package]]

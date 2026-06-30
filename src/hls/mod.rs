@@ -284,6 +284,7 @@ impl HlsServer {
         }
 
         // Subscribe to stream frames
+        self.stream_manager.ensure_stream_broadcast(stream_id);
         let rx = match self.stream_manager.subscribe(&stream_id.to_string()) {
             Some(rx) => rx,
             None => {
@@ -403,6 +404,11 @@ impl HlsServer {
 
             info!("[HLS] [{}] HLS frame processing loop stopped after {} frames", 
                   stream_id_owned, frame_count);
+
+            let mut sessions = sessions_clone.write();
+            if sessions.remove(&stream_id_owned).is_some() {
+                info!("[HLS] [{}] Session removed after loop exit", stream_id_owned);
+            }
         });
 
         Ok(())

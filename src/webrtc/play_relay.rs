@@ -27,23 +27,37 @@ fn count_for_stream(stream_id: &str) -> usize {
         .count()
 }
 
-/// Stop one play relay by session id. Returns true if it was running.
-pub fn cancel_play_relay(relay_id: &str) -> bool {
-    if let Some(ctrl) = relays().lock().remove(relay_id) {
+/// Cooperative stop: set the watch flag so the relay loop exits on its own.
+pub fn signal_play_relay_stop(relay_id: &str) -> bool {
+    if let Some(ctrl) = relays().lock().get(relay_id) {
         let _ = ctrl.stop.send(true);
-        if let Some(abort) = ctrl.abort {
-            abort.abort();
-        }
-        info!(
-            "[WebRTC] Cancelled play relay id='{}' stream='{}' remaining={}",
-            relay_id,
-            ctrl.stream_id,
-            count_for_stream(&ctrl.stream_id)
-        );
         true
     } else {
         false
     }
+}
+
+/// Stop one play relay by session id. Returns true if it was running.
+pub fn cancel_play_relay(relay_id: &str) -> bool {
+    let removed = relays().lock().remove(relay_id);
+    let Some(ctrl) = removed else {
+        return false;
+    };
+
+    let stream_id = ctrl.stream_id.clone();
+    let _ = ctrl.stop.send(true);
+    let abort = ctrl.abort;
+
+    if let Some(abort) = abort {
+        abort.abort();
+    }
+    info!(
+        "[WebRTC] Cancelled play relay id='{}' stream='{}' remaining={}",
+        relay_id,
+        stream_id,
+        count_for_stream(&stream_id)
+    );
+    true
 }
 
 /// Register a new play relay; does not cancel other players on the same stream.

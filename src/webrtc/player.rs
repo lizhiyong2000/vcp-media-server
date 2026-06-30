@@ -27,12 +27,13 @@ use super::sdp_h264::{build_h264_sdp_fmtp, patch_answer_sdp_h264};
 use super::signaling::ServerSignal;
 use webrtc::api::API;
 
-pub use super::play_relay::cancel_play_relay;
+pub use super::play_relay::{cancel_play_relay, signal_play_relay_stop};
 
 pub struct PlaySession {
     pub answer_sdp: String,
     pub pc: Arc<RTCPeerConnection>,
     pub relay_id: String,
+    pub relay_handle: tokio::task::JoinHandle<()>,
 }
 
 pub async fn start_play(
@@ -46,6 +47,7 @@ pub async fn start_play(
         return Err(anyhow!("Stream '{}' not found", stream_id));
     }
 
+    manager.ensure_stream_broadcast(&stream_id);
     log_stream_codec_state(&manager, &stream_id, "play-request");
 
     let h264_fmtp = manager.get_stream(&stream_id.to_string()).and_then(|stream| {
@@ -140,6 +142,7 @@ pub async fn start_play(
         answer_sdp,
         pc,
         relay_id,
+        relay_handle,
     })
 }
 
@@ -348,7 +351,7 @@ async fn relay_stream_to_track(
     info!("[WebRTC] Play relay loop started for stream='{}'", stream_id);
 
     loop {
-        if stop_requested(&mut stop_rx) {
+        if stop_requested(&stop_rx) {
             info!("[WebRTC] Play relay stop requested stream='{}'", stream_id);
             break;
         }
@@ -486,13 +489,36 @@ async fn relay_stream_to_track(
         if !catch_up {
             let now = Instant::now();
             if pace_next > now {
-                tokio::time::sleep(pace_next - now).await;
+                tokio::select! {
+                    biased;
+                    _ = stop_rx.changed() => {
+                        if stop_requested(&stop_rx) {
+                            info!("[WebRTC] Play relay stop during pace stream='{}'", stream_id);
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(pace_next - now) => {}
+                }
             }
             pace_next = Instant::now() + duration;
         } else {
             pace_next = Instant::now();
         }
-        outbound.send_access_unit(&sample_data, duration).await?;
+        if stop_requested(&stop_rx) {
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = stop_rx.changed() => {
+                if stop_requested(&stop_rx) {
+                    info!("[WebRTC] Play relay stop during send stream='{}'", stream_id);
+                    break;
+                }
+            }
+            result = outbound.send_access_unit(&sample_data, duration) => {
+                result?;
+            }
+        }
         last_sent_ts = Some(frame.timestamp);
         rtp_sent += 1;
 
@@ -577,8 +603,8 @@ fn is_idr_frame(frame: &MediaFrame) -> bool {
     contains_idr_nalu(&data)
 }
 
-fn stop_requested(stop_rx: &mut tokio::sync::watch::Receiver<bool>) -> bool {
-    stop_rx.has_changed().ok() == Some(true) && *stop_rx.borrow()
+fn stop_requested(stop_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *stop_rx.borrow()
 }
 
 fn pc_connection_ended(pc: &RTCPeerConnection) -> bool {

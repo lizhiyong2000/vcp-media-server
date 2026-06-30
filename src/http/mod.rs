@@ -106,6 +106,7 @@ impl HttpServer {
                         socket.flush().await?;
                         return Ok(());
                     }
+                    manager.ensure_stream_broadcast(stream_id);
                     let _ = hls.ensure_stream(stream_id, false).await;
 
                     let playlist = hls
@@ -171,6 +172,7 @@ impl HttpServer {
                     let stream_id = path.trim_start_matches("/flv/").trim_end_matches('/');
                     if let Some((mut session, mut stream)) = flv.create_session(stream_id) {
                         let stream_id_owned = stream_id.to_string();
+                        flv.stream_manager().ensure_stream_broadcast(stream_id);
                         let mut rx = match flv.subscribe(stream_id) {
                             Some(rx) => rx,
                             None => {

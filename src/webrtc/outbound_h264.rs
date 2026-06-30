@@ -36,9 +36,9 @@ impl OutboundH264Track {
             duration,
             ..Default::default()
         };
-        self.track
-            .write_sample(&sample)
+        tokio::time::timeout(Duration::from_secs(2), self.track.write_sample(&sample))
             .await
+            .map_err(|_| anyhow!("write_sample timed out"))?
             .map_err(|e| anyhow!("write_sample: {}", e))
     }
 }

@@ -14,7 +14,8 @@ pub mod session;
 pub mod common;
 pub mod client_session;
 pub mod server_session;
-pub mod puller;
+pub mod play_egress;
+mod puller;
 pub mod pusher;
 
 pub use messages::{RtspRequest, RtspResponse};
@@ -195,6 +196,7 @@ impl RtspServer {
 
                 session.stream_id = None;
                 session.playing = false;
+                session.publishing = false;
                 session.interleaved_channels.clear();
                 session.rtp_task_started = false;
                 
@@ -269,6 +271,7 @@ impl RtspServer {
                 let _ = manager.set_unpublished(&stream_id);
 
                 session.stream_id = Some(stream_id.clone());
+                session.publishing = true;
                 let response = Self::build_announce_response(cseq);
                 Ok(response)
             }
@@ -287,6 +290,7 @@ impl RtspServer {
 
                 manager.ensure_stream_broadcast(&stream_id);
                 let _ = manager.set_publishing(&stream_id);
+                session.publishing = true;
 
                 if let Some(hls) = hls_server {
                     if let Err(e) = hls.restart_stream(&stream_id).await {

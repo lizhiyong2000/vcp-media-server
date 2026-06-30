@@ -11,7 +11,13 @@ use bytes::BytesMut;
 use crate::core::{StreamManager, MediaFrame, CodecType};
 use crate::webrtc::H264RtpIngest;
 use super::{RtspRequest, RtspResponse, RtspSession, TransportMode, RtspServer};
-use super::common::{format_rtsp_message, extract_transport, extract_track_id, is_udp_transport, RtspCommon};
+use super::common::{
+    format_rtsp_message, extract_transport, extract_track_id, is_udp_transport, RtspCommon,
+};
+use super::play_egress::{
+    egress_rtp_packets, flush_stale_rx, prime_rtsp_play_rx, recv_coalesced_play_frame,
+    PlayRtpTimeline,
+};
 
 pub struct RtspServerSession {
     reader: tokio::net::tcp::OwnedReadHalf,
@@ -24,6 +30,7 @@ pub struct RtspServerSession {
     running: bool,
     udp_tracks: HashMap<u8, UdpTrackTransport>,
     udp_receiver_tracks: std::collections::HashSet<u8>,
+    rtp_sender_abort: Option<tokio::task::AbortHandle>,
     // H264 codec parameters
     sps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     pps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
@@ -65,6 +72,7 @@ impl RtspServerSession {
             running: true,
             udp_tracks: HashMap::new(),
             udp_receiver_tracks: std::collections::HashSet::new(),
+            rtp_sender_abort: None,
             sps_cache: Arc::new(parking_lot::RwLock::new(None)),
             pps_cache: Arc::new(parking_lot::RwLock::new(None)),
             h264_ingest: None,
@@ -102,7 +110,9 @@ impl RtspServerSession {
         );
 
         self.session.transport_mode = TransportMode::Udp;
-        self.start_udp_receiver_for_track(track_id, rtp_socket);
+        if self.session.publishing {
+            self.start_udp_receiver_for_track(track_id, rtp_socket);
+        }
         Ok((server_rtp_port, server_rtcp_port))
     }
 
@@ -717,6 +727,13 @@ impl RtspServerSession {
             }
         }
 
+        if method == "TEARDOWN" {
+            self.abort_rtp_sender();
+            self.udp_tracks.clear();
+        } else if method == "PAUSE" {
+            self.abort_rtp_sender();
+        }
+
         let response = RtspServer::process_rtsp_request(
             &request,
             &self.manager,
@@ -736,14 +753,23 @@ impl RtspServerSession {
             self.ensure_udp_receivers_started().await;
         }
 
-        if self.session.playing && self.session.stream_id.is_some() && !self.session.rtp_task_started {
+        if method == "PLAY" && self.session.playing && self.session.stream_id.is_some() {
             self.start_rtp_sender().await;
         }
 
         Ok(())
     }
 
+    fn abort_rtp_sender(&mut self) {
+        if let Some(handle) = self.rtp_sender_abort.take() {
+            handle.abort();
+        }
+        self.session.rtp_task_started = false;
+    }
+
     async fn start_rtp_sender(&mut self) {
+        self.abort_rtp_sender();
+
         self.session.rtp_task_started = true;
 
         let stream_id = self.session.stream_id.clone().unwrap();
@@ -756,59 +782,56 @@ impl RtspServerSession {
         let use_udp = self.session.transport_mode == TransportMode::Udp;
         let udp_tracks = self.udp_tracks.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             info!(
                 "[RTSP] [{}] Starting RTP sender (udp={}) SSRC={}",
                 stream_id, use_udp, rtp_ssrc
             );
 
+            manager.ensure_stream_broadcast(&stream_id);
             if let Some(mut rx) = manager.subscribe(&stream_id) {
                 info!("[RTSP] [{}] Successfully subscribed to stream channel", stream_id);
 
                 let mut frame_count: u64 = 0;
                 let mut rtp_seq: std::collections::HashMap<u8, u16> = std::collections::HashMap::new();
+                let mut timelines: std::collections::HashMap<u8, PlayRtpTimeline> =
+                    std::collections::HashMap::new();
+                let mut pending: Option<MediaFrame> =
+                    prime_rtsp_play_rx(&mut rx, &manager, &stream_id).await;
 
-                while let Ok(frame) = rx.recv().await {
+                loop {
+                    let frame = if let Some(f) = pending.take() {
+                        f
+                    } else {
+                        match recv_coalesced_play_frame(&mut rx).await {
+                            Ok(f) => f,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                info!(
+                                    "[RTSP] [{}] PLAY lagged {} frames — jump to live",
+                                    stream_id, n
+                                );
+                                flush_stale_rx(&mut rx, &manager, &stream_id);
+                                timelines.clear();
+                                if let Some(idr) =
+                                    prime_rtsp_play_rx(&mut rx, &manager, &stream_id).await
+                                {
+                                    pending = Some(idr);
+                                }
+                                continue;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    };
+
                     frame_count += 1;
+                    let seq = rtp_seq.entry(frame.track_id).or_insert(0);
+                    let timeline = timelines
+                        .entry(frame.track_id)
+                        .or_insert_with(|| PlayRtpTimeline::for_codec(frame.codec));
+                    let packets =
+                        egress_rtp_packets(&frame, &manager, &stream_id, timeline, seq, rtp_ssrc);
 
                     if use_udp {
-                        let payload_type = match frame.codec {
-                            CodecType::H264 => 96,
-                            CodecType::AAC => 97,
-                            _ => 96,
-                        };
-                        let ts = frame.timestamp as u32;
-                        let seq = rtp_seq.entry(frame.track_id).or_insert(0);
-
-                        let packets: Vec<Vec<u8>> = if frame.codec == CodecType::H264 {
-                            if let Some(ref rtp_data) = frame.rtp_data {
-                                if rtp_data.len() <= RtspCommon::UDP_RTP_MAX_PAYLOAD + 12 {
-                                    vec![rtp_data.to_vec()]
-                                } else {
-                                    RtspCommon::packetize_h264_access_unit_for_rtp(
-                                        &frame.data, payload_type, seq, ts, rtp_ssrc,
-                                    )
-                                }
-                            } else {
-                                RtspCommon::packetize_h264_access_unit_for_rtp(
-                                    &frame.data, payload_type, seq, ts, rtp_ssrc,
-                                )
-                            }
-                        } else if let Some(ref rtp_data) = frame.rtp_data {
-                            vec![rtp_data.to_vec()]
-                        } else {
-                            let pkt = RtspCommon::build_rtp_packet(
-                                payload_type,
-                                *seq,
-                                ts,
-                                rtp_ssrc,
-                                frame.is_keyframe,
-                                &frame.data,
-                            );
-                            *seq = seq.wrapping_add(1);
-                            vec![pkt]
-                        };
-
                         if let Some(track) = udp_tracks.get(&frame.track_id) {
                             let mut send_failed = false;
                             for packet in packets {
@@ -838,54 +861,22 @@ impl RtspServerSession {
                         continue;
                     }
 
-                    // TCP interleaved path
-                    if let Some(ref rtp_data) = frame.rtp_data {
-                        if write_tx.send(rtp_data.to_vec()).await.is_ok() {
-                            if frame_count <= 10 || frame.is_keyframe || frame_count % 100 == 0 {
-                                info!("[RTSP] [{}] Sent RTP packet to client {}: track={}, len={}, keyframe={}, frame#={}", 
-                                       stream_id, peer_addr, frame.track_id, rtp_data.len(), frame.is_keyframe, frame_count);
-                            }
-                        } else {
+                    // TCP interleaved: one RTP packet per interleaved frame
+                    for packet in packets {
+                        if packet.is_empty() {
+                            continue;
+                        }
+                        let interleaved = RtspCommon::wrap_interleaved(&packet, frame.track_id);
+                        if write_tx.send(interleaved).await.is_err() {
                             error!("[RTSP] [{}] Failed to send RTP packet", stream_id);
                             break;
                         }
-                    } else {
-                        // For frames without RTP data (e.g., from RTMP), build RTP packet
-                        let payload_type = match frame.codec {
-                            CodecType::H264 => 96,
-                            CodecType::AAC => 97,
-                            _ => 96,
-                        };
-
-                        let rtp_payload = if frame.codec == CodecType::H264 {
-                            let mut payload = Vec::with_capacity(4 + frame.data.len());
-                            payload.extend_from_slice(&(frame.data.len() as u32).to_be_bytes());
-                            payload.extend_from_slice(&frame.data);
-                            payload
-                        } else {
-                            frame.data.to_vec()
-                        };
-
-                        let rtp_data = RtspCommon::build_rtp_packet(
-                            payload_type,
-                            frame_count as u16,
-                            frame.timestamp as u32,
-                            rtp_ssrc,
-                            frame.is_keyframe,
-                            &rtp_payload
+                    }
+                    if frame_count <= 10 || frame.is_keyframe || frame_count % 100 == 0 {
+                        info!(
+                            "[RTSP] [{}] Sent RTP to client {}: track={}, keyframe={}, frame#={}",
+                            stream_id, peer_addr, frame.track_id, frame.is_keyframe, frame_count
                         );
-                        let interleaved = RtspCommon::wrap_interleaved(&rtp_data, frame.track_id);
-                        let len = interleaved.len();
-
-                        if write_tx.send(interleaved).await.is_ok() {
-                            if frame_count <= 10 || frame.is_keyframe || frame_count % 100 == 0 {
-                                info!("[RTSP] [{}] Built and sent RTP packet to client {}: track={}, len={}, keyframe={}, frame#={}", 
-                                       stream_id, peer_addr, frame.track_id, len, frame.is_keyframe, frame_count);
-                            }
-                        } else {
-                            error!("[RTSP] [{}] Failed to send RTP packet", stream_id);
-                            break;
-                        }
                     }
                 }
 
@@ -894,6 +885,7 @@ impl RtspServerSession {
                 warn!("[RTSP] [{}] Failed to subscribe to stream", stream_id);
             }
         });
+        self.rtp_sender_abort = Some(handle.abort_handle());
     }
 
     pub async fn close(&mut self) {

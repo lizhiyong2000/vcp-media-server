@@ -17,6 +17,7 @@ pub use h264_rtp_ingest::{H264RtpIngest, rtp_h264_media_payload};
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -25,7 +26,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::core::StreamManager;
 use peer::create_api;
-use player::{cancel_play_relay, start_play};
+use player::{cancel_play_relay, signal_play_relay_stop, start_play};
 use publisher::{add_ice_candidate, start_publish};
 use publish_signaling::{register_publish_signaling, request_publisher_keyframe, unregister_publish_signaling};
 use signaling::{ClientSignal, ServerSignal};
@@ -36,11 +37,19 @@ pub struct WebrtcServer {
 }
 
 /// One WebSocket may hold both publish and play peer connections simultaneously.
+struct PendingIce {
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u16>,
+}
+
 struct SessionState {
     publish_pc: Option<Arc<RTCPeerConnection>>,
     play_pc: Option<Arc<RTCPeerConnection>>,
     stream_id: Option<String>,
     play_relay_id: Option<String>,
+    play_relay_handle: Option<tokio::task::JoinHandle<()>>,
+    pending_ice: Vec<PendingIce>,
 }
 
 impl SessionState {
@@ -98,6 +107,8 @@ async fn handle_connection(
         play_pc: None,
         stream_id: None,
         play_relay_id: None,
+        play_relay_handle: None,
+        pending_ice: Vec::new(),
     };
 
     loop {
@@ -132,12 +143,7 @@ async fn handle_connection(
 }
 
 async fn cleanup_session(manager: &Arc<StreamManager>, state: &mut SessionState) {
-    if let Some(relay_id) = state.play_relay_id.take() {
-        cancel_play_relay(&relay_id);
-    }
-    if let Some(pc) = state.play_pc.take() {
-        let _ = pc.close().await;
-    }
+    stop_play_session(state).await;
     if state.has_publish() {
         let sid = state
             .stream_id
@@ -154,7 +160,7 @@ async fn cleanup_publish_session(
     pc: Option<Arc<RTCPeerConnection>>,
 ) {
     if let Some(pc) = pc {
-        let _ = pc.close().await;
+        close_pc_async(pc);
     }
     unregister_publish_signaling(stream_id);
     let _ = manager.set_unpublished(stream_id);
@@ -164,28 +170,119 @@ async fn cleanup_publish_session(
     );
 }
 
+/// Close peer connection in the background so WebSocket signaling never blocks on DTLS teardown.
+fn close_pc_async(pc: Arc<RTCPeerConnection>) {
+    tokio::spawn(async move {
+        match tokio::time::timeout(Duration::from_secs(3), pc.close()).await {
+            Ok(Ok(())) => info!("[WebRTC] Peer connection closed"),
+            Ok(Err(e)) => warn!("[WebRTC] Peer connection close error: {}", e),
+            Err(_) => warn!("[WebRTC] Peer connection close timed out"),
+        }
+    });
+}
+
+/// Stop play relay first, wait for relay task, then close PC asynchronously.
+async fn stop_play_session(state: &mut SessionState) {
+    let relay_id = state.play_relay_id.take();
+    let relay_handle = state.play_relay_handle.take();
+
+    if let Some(ref id) = relay_id {
+        signal_play_relay_stop(id);
+    }
+
+    if let Some(handle) = relay_handle {
+        match tokio::time::timeout(Duration::from_millis(800), handle).await {
+            Ok(Ok(())) => info!("[WebRTC] Play relay stopped cleanly"),
+            Ok(Err(e)) => warn!("[WebRTC] Play relay task join error: {}", e),
+            Err(_) => {
+                warn!("[WebRTC] Play relay stop timed out, forcing abort");
+                if let Some(id) = relay_id.as_ref() {
+                    cancel_play_relay(id);
+                }
+            }
+        }
+    } else if let Some(id) = relay_id.as_ref() {
+        cancel_play_relay(id);
+    }
+
+    if let Some(pc) = state.play_pc.take() {
+        close_pc_async(pc);
+    }
+}
+
+async fn apply_ice_candidate(pc: &Arc<RTCPeerConnection>, ice: &PendingIce) -> bool {
+    add_ice_candidate(
+        pc,
+        ice.candidate.clone(),
+        ice.sdp_mid.clone(),
+        ice.sdp_mline_index,
+    )
+    .await
+    .is_ok()
+}
+
+async fn flush_pending_ice(state: &mut SessionState) {
+    if state.pending_ice.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut state.pending_ice);
+    let mut still_pending = Vec::new();
+    for ice in pending {
+        let mut applied = false;
+        if let Some(pc) = &state.play_pc {
+            if apply_ice_candidate(pc, &ice).await {
+                applied = true;
+            }
+        }
+        if !applied {
+            if let Some(pc) = &state.publish_pc {
+                if apply_ice_candidate(pc, &ice).await {
+                    applied = true;
+                }
+            }
+        }
+        if !applied {
+            still_pending.push(ice);
+        }
+    }
+    if !still_pending.is_empty() {
+        debug!(
+            "[WebRTC] {} ICE candidates still buffered (PC not ready)",
+            still_pending.len()
+        );
+        state.pending_ice = still_pending;
+    }
+}
+
 async fn route_ice_candidate(
-    state: &SessionState,
+    state: &mut SessionState,
     candidate: String,
     sdp_mid: Option<String>,
     sdp_mline_index: Option<u16>,
 ) -> Result<()> {
-    let mut applied = false;
+    let ice = PendingIce {
+        candidate,
+        sdp_mid,
+        sdp_mline_index,
+    };
 
-    if let Some(pc) = &state.publish_pc {
-        if add_ice_candidate(pc, candidate.clone(), sdp_mid.clone(), sdp_mline_index).await.is_ok()
-        {
+    let mut applied = false;
+    if let Some(pc) = &state.play_pc {
+        if apply_ice_candidate(pc, &ice).await {
             applied = true;
         }
     }
-    if let Some(pc) = &state.play_pc {
-        if add_ice_candidate(pc, candidate, sdp_mid, sdp_mline_index).await.is_ok() {
-            applied = true;
+    if !applied {
+        if let Some(pc) = &state.publish_pc {
+            if apply_ice_candidate(pc, &ice).await {
+                applied = true;
+            }
         }
     }
 
     if !applied {
-        warn!("[WebRTC] ICE candidate did not match any PC on this connection");
+        debug!("[WebRTC] Buffering inbound ICE candidate (PC not ready or no match)");
+        state.pending_ice.push(ice);
     }
     Ok(())
 }
@@ -230,7 +327,7 @@ where
         ClientSignal::Publish { stream_id, sdp } => {
             info!("[WebRTC] Publish request stream='{}'", stream_id);
             if let Some(old_pc) = state.publish_pc.take() {
-                let _ = old_pc.close().await;
+                close_pc_async(old_pc);
             }
             state.stream_id = Some(stream_id.clone());
             register_publish_signaling(&stream_id, ice_tx.clone());
@@ -244,6 +341,7 @@ where
             .await?;
 
             state.publish_pc = Some(session.pc);
+            flush_pending_ice(state).await;
             let answer = ServerSignal::Answer {
                 sdp: session.answer_sdp,
             };
@@ -251,12 +349,7 @@ where
         }
         ClientSignal::Play { stream_id, sdp } => {
             info!("[WebRTC] Play request stream='{}'", stream_id);
-            if let Some(relay_id) = state.play_relay_id.take() {
-                cancel_play_relay(&relay_id);
-            }
-            if let Some(old_pc) = state.play_pc.take() {
-                let _ = old_pc.close().await;
-            }
+            stop_play_session(state).await;
             let _ = request_publisher_keyframe(&stream_id);
             if state.stream_id.is_none() {
                 state.stream_id = Some(stream_id.clone());
@@ -272,6 +365,8 @@ where
 
             state.play_pc = Some(session.pc);
             state.play_relay_id = Some(session.relay_id);
+            state.play_relay_handle = Some(session.relay_handle);
+            flush_pending_ice(state).await;
             let answer = ServerSignal::Answer {
                 sdp: session.answer_sdp,
             };
@@ -279,12 +374,7 @@ where
         }
         ClientSignal::StopPlay { stream_id: _ } => {
             info!("[WebRTC] Stop play");
-            if let Some(relay_id) = state.play_relay_id.take() {
-                cancel_play_relay(&relay_id);
-            }
-            if let Some(pc) = state.play_pc.take() {
-                let _ = pc.close().await;
-            }
+            stop_play_session(state).await;
         }
         ClientSignal::StopPublish { stream_id } => {
             info!("[WebRTC] Stop publish stream='{}'", stream_id);

@@ -1,8 +1,10 @@
 use anyhow::Result;
+use ice::mdns::MulticastDnsMode;
 use std::sync::Arc;
 use tracing::info;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::api::API;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -17,9 +19,15 @@ pub fn create_api() -> Result<Arc<API>> {
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media_engine)?;
 
+    let mut setting_engine = SettingEngine::default();
+    // Browsers cannot use webrtc-rs mDNS (.local) host candidates reliably.
+    setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+    setting_engine.set_include_loopback_candidate(true);
+
     let api = APIBuilder::new()
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
+        .with_setting_engine(setting_engine)
         .build();
 
     Ok(Arc::new(api))

@@ -226,17 +226,44 @@
       return [...h264, ...aux];
     }
 
+    let pendingServerIce = [];
+
+    async function addIceToReadyPcs(ice) {
+      const pcs = [playPc, publishPc].filter((pc) => pc?.remoteDescription);
+      if (!pcs.length) return false;
+      for (const pc of pcs) {
+        try {
+          await pc.addIceCandidate(ice);
+          return true;
+        } catch (_) { /* ufrag/mline mismatch */ }
+      }
+      return false;
+    }
+
+    async function flushPendingServerIce() {
+      const rest = [];
+      for (const ice of pendingServerIce) {
+        if (!(await addIceToReadyPcs(ice))) rest.push(ice);
+      }
+      pendingServerIce.length = 0;
+      pendingServerIce.push(...rest);
+    }
+
     async function addServerIceCandidate(msg) {
       const ice = {
         candidate: msg.candidate,
         sdpMid: msg.sdp_mid,
         sdpMLineIndex: msg.sdp_mline_index,
       };
-      if (publishPc) {
-        try { await publishPc.addIceCandidate(ice); } catch (_) { /* wrong PC */ }
+      const pcs = [playPc, publishPc].filter(Boolean);
+      if (!pcs.length) return;
+      const ready = pcs.some((pc) => pc.remoteDescription);
+      if (!ready) {
+        pendingServerIce.push(ice);
+        return;
       }
-      if (playPc) {
-        try { await playPc.addIceCandidate(ice); } catch (_) { /* wrong PC */ }
+      if (!(await addIceToReadyPcs(ice))) {
+        pendingServerIce.push(ice);
       }
     }
 
@@ -281,6 +308,7 @@
           await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
           negotiatingPc = null;
           log('收到 answer');
+          await flushPendingServerIce();
         } else if (msg.type === 'ice') {
           await addServerIceCandidate(msg);
         } else if (msg.type === 'need_keyframe') {
@@ -401,8 +429,8 @@
       const streamId = $('streamId').value.trim();
       if (negotiatingPc === playPc) negotiatingPc = null;
       if (activePc === playPc) activePc = null;
-      if (playPc) { playPc.close(); playPc = null; }
       if (streamId) wsSend({ type: 'stop_play', stream_id: streamId });
+      if (playPc) { playPc.close(); playPc = null; }
       $('remoteVideo').srcObject = null;
       $('btnPlay').disabled = false;
       $('btnStopPlay').disabled = true;
