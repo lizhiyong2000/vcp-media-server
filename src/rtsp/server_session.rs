@@ -766,47 +766,72 @@ impl RtspServerSession {
                 info!("[RTSP] [{}] Successfully subscribed to stream channel", stream_id);
 
                 let mut frame_count: u64 = 0;
+                let mut rtp_seq: std::collections::HashMap<u8, u16> = std::collections::HashMap::new();
 
                 while let Ok(frame) = rx.recv().await {
                     frame_count += 1;
 
                     if use_udp {
-                        let rtp_bytes = if let Some(ref rtp_data) = frame.rtp_data {
-                            rtp_data.to_vec()
-                        } else {
-                            let payload_type = match frame.codec {
-                                CodecType::H264 => 96,
-                                CodecType::AAC => 97,
-                                _ => 96,
-                            };
-                            let rtp_payload = if frame.codec == CodecType::H264 {
-                                let mut payload = Vec::with_capacity(4 + frame.data.len());
-                                payload.extend_from_slice(&(frame.data.len() as u32).to_be_bytes());
-                                payload.extend_from_slice(&frame.data);
-                                payload
+                        let payload_type = match frame.codec {
+                            CodecType::H264 => 96,
+                            CodecType::AAC => 97,
+                            _ => 96,
+                        };
+                        let ts = frame.timestamp as u32;
+                        let seq = rtp_seq.entry(frame.track_id).or_insert(0);
+
+                        let packets: Vec<Vec<u8>> = if frame.codec == CodecType::H264 {
+                            if let Some(ref rtp_data) = frame.rtp_data {
+                                if rtp_data.len() <= RtspCommon::UDP_RTP_MAX_PAYLOAD + 12 {
+                                    vec![rtp_data.to_vec()]
+                                } else {
+                                    RtspCommon::packetize_h264_access_unit_for_rtp(
+                                        &frame.data, payload_type, seq, ts, rtp_ssrc,
+                                    )
+                                }
                             } else {
-                                frame.data.to_vec()
-                            };
-                            RtspCommon::build_rtp_packet(
+                                RtspCommon::packetize_h264_access_unit_for_rtp(
+                                    &frame.data, payload_type, seq, ts, rtp_ssrc,
+                                )
+                            }
+                        } else if let Some(ref rtp_data) = frame.rtp_data {
+                            vec![rtp_data.to_vec()]
+                        } else {
+                            let pkt = RtspCommon::build_rtp_packet(
                                 payload_type,
-                                frame_count as u16,
-                                frame.timestamp as u32,
+                                *seq,
+                                ts,
                                 rtp_ssrc,
                                 frame.is_keyframe,
-                                &rtp_payload,
-                            )
+                                &frame.data,
+                            );
+                            *seq = seq.wrapping_add(1);
+                            vec![pkt]
                         };
 
                         if let Some(track) = udp_tracks.get(&frame.track_id) {
-                            if RtspCommon::send_rtp_over_udp(
-                                &track.rtp_socket,
-                                &rtp_bytes,
-                                track.client_rtp_addr,
-                            )
-                            .await
-                            .is_err()
-                            {
-                                error!("[RTSP] [{}] Failed to send UDP RTP", stream_id);
+                            let mut send_failed = false;
+                            for packet in packets {
+                                if packet.is_empty() {
+                                    continue;
+                                }
+                                if RtspCommon::send_rtp_over_udp(
+                                    &track.rtp_socket,
+                                    &packet,
+                                    track.client_rtp_addr,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    error!(
+                                        "[RTSP] [{}] Failed to send UDP RTP track={}",
+                                        stream_id, frame.track_id
+                                    );
+                                    send_failed = true;
+                                    break;
+                                }
+                            }
+                            if send_failed {
                                 break;
                             }
                         }

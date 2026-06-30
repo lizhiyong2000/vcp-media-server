@@ -828,6 +828,79 @@ impl RtspCommon {
         }
         payload
     }
+
+    /// Max RTP payload size for UDP (stay under typical Ethernet MTU).
+    pub const UDP_RTP_MAX_PAYLOAD: usize = 1200;
+
+    /// Packetize one H.264 NAL into one or more RTP packets (single-NAL or FU-A).
+    pub fn packetize_h264_nal_for_rtp(
+        nal: &[u8],
+        payload_type: u8,
+        seq: &mut u16,
+        ts: u32,
+        ssrc: u32,
+        marker: bool,
+    ) -> Vec<Vec<u8>> {
+        if nal.is_empty() {
+            return Vec::new();
+        }
+
+        if nal.len() <= Self::UDP_RTP_MAX_PAYLOAD {
+            let pkt = Self::build_rtp_packet(payload_type, *seq, ts, ssrc, marker, nal);
+            *seq = seq.wrapping_add(1);
+            return vec![pkt];
+        }
+
+        let nal_type = nal[0] & 0x1F;
+        let fu_indicator = (nal[0] & 0x60) | 28;
+        let data = &nal[1..];
+        let chunk_max = Self::UDP_RTP_MAX_PAYLOAD - 2;
+        let mut packets = Vec::new();
+        let mut offset = 0;
+
+        while offset < data.len() {
+            let chunk_size = (data.len() - offset).min(chunk_max);
+            let is_start = offset == 0;
+            let is_end = offset + chunk_size >= data.len();
+            let fu_header =
+                (if is_start { 0x80 } else { 0 }) | (if is_end { 0x40 } else { 0 }) | nal_type;
+            let mut payload = vec![fu_indicator, fu_header];
+            payload.extend_from_slice(&data[offset..offset + chunk_size]);
+            let mark = marker && is_end;
+            packets.push(Self::build_rtp_packet(
+                payload_type, *seq, ts, ssrc, mark, &payload,
+            ));
+            *seq = seq.wrapping_add(1);
+            offset += chunk_size;
+        }
+
+        packets
+    }
+
+    /// Packetize an Annex-B H.264 access unit for UDP RTP egress.
+    pub fn packetize_h264_access_unit_for_rtp(
+        annex_b: &[u8],
+        payload_type: u8,
+        seq: &mut u16,
+        ts: u32,
+        ssrc: u32,
+    ) -> Vec<Vec<u8>> {
+        use crate::webrtc::h264_util::iter_annex_b_nal_ranges;
+        let ranges = iter_annex_b_nal_ranges(annex_b);
+        let mut packets = Vec::new();
+        for (i, (start, end)) in ranges.iter().enumerate() {
+            let marker = i + 1 == ranges.len();
+            packets.extend(Self::packetize_h264_nal_for_rtp(
+                &annex_b[*start..*end],
+                payload_type,
+                seq,
+                ts,
+                ssrc,
+                marker,
+            ));
+        }
+        packets
+    }
 }
 
 #[derive(Debug, Clone)]

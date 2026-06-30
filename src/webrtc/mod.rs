@@ -1,4 +1,4 @@
-mod h264_util;
+pub(crate) mod h264_util;
 mod h264_rtp_ingest;
 mod outbound_h264;
 mod peer;
