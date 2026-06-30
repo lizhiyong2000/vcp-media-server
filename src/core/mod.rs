@@ -1,6 +1,7 @@
 mod config;
 mod tester;
 mod pusher;
+mod timestamp;
 pub mod protocol;
 
 use std::collections::HashMap;
@@ -14,6 +15,7 @@ pub use config::{Config, RtmpConfig, RtspConfig, WebrtcConfig, HttpConfig, Strea
 pub use tester::StreamTester;
 pub use pusher::*;
 pub use protocol::{ProtocolType, ProtocolInfo, ProtocolRegistry, StreamSink};
+pub use timestamp::{flv_timestamp_ms, media_timestamp_delta_ms};
 
 pub type StreamId = String;
 pub type TrackId = u8;

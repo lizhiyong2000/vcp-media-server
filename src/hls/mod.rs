@@ -111,9 +111,9 @@ impl HlsSession {
             CodecType::H264 | CodecType::H265 => {
                 if let Some(last) = self.last_raw_video_ts {
                     if frame.timestamp > last {
-                        let delta = frame.timestamp - last;
-                        if delta > 0 && delta < 2000 {
-                            self.session_video_mux_ms += delta;
+                        let delta_ms = crate::core::media_timestamp_delta_ms(last, frame.timestamp);
+                        if delta_ms > 0 && delta_ms < 2000 {
+                            self.session_video_mux_ms += delta_ms;
                         }
                     }
                 }
@@ -163,7 +163,8 @@ impl HlsSession {
         // Track segment duration from video timestamps only (audio/video RTMP clocks differ)
         if matches!(frame.codec, CodecType::H264 | CodecType::H265) {
             if self.last_video_timestamp > 0 && frame.timestamp > self.last_video_timestamp {
-                let delta_ms = frame.timestamp - self.last_video_timestamp;
+                let delta_ms =
+                    crate::core::media_timestamp_delta_ms(self.last_video_timestamp, frame.timestamp);
                 if delta_ms > 0 && delta_ms < 2000 {
                     self.segment_duration_acc += delta_ms as f64 / 1000.0;
                 }

@@ -177,11 +177,19 @@ impl RtspPuller {
                     let media = crate::webrtc::rtp_h264_media_payload(&rtp_payload)
                         .map(|(p, _, _)| p)
                         .unwrap_or(&rtp_payload[12..]);
+                    let aac_data = if codec == CodecType::AAC {
+                        match super::common::strip_mpeg4_generic_aac(media) {
+                            Some(raw) if !raw.is_empty() => raw,
+                            _ => continue,
+                        }
+                    } else {
+                        media.to_vec()
+                    };
                     let frame = MediaFrame {
                         stream_id: stream_id.clone(),
                         track_id,
                         timestamp: ts,
-                        data: media.to_vec().into(),
+                        data: aac_data.into(),
                         is_keyframe: marker,
                         codec,
                         rtp_data: None,

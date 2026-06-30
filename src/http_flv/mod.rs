@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 
-use crate::core::{StreamManager, MediaFrame, CodecType};
+use crate::core::{StreamManager, MediaFrame, CodecType, flv_timestamp_ms};
 use crate::rtmp::session::{frame_to_rtmp_audio, frame_to_rtmp_video};
 
 /// FLV file header (9 bytes)
@@ -168,14 +168,14 @@ fn frame_to_flv_video(frame: &MediaFrame) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();
     }
-    let timestamp = (frame.timestamp & 0xFFFFFFFF) as u32;
+    let timestamp = flv_timestamp_ms(frame.codec, frame.timestamp);
     generate_flv_tag(0x09, timestamp, &data)
 }
 
 /// Convert a MediaFrame to FLV audio tag data
 fn frame_to_flv_audio(frame: &MediaFrame) -> Vec<u8> {
     let data = frame_to_rtmp_audio(frame);
-    let timestamp = (frame.timestamp & 0xFFFFFFFF) as u32;
+    let timestamp = flv_timestamp_ms(frame.codec, frame.timestamp);
     generate_flv_tag(0x08, timestamp, &data)
 }
 

@@ -143,9 +143,6 @@ async fn main() -> Result<()> {
         info!("Created stream: {} (source: {:?}, protocol: {:?})", stream_config.id, source_clone, protocol_clone);
     }
 
-    let rtsp_server = rtsp::RtspServer::new(stream_manager.clone(), config.rtsp.port);
-    let webrtc_server = webrtc::WebrtcServer::new(stream_manager.clone(), config.webrtc.port);
-    
     // Initialize HLS server
     let hls_config = config.hls.as_ref().map(|h| HlsModuleConfig {
         enabled: h.enabled,
@@ -153,18 +150,27 @@ async fn main() -> Result<()> {
         max_segments: h.max_segments.unwrap_or(10),
         output_dir: h.output_dir.clone().unwrap_or("./hls".to_string()),
     }).unwrap_or_default();
-    
+
     let hls_server = Arc::new(hls::HlsServer::new(stream_manager.clone(), hls_config.clone()));
+    let hls_server_publish = if hls_config.enabled {
+        Some(hls_server.clone())
+    } else {
+        None
+    };
+
+    let rtsp_server = rtsp::RtspServer::new(
+        stream_manager.clone(),
+        config.rtsp.port,
+        hls_server_publish.clone(),
+    );
+    let webrtc_server = webrtc::WebrtcServer::new(stream_manager.clone(), config.webrtc.port);
+
     let hls_server_http = if hls_config.enabled {
         Some(hls_server.clone())
     } else {
         None
     };
-    let hls_server_rtmp = if hls_config.enabled {
-        Some(hls_server.clone())
-    } else {
-        None
-    };
+    let hls_server_rtmp = hls_server_publish.clone();
     
     // Initialize HTTP-FLV server
     let http_flv_enabled = config.http_flv.as_ref().map(|c| c.enabled).unwrap_or(true);

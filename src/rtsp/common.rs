@@ -757,3 +757,96 @@ impl UdpTransport {
         }
     }
 }
+
+/// RFC 3640 AAC-hbr parameters from our RTSP SDP (`sizeLength=13;indexLength=3`).
+const AAC_HBR_SIZE_LENGTH: u8 = 13;
+const AAC_HBR_INDEX_LENGTH: u8 = 3;
+
+/// Strip RFC 3640 `mpeg4-generic` AAC-hbr AU headers, returning raw AAC frame bytes.
+pub fn strip_mpeg4_generic_aac(payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.is_empty() {
+        return None;
+    }
+    // Already ADTS-framed (e.g. some pushers)
+    if payload.len() >= 7 && payload[0] == 0xFF && (payload[1] & 0xF0) == 0xF0 {
+        return Some(payload.to_vec());
+    }
+    if payload.len() < 2 {
+        return None;
+    }
+
+    // First 16 bits: AU-headers-length in **bits** (RFC 3640 §3.2.1), not >> 3.
+    let au_headers_length_bits = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    let au_headers_length_bytes = (au_headers_length_bits + 7) / 8;
+    let data_offset = 2 + au_headers_length_bytes;
+    if data_offset > payload.len() || au_headers_length_bytes == 0 {
+        return None;
+    }
+
+    let au_header_field_bits = AAC_HBR_SIZE_LENGTH as usize + AAC_HBR_INDEX_LENGTH as usize;
+    if au_headers_length_bits % au_header_field_bits != 0 {
+        return None;
+    }
+
+    let au_header_bytes = &payload[2..data_offset];
+    let au_size = read_aac_hbr_au_size(au_header_bytes)?;
+    if au_size == 0 {
+        return None;
+    }
+
+    // Complete AU in this RTP packet (typical for ffmpeg RTSP push).
+    if data_offset + au_size <= payload.len() {
+        return Some(payload[data_offset..data_offset + au_size].to_vec());
+    }
+
+    // Fragmented AU: use available bytes only when this is the sole AU in the packet.
+    let nb_au = au_headers_length_bits / au_header_field_bits;
+    if nb_au == 1 && data_offset < payload.len() {
+        return Some(payload[data_offset..].to_vec());
+    }
+
+    None
+}
+
+/// Read the first AU-size field from the AU-header section (MSB-first bit stream).
+fn read_aac_hbr_au_size(au_header_bytes: &[u8]) -> Option<usize> {
+    let mut bitpos = 0usize;
+    let mut read_bits = |n: usize| -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            let byte_idx = bitpos / 8;
+            let bit_idx = 7 - (bitpos % 8);
+            let byte = *au_header_bytes.get(byte_idx)?;
+            v = (v << 1) | ((byte >> bit_idx) & 1) as u32;
+            bitpos += 1;
+        }
+        Some(v)
+    };
+    let size = read_bits(AAC_HBR_SIZE_LENGTH as usize)? as usize;
+    let _index = read_bits(AAC_HBR_INDEX_LENGTH as usize)?;
+    Some(size)
+}
+
+#[cfg(test)]
+mod aac_tests {
+    use super::*;
+
+    #[test]
+    fn strip_aac_hbr_au_header() {
+        // au-headers-length = 16 bits (0x0010), one 16-bit AU header, size=4 → 0x0020
+        let payload = [0x00, 0x10, 0x00, 0x20, 0xDE, 0xAD, 0xBE, 0xEF];
+        let stripped = strip_mpeg4_generic_aac(&payload).unwrap();
+        assert_eq!(stripped, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn strip_aac_hbr_typical_ffmpeg_length_field() {
+        let au_size = 200usize;
+        let au_header = ((au_size as u16) << 3) as u16;
+        let mut payload = vec![0x00, 0x10, (au_header >> 8) as u8, (au_header & 0xFF) as u8];
+        payload.extend(std::iter::repeat_n(0xABu8, au_size));
+        let stripped = strip_mpeg4_generic_aac(&payload).unwrap();
+        assert_eq!(stripped.len(), au_size);
+        assert!(stripped.iter().all(|&b| b == 0xAB));
+    }
+}

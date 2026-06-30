@@ -35,6 +35,7 @@ pub struct RtspServerSession {
     reader: tokio::net::tcp::OwnedReadHalf,
     session: RtspSession,
     manager: Arc<StreamManager>,
+    hls_server: Option<Arc<crate::hls::HlsServer>>,
     peer_addr: SocketAddr,
     rtp_ssrc: u32,
     write_tx: Sender<Vec<u8>>,
@@ -56,7 +57,11 @@ struct UdpSocketManager {
 }
 
 impl RtspServerSession {
-    pub fn new(socket: TcpStream, manager: Arc<StreamManager>) -> Self {
+    pub fn new(
+        socket: TcpStream,
+        manager: Arc<StreamManager>,
+        hls_server: Option<Arc<crate::hls::HlsServer>>,
+    ) -> Self {
         let peer_addr = socket.peer_addr().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
         let (reader, writer) = socket.into_split();
         let (write_tx, write_rx) = channel(100);
@@ -69,6 +74,7 @@ impl RtspServerSession {
             reader,
             session: RtspSession::new(),
             manager,
+            hls_server,
             peer_addr,
             rtp_ssrc: rand::random(),
             write_tx,
@@ -625,11 +631,20 @@ impl RtspServerSession {
                 .map(|(p, _, _)| p)
                 .unwrap_or(&rtp_payload[12..]);
 
+            let aac_data = if codec == CodecType::AAC {
+                match super::common::strip_mpeg4_generic_aac(media_payload) {
+                    Some(raw) if !raw.is_empty() => raw,
+                    _ => return,
+                }
+            } else {
+                media_payload.to_vec()
+            };
+
             let frame = MediaFrame {
                 stream_id: stream_id.clone(),
                 track_id: track_id as u8,
                 timestamp: rtp_timestamp as u64,
-                data: media_payload.to_vec().into(),
+                data: aac_data.into(),
                 is_keyframe: marker,
                 codec,
                 rtp_data: Some(data.to_vec().into()),
@@ -669,7 +684,14 @@ impl RtspServerSession {
         debug!("[RTSP] [{}] Request #{}, cseq={}", self.peer_addr, request_count, cseq);
         debug!("[RTSP] [{}] Received request:\n{}", self.peer_addr, format_rtsp_message(&request));
 
-        let response = RtspServer::process_rtsp_request(&request, &self.manager, &mut self.session, self.peer_addr).await?;
+        let response = RtspServer::process_rtsp_request(
+            &request,
+            &self.manager,
+            &mut self.session,
+            self.peer_addr,
+            self.hls_server.clone(),
+        )
+        .await?;
 
         info!("[RTSP] [{}] Response #{}, length={}", self.peer_addr, request_count, response.len());
         

@@ -29,11 +29,20 @@ pub use pusher::RtspPusher;
 pub struct RtspServer {
     stream_manager: Arc<StreamManager>,
     port: u16,
+    hls_server: Option<Arc<crate::hls::HlsServer>>,
 }
 
 impl RtspServer {
-    pub fn new(stream_manager: Arc<StreamManager>, port: u16) -> Self {
-        Self { stream_manager, port }
+    pub fn new(
+        stream_manager: Arc<StreamManager>,
+        port: u16,
+        hls_server: Option<Arc<crate::hls::HlsServer>>,
+    ) -> Self {
+        Self {
+            stream_manager,
+            port,
+            hls_server,
+        }
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -48,8 +57,9 @@ impl RtspServer {
                 Ok((socket, peer_addr)) => {
                     info!("[RTSP] New connection from {}", peer_addr);
                     let manager = self.stream_manager.clone();
+                    let hls = self.hls_server.clone();
                     tokio::spawn(async move {
-                        let session = RtspServerSession::new(socket, manager);
+                        let session = RtspServerSession::new(socket, manager, hls);
                         session.start().await;
                     });
                 }
@@ -60,7 +70,13 @@ impl RtspServer {
         }
     }
 
-    pub async fn process_rtsp_request(request: &str, manager: &StreamManager, session: &mut RtspSession, peer_addr: std::net::SocketAddr) -> Result<String> {
+    pub async fn process_rtsp_request(
+        request: &str,
+        manager: &StreamManager,
+        session: &mut RtspSession,
+        peer_addr: std::net::SocketAddr,
+        hls_server: Option<Arc<crate::hls::HlsServer>>,
+    ) -> Result<String> {
         let lines: Vec<&str> = request.lines().collect();
         if lines.is_empty() {
             warn!("[RTSP] [{}] Empty request received, returning 400 Bad Request", peer_addr);
@@ -254,7 +270,10 @@ impl RtspServer {
             "RECORD" => {
                 info!("[RTSP] [{}] Handling RECORD request, cseq={}", peer_addr, cseq);
                 
-                let stream_id = Self::extract_stream_id(url);
+                let stream_id = session
+                    .stream_id
+                    .clone()
+                    .unwrap_or_else(|| Self::extract_stream_id(url));
                 info!("[RTSP] [{}] RECORD stream_id={}", peer_addr, stream_id);
                 
                 if session.session_id.is_none() {
@@ -263,7 +282,13 @@ impl RtspServer {
 
                 manager.ensure_stream_broadcast(&stream_id);
                 let _ = manager.set_publishing(&stream_id);
-                
+
+                if let Some(hls) = hls_server {
+                    if let Err(e) = hls.restart_stream(&stream_id).await {
+                        warn!("[RTSP] Failed to start HLS for {}: {}", stream_id, e);
+                    }
+                }
+
                 let session_id = session.session_id.as_ref().unwrap();
                 let response = Self::build_record_response(cseq, session_id);
                 Ok(response)
