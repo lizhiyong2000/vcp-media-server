@@ -25,6 +25,7 @@ use tracing::{debug, error, info, warn};
 use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::core::StreamManager;
+use crate::hls::HlsServer;
 use peer::create_api;
 use player::{cancel_play_relay, signal_play_relay_stop, start_play};
 use publisher::{add_ice_candidate, start_publish};
@@ -34,6 +35,7 @@ use signaling::{ClientSignal, ServerSignal};
 pub struct WebrtcServer {
     stream_manager: Arc<StreamManager>,
     port: u16,
+    hls_server: Option<Arc<HlsServer>>,
 }
 
 /// One WebSocket may hold both publish and play peer connections simultaneously.
@@ -59,8 +61,16 @@ impl SessionState {
 }
 
 impl WebrtcServer {
-    pub fn new(stream_manager: Arc<StreamManager>, port: u16) -> Self {
-        Self { stream_manager, port }
+    pub fn new(
+        stream_manager: Arc<StreamManager>,
+        port: u16,
+        hls_server: Option<Arc<HlsServer>>,
+    ) -> Self {
+        Self {
+            stream_manager,
+            port,
+            hls_server,
+        }
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -78,9 +88,10 @@ impl WebrtcServer {
                 Ok((socket, peer_addr)) => {
                     info!("[WebRTC] New connection from {}", peer_addr);
                     let manager = self.stream_manager.clone();
+                    let hls = self.hls_server.clone();
                     let api = api.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(socket, manager, api).await {
+                        if let Err(e) = handle_connection(socket, manager, api, hls).await {
                             error!("[WebRTC] Connection error from {}: {}", peer_addr, e);
                         }
                     });
@@ -97,6 +108,7 @@ async fn handle_connection(
     stream: TcpStream,
     manager: Arc<StreamManager>,
     api: Arc<webrtc::api::API>,
+    hls_server: Option<Arc<HlsServer>>,
 ) -> Result<()> {
     let ws = accept_async(stream).await?;
     let (mut ws_tx, mut ws_rx) = ws.split();
@@ -116,7 +128,16 @@ async fn handle_connection(
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_signal(&text, &api, &manager, &mut state, &ice_tx, &mut ws_tx).await {
+                        if let Err(e) = handle_signal(
+                            &text,
+                            &api,
+                            &manager,
+                            hls_server.as_ref(),
+                            &mut state,
+                            &ice_tx,
+                            &mut ws_tx,
+                        )
+                        .await {
                             warn!("[WebRTC] Signal error: {}", e);
                             let err = ServerSignal::Error { message: e.to_string() };
                             let _ = ws_tx.send(Message::Text(err.to_json())).await;
@@ -291,6 +312,7 @@ async fn handle_signal<S>(
     text: &str,
     api: &Arc<webrtc::api::API>,
     manager: &Arc<StreamManager>,
+    hls_server: Option<&Arc<HlsServer>>,
     state: &mut SessionState,
     ice_tx: &mpsc::UnboundedSender<ServerSignal>,
     ws_tx: &mut S,
@@ -331,6 +353,7 @@ where
             }
             state.stream_id = Some(stream_id.clone());
             register_publish_signaling(&stream_id, ice_tx.clone());
+            let stream_id_for_hls = stream_id.clone();
             let session = start_publish(
                 api.clone(),
                 manager.clone(),
@@ -339,6 +362,18 @@ where
                 ice_tx.clone(),
             )
             .await?;
+
+            if let Some(hls) = hls_server {
+                let hls = Arc::clone(hls);
+                tokio::spawn(async move {
+                    if let Err(e) = hls.restart_stream(&stream_id_for_hls).await {
+                        warn!(
+                            "[WebRTC] HLS restart failed for stream='{}': {}",
+                            stream_id_for_hls, e
+                        );
+                    }
+                });
+            }
 
             state.publish_pc = Some(session.pc);
             flush_pending_ice(state).await;

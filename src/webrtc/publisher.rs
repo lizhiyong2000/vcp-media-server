@@ -11,7 +11,7 @@ use webrtc::rtp::packetizer::Depacketizer;
 use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::track::track_remote::TrackRemote;
 
-use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode};
+use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, default_live_tracks};
 use super::h264_util::{describe_annex_b, is_keyframe_annex_b, is_parameter_set_only};
 use super::peer::{new_peer_connection, wire_pc_debug};
 use super::rtp_h264::{
@@ -43,6 +43,7 @@ pub async fn start_publish(
         StreamProtocol::WebRTC,
         None,
     );
+    manager.set_stream_tracks(&stream_id, default_live_tracks());
     let _ = manager.set_unpublished(&stream_id);
     manager.ensure_stream_broadcast(&stream_id);
 

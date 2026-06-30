@@ -166,7 +166,11 @@ async fn main() -> Result<()> {
         config.rtsp.port,
         hls_server_publish.clone(),
     );
-    let webrtc_server = webrtc::WebrtcServer::new(stream_manager.clone(), config.webrtc.port);
+    let webrtc_server = webrtc::WebrtcServer::new(
+        stream_manager.clone(),
+        config.webrtc.port,
+        hls_server_publish.clone(),
+    );
 
     let hls_server_http = if hls_config.enabled {
         Some(hls_server.clone())

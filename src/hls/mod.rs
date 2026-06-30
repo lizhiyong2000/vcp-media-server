@@ -151,6 +151,11 @@ impl HlsSession {
             return Ok(None);
         }
 
+        // HLS muxer only supports AAC audio; WebRTC publishes Opus.
+        if matches!(frame.codec, CodecType::Opus | CodecType::G711) {
+            return Ok(None);
+        }
+
         // Skip AAC sequence header / tiny config payloads
         if frame.codec == CodecType::AAC && frame.data.len() < 8 {
             return Ok(None);
@@ -165,7 +170,9 @@ impl HlsSession {
 
         // Initialize segment with PAT/PMT
         if self.segment_buffer.is_empty() {
-            let pat_pmt = self.muxer.generate_pat_pmt(true, true);
+            let has_audio =
+                self.session_audio_frames > 0 || frame.codec == CodecType::AAC;
+            let pat_pmt = self.muxer.generate_pat_pmt(true, has_audio);
             self.segment_buffer.extend(pat_pmt);
         }
 
@@ -208,7 +215,8 @@ impl HlsSession {
 
             // Start new segment (continuous timestamps, fresh TS continuity counters)
             self.begin_new_segment();
-            let pat_pmt = self.muxer.generate_pat_pmt(true, true);
+            let has_audio = self.session_audio_frames > 0;
+            let pat_pmt = self.muxer.generate_pat_pmt(true, has_audio);
             self.segment_buffer.extend(pat_pmt);
         }
 
@@ -358,6 +366,9 @@ impl HlsServer {
             loop {
                 match rx.recv().await {
                     Ok(mut frame) => {
+                        if matches!(frame.codec, CodecType::Opus | CodecType::G711) {
+                            continue;
+                        }
                         if frame.codec == CodecType::H264 && frame.is_keyframe {
                             if let Some(stream) = stream_manager.get_stream(&stream_id_owned) {
                                 if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
