@@ -1,5 +1,7 @@
 use anyhow::Result;
 use bytes::BytesMut;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -132,10 +134,18 @@ impl RtspPusher {
         let paused_clone = Arc::clone(&self.paused);
         let sps_cache_clone = Arc::clone(&self.sps_cache);
         let pps_cache_clone = Arc::clone(&self.pps_cache);
-        
+        let use_udp = session.use_udp();
+        let udp_tracks: HashMap<usize, (Arc<tokio::net::UdpSocket>, SocketAddr)> = session
+            .udp_track_transports()
+            .into_iter()
+            .map(|(id, sock, addr)| (id, (sock, addr)))
+            .collect();
+
+        info!("[RTSP Pusher] Transport: {}", if use_udp { "UDP" } else { "TCP" });
+
         tokio::spawn(async move {
             tokio::select! {
-                _ = Self::rtp_send_loop(writer, manager_clone, stream_id_clone, tracks_clone, paused_clone, sps_cache_clone, pps_cache_clone) => (),
+                _ = Self::rtp_send_loop(writer, manager_clone, stream_id_clone, tracks_clone, paused_clone, sps_cache_clone, pps_cache_clone, use_udp, udp_tracks) => (),
                 _ = Self::monitor_connection(reader) => (),
             }
         });
@@ -143,7 +153,17 @@ impl RtspPusher {
         Ok(())
     }
 
-    async fn rtp_send_loop(mut writer: tokio::net::tcp::OwnedWriteHalf, manager: Arc<StreamManager>, stream_id: String, tracks: Vec<Track>, paused: Arc<RwLock<bool>>, sps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>, pps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>) {
+    async fn rtp_send_loop(
+        mut writer: tokio::net::tcp::OwnedWriteHalf,
+        manager: Arc<StreamManager>,
+        stream_id: String,
+        tracks: Vec<Track>,
+        paused: Arc<RwLock<bool>>,
+        sps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
+        pps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
+        use_udp: bool,
+        udp_tracks: HashMap<usize, (Arc<tokio::net::UdpSocket>, SocketAddr)>,
+    ) {
         let mut buffer = BytesMut::with_capacity(8192);
         let mut frame_count: u64 = 0;
         let mut bytes_sent: u64 = 0;
@@ -161,6 +181,25 @@ impl RtspPusher {
         };
         
         info!("[RTSP Pusher] [RTP Loop] Waiting for media frames...");
+
+        async fn send_rtp_packet(
+            writer: &mut tokio::net::tcp::OwnedWriteHalf,
+            use_udp: bool,
+            udp_tracks: &HashMap<usize, (Arc<tokio::net::UdpSocket>, SocketAddr)>,
+            track_id: usize,
+            channel: u8,
+            packet: &[u8],
+        ) -> Result<()> {
+            if use_udp {
+                if let Some((socket, addr)) = udp_tracks.get(&track_id) {
+                    RtspCommon::send_rtp_over_udp(socket, packet, *addr).await?;
+                }
+            } else {
+                let interleaved = RtspClientSession::wrap_interleaved(packet, channel);
+                writer.write_all(&interleaved).await?;
+            }
+            Ok(())
+        }
         
         while let Ok(frame) = receiver.recv().await {
             frame_count += 1;
@@ -211,24 +250,40 @@ impl RtspPusher {
                     let sps_rtp = RtspClientSession::build_rtp_packet(
                         96, seq, timestamp, 0x12345678, false, &sps_data
                     );
-                    let sps_interleaved = RtspClientSession::wrap_interleaved(&sps_rtp, channel);
-                    if let Err(e) = writer.write_all(&sps_interleaved).await {
+                    if let Err(e) = send_rtp_packet(
+                        &mut writer,
+                        use_udp,
+                        &udp_tracks,
+                        track.id as usize,
+                        channel,
+                        &sps_rtp,
+                    )
+                    .await
+                    {
                         error!("[RTSP Pusher] [RTP Loop] Failed to send SPS: {}", e);
                         break;
                     }
-                    info!("[RTSP Pusher] [RTP Loop] Sent SPS RTP ({} bytes)", sps_interleaved.len());
+                    info!("[RTSP Pusher] [RTP Loop] Sent SPS RTP ({} bytes)", sps_rtp.len());
                     sequences[track.id as usize] = sequences[track.id as usize].wrapping_add(1);
                     
                     // Send PPS packet
                     let pps_rtp = RtspClientSession::build_rtp_packet(
                         96, sequences[track.id as usize], timestamp, 0x12345678, false, &pps_data
                     );
-                    let pps_interleaved = RtspClientSession::wrap_interleaved(&pps_rtp, channel);
-                    if let Err(e) = writer.write_all(&pps_interleaved).await {
+                    if let Err(e) = send_rtp_packet(
+                        &mut writer,
+                        use_udp,
+                        &udp_tracks,
+                        track.id as usize,
+                        channel,
+                        &pps_rtp,
+                    )
+                    .await
+                    {
                         error!("[RTSP Pusher] [RTP Loop] Failed to send PPS: {}", e);
                         break;
                     }
-                    info!("[RTSP Pusher] [RTP Loop] Sent PPS RTP ({} bytes)", pps_interleaved.len());
+                    info!("[RTSP Pusher] [RTP Loop] Sent PPS RTP ({} bytes)", pps_rtp.len());
                     sequences[track.id as usize] = sequences[track.id as usize].wrapping_add(1);
                 }
             }
@@ -254,13 +309,30 @@ impl RtspPusher {
                 frame.is_keyframe,
                 &rtp_payload
             );
-            
-            let interleaved = RtspClientSession::wrap_interleaved(&rtp_packet, channel);
-            bytes_sent += interleaved.len() as u64;
-            
-            if let Err(e) = writer.write_all(&interleaved).await {
-                error!("[RTSP Pusher] [RTP Loop] Frame #{:>6} - Failed to send RTP packet: {}", frame_count, e);
+
+            if use_udp {
+                bytes_sent += rtp_packet.len() as u64;
+            }
+
+            if let Err(e) = send_rtp_packet(
+                &mut writer,
+                use_udp,
+                &udp_tracks,
+                track.id as usize,
+                channel,
+                &rtp_packet,
+            )
+            .await
+            {
+                error!(
+                    "[RTSP Pusher] [RTP Loop] Frame #{:>6} - Failed to send RTP packet: {}",
+                    frame_count, e
+                );
                 break;
+            }
+
+            if !use_udp {
+                bytes_sent += (4 + rtp_packet.len()) as u64;
             }
             
             sequences[track.id as usize] = sequences[track.id as usize].wrapping_add(1);

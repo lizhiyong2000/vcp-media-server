@@ -8,7 +8,7 @@ use tracing::{info, warn, debug};
 use crate::core::{Track, CodecType};
 use super::messages::RtspRequest;
 
-/// Format RTSP message for human-readable logging
+/// Format RTSP message for human-readable logging (CRLF → LF, trim trailing blank line).
 pub fn format_rtsp_message(message: &str) -> String {
     let mut lines: Vec<String> = message
         .split("\r\n")
@@ -16,16 +16,132 @@ pub fn format_rtsp_message(message: &str) -> String {
             if line.is_empty() {
                 "[empty line]".to_string()
             } else {
-                format!("  {}", line)
+                line.to_string()
             }
         })
         .collect();
-    
-    if lines.last() == Some(&"  [empty line]".to_string()) {
+
+    if lines.last() == Some(&"[empty line]".to_string()) {
         lines.pop();
     }
-    
+
     lines.join("\n")
+}
+
+/// Parsed `Transport:` header from an RTSP message.
+#[derive(Debug, Default, Clone)]
+pub struct TransportInfo {
+    pub transport_type: String,
+    pub client_port: Option<(u16, u16)>,
+    pub server_port: Option<(u16, u16)>,
+}
+
+pub fn extract_transport(request: &str) -> TransportInfo {
+    let mut info = TransportInfo::default();
+
+    for line in request.lines() {
+        if !line.starts_with("Transport:") {
+            continue;
+        }
+        for part in line.split(';') {
+            let trimmed = part.trim();
+            if trimmed.starts_with("Transport:") {
+                info.transport_type = trimmed["Transport:".len()..].trim().to_string();
+            } else if trimmed.starts_with("client_port=") {
+                let ports: Vec<&str> = trimmed["client_port=".len()..].split('-').collect();
+                if ports.len() >= 2 {
+                    if let (Ok(p1), Ok(p2)) = (ports[0].parse(), ports[1].parse()) {
+                        info.client_port = Some((p1, p2));
+                    }
+                }
+            } else if trimmed.starts_with("server_port=") {
+                let ports: Vec<&str> = trimmed["server_port=".len()..].split('-').collect();
+                if ports.len() >= 2 {
+                    if let (Ok(p1), Ok(p2)) = (ports[0].parse(), ports[1].parse()) {
+                        info.server_port = Some((p1, p2));
+                    }
+                }
+            } else if trimmed.starts_with("interleaved=") {
+                let ports: Vec<&str> = trimmed["interleaved=".len()..].split('-').collect();
+                if ports.len() >= 2 {
+                    if let (Ok(p1), Ok(p2)) = (ports[0].parse(), ports[1].parse()) {
+                        info.client_port = Some((p1, p2));
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    info
+}
+
+pub fn is_udp_transport(transport: &TransportInfo) -> bool {
+    !transport.transport_type.to_uppercase().contains("TCP")
+}
+
+/// Parse `server_port=` from a SETUP response.
+pub fn parse_transport_server_ports(response: &str) -> Option<(u16, u16)> {
+    for line in response.lines() {
+        if !line.starts_with("Transport:") {
+            continue;
+        }
+        for part in line.split(';') {
+            let trimmed = part.trim();
+            if let Some(ports) = trimmed.strip_prefix("server_port=") {
+                let v: Vec<&str> = ports.split('-').collect();
+                if v.len() >= 2 {
+                    if let (Ok(p1), Ok(p2)) = (v[0].parse(), v[1].parse()) {
+                        return Some((p1, p2));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True when URL query asks for UDP (`transport=udp` or `rtsp_transport=udp`).
+pub fn url_prefers_udp(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.contains("transport=udp") || lower.contains("rtsp_transport=udp")
+}
+
+/// Parse track index from SETUP URL (`trackID=`, `trackid=`, `streamid=`).
+pub fn extract_track_id(url: &str) -> u32 {
+    let path = url.to_lowercase();
+    for prefix in ["trackid=", "streamid="] {
+        if let Some(idx) = path.find(prefix) {
+            let rest = &path[idx + prefix.len()..];
+            if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
+                return rest[..end].parse().unwrap_or(0);
+            }
+            return rest.parse().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Parse stream name from RTSP URL, stripping track suffixes.
+pub fn extract_stream_id(url: &str) -> String {
+    let path = url::Url::parse(url)
+        .ok()
+        .map(|u| u.path().to_string())
+        .unwrap_or_else(|| url.to_string());
+
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if let Some(last_part) = parts.last() {
+        let lower = last_part.to_lowercase();
+        if lower.starts_with("trackid=") || lower.starts_with("streamid=") {
+            if parts.len() >= 2 {
+                return parts[parts.len() - 2].to_string();
+            }
+        }
+        last_part.to_string()
+    } else {
+        "live".to_string()
+    }
 }
 
 pub struct RtspCommon;
@@ -364,7 +480,7 @@ impl RtspCommon {
                 _ => ("video", "H264"),
             };
 
-            sdp.push_str(&format!("m={} 0 RTP/AVP/TCP {}\r\n", media_type, track.payload_type));
+            sdp.push_str(&format!("m={} 0 RTP/AVP {}\r\n", media_type, track.payload_type));
             sdp.push_str("c=IN IP4 0.0.0.0\r\n");
             sdp.push_str("t=0 0\r\n");
             sdp.push_str(&format!("a=rtpmap:{} {}/{}\r\n", track.payload_type, codec_name, track.clock_rate));

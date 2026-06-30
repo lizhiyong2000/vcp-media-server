@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Sender, Receiver, channel};
@@ -10,26 +11,7 @@ use bytes::BytesMut;
 use crate::core::{StreamManager, MediaFrame, CodecType};
 use crate::webrtc::H264RtpIngest;
 use super::{RtspRequest, RtspResponse, RtspSession, TransportMode, RtspServer};
-use super::common::RtspCommon;
-
-fn format_rtsp_message(message: &str) -> String {
-    let mut lines: Vec<String> = message
-        .split("\r\n")
-        .map(|line| {
-            if line.is_empty() {
-                "[empty line]".to_string()
-            } else {
-                format!("  {}", line)
-            }
-        })
-        .collect();
-    
-    if lines.last() == Some(&"  [empty line]".to_string()) {
-        lines.pop();
-    }
-    
-    lines.join("\n")
-}
+use super::common::{format_rtsp_message, extract_transport, extract_track_id, is_udp_transport, RtspCommon};
 
 pub struct RtspServerSession {
     reader: tokio::net::tcp::OwnedReadHalf,
@@ -40,7 +22,8 @@ pub struct RtspServerSession {
     rtp_ssrc: u32,
     write_tx: Sender<Vec<u8>>,
     running: bool,
-    udp_sockets: Option<UdpSocketManager>,
+    udp_tracks: HashMap<u8, UdpTrackTransport>,
+    udp_receiver_tracks: std::collections::HashSet<u8>,
     // H264 codec parameters
     sps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     pps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
@@ -49,11 +32,12 @@ pub struct RtspServerSession {
     sdp_generated: Arc<parking_lot::RwLock<bool>>,
 }
 
-struct UdpSocketManager {
-    rtp_socket: Option<tokio::net::UdpSocket>,
-    rtcp_socket: Option<tokio::net::UdpSocket>,
-    client_rtp_addr: Option<SocketAddr>,
-    client_rtcp_addr: Option<SocketAddr>,
+#[derive(Clone)]
+struct UdpTrackTransport {
+    rtp_socket: Arc<tokio::net::UdpSocket>,
+    rtcp_socket: Arc<tokio::net::UdpSocket>,
+    client_rtp_addr: SocketAddr,
+    client_rtcp_addr: SocketAddr,
 }
 
 impl RtspServerSession {
@@ -79,7 +63,8 @@ impl RtspServerSession {
             rtp_ssrc: rand::random(),
             write_tx,
             running: true,
-            udp_sockets: None,
+            udp_tracks: HashMap::new(),
+            udp_receiver_tracks: std::collections::HashSet::new(),
             sps_cache: Arc::new(parking_lot::RwLock::new(None)),
             pps_cache: Arc::new(parking_lot::RwLock::new(None)),
             h264_ingest: None,
@@ -87,121 +72,142 @@ impl RtspServerSession {
         }
     }
 
-    pub async fn setup_udp_transport(&mut self, client_rtp_port: u16, client_rtcp_port: u16) -> Result<(u16, u16)> {
-        let server_rtp_port = self.allocate_udp_port();
-        let server_rtcp_port = self.allocate_udp_port();
-        
-        info!("[RTSP] [{}] Setting up UDP transport: client_rtp={}, client_rtcp={}, server_rtp={}, server_rtcp={}", 
-              self.peer_addr, client_rtp_port, client_rtcp_port, server_rtp_port, server_rtcp_port);
-        
-        let rtp_socket = RtspCommon::create_udp_socket(server_rtp_port).await?;
-        let rtcp_socket = RtspCommon::create_udp_socket(server_rtcp_port).await?;
-        
-        let client_rtp_addr: SocketAddr = format!("{}:{}", self.peer_addr.ip(), client_rtp_port).parse().unwrap();
-        let client_rtcp_addr: SocketAddr = format!("{}:{}", self.peer_addr.ip(), client_rtcp_port).parse().unwrap();
-        
-        self.udp_sockets = Some(UdpSocketManager {
-            rtp_socket: Some(rtp_socket),
-            rtcp_socket: Some(rtcp_socket),
-            client_rtp_addr: Some(client_rtp_addr),
-            client_rtcp_addr: Some(client_rtcp_addr),
-        });
-        
+    async fn setup_udp_track(
+        &mut self,
+        track_id: u8,
+        client_rtp_port: u16,
+        client_rtcp_port: u16,
+    ) -> Result<(u16, u16)> {
+        let (server_rtp_port, server_rtcp_port) = self.allocate_udp_port_pair();
+
+        info!(
+            "[RTSP] [{}] UDP SETUP track={} client={}-{} server={}-{}",
+            self.peer_addr, track_id, client_rtp_port, client_rtcp_port, server_rtp_port, server_rtcp_port
+        );
+
+        let rtp_socket = Arc::new(RtspCommon::create_udp_socket(server_rtp_port).await?);
+        let rtcp_socket = Arc::new(RtspCommon::create_udp_socket(server_rtcp_port).await?);
+
+        let client_rtp_addr = SocketAddr::new(self.peer_addr.ip(), client_rtp_port);
+        let client_rtcp_addr = SocketAddr::new(self.peer_addr.ip(), client_rtcp_port);
+
+        self.udp_tracks.insert(
+            track_id,
+            UdpTrackTransport {
+                rtp_socket: Arc::clone(&rtp_socket),
+                rtcp_socket,
+                client_rtp_addr,
+                client_rtcp_addr,
+            },
+        );
+
         self.session.transport_mode = TransportMode::Udp;
-        
+        self.start_udp_receiver_for_track(track_id, rtp_socket);
         Ok((server_rtp_port, server_rtcp_port))
     }
 
-    pub async fn start_udp_receiver(&mut self) {
-        let Some(ref mut udp_mgr) = self.udp_sockets else {
-            warn!("[RTSP] [{}] UDP sockets not configured", self.peer_addr);
+    fn start_udp_receiver_for_track(&mut self, track_id: u8, rtp_socket: Arc<tokio::net::UdpSocket>) {
+        if !self.udp_receiver_tracks.insert(track_id) {
             return;
+        }
+
+        let stream_id = match self.session.stream_id.clone() {
+            Some(id) => id,
+            None => {
+                self.udp_receiver_tracks.remove(&track_id);
+                return;
+            }
         };
-        
-        let Some(rtp_socket) = udp_mgr.rtp_socket.take() else {
-            return;
-        };
-        
-        let stream_id = self.session.stream_id.clone().unwrap_or_default();
+
         let manager = Arc::clone(&self.manager);
         let peer_addr = self.peer_addr;
-        
+
         tokio::spawn(async move {
-            info!("[RTSP] [UDP Receiver] Starting UDP RTP receiver for stream {}", stream_id);
-            
+            info!(
+                "[RTSP] [UDP Receiver] track={} stream='{}' from {}",
+                track_id, stream_id, peer_addr
+            );
             let mut buffer = vec![0u8; 65535];
-            let mut total_packets: u64 = 0;
-            let mut total_bytes: u64 = 0;
-            
+            let mut h264_ingest = if track_id == 0 {
+                Some(H264RtpIngest::new(manager.clone(), stream_id.clone(), "RTSP-Push-UDP"))
+            } else {
+                None
+            };
+
             loop {
                 match RtspCommon::receive_rtp_over_udp(&rtp_socket, &mut buffer).await {
-                    Ok((len, src)) => {
-                        total_packets += 1;
-                        total_bytes += len as u64;
-                        
-                        if RtspCommon::is_rtcp_packet(&buffer[..len]) {
-                            debug!("[RTSP] [UDP Receiver] Received RTCP packet from {} ({} bytes)", src, len);
+                    Ok((len, _)) => {
+                        if len < 12 || RtspCommon::is_rtcp_packet(&buffer[..len]) {
                             continue;
                         }
-                        
-                        if let Some(header) = RtspCommon::parse_rtp_header(&buffer[..len]) {
-                            let track_id = if header.payload_type == 96 { 0 } else { 1 };
-                            let codec = if header.payload_type == 96 { CodecType::H264 } else { CodecType::AAC };
-                            let is_keyframe = header.marker != 0;
-                            
-                            debug!("[RTSP] [UDP Receiver] RTP: track={}, seq={}, ts={}, len={}", 
-                                   track_id, header.sequence_number, header.timestamp, len);
-                            
+
+                        if track_id == 0 {
+                            if let Some(ingest) = &mut h264_ingest {
+                                ingest.ingest_rtp_packet(&buffer[..len]);
+                            }
+                        } else {
+                            let marker = (buffer[1] & 0x80) != 0;
+                            let ts = u32::from_be_bytes(
+                                buffer[4..8].try_into().unwrap_or([0; 4]),
+                            ) as u64;
+                            let payload_type = buffer[1] & 0x7F;
+                            let codec = if payload_type == 97 {
+                                CodecType::AAC
+                            } else {
+                                CodecType::AAC
+                            };
+                            let media = crate::webrtc::rtp_h264_media_payload(&buffer[..len])
+                                .map(|(p, _, _)| p)
+                                .unwrap_or(&buffer[12..len]);
+                            let aac_data = match super::common::strip_mpeg4_generic_aac(media) {
+                                Some(raw) if !raw.is_empty() => raw,
+                                _ => continue,
+                            };
                             let frame = MediaFrame {
                                 stream_id: stream_id.clone(),
                                 track_id,
-                                timestamp: header.timestamp as u64,
-                                data: buffer[12..len].to_vec().into(),
-                                is_keyframe,
+                                timestamp: ts,
+                                data: aac_data.into(),
+                                is_keyframe: marker,
                                 codec,
                                 rtp_data: Some(buffer[..len].to_vec().into()),
                             };
-                            
                             manager.publish_frame(frame);
-                        }
-                        
-                        if total_packets % 1000 == 0 {
-                            info!("[RTSP] [UDP Receiver] Stats: packets={}, bytes={}", total_packets, total_bytes);
                         }
                     }
                     Err(e) => {
-                        error!("[RTSP] [UDP Receiver] Error receiving: {}", e);
+                        error!(
+                            "[RTSP] [UDP Receiver] track={} stream='{}' error: {}",
+                            track_id, stream_id, e
+                        );
                         break;
                     }
                 }
             }
-            
-            info!("[RTSP] [UDP Receiver] Stopped: packets={}, bytes={}", total_packets, total_bytes);
         });
     }
 
-    fn allocate_udp_port(&self) -> u16 {
-        (50000 + rand::random::<u16>() % 10000) & !1
+    async fn ensure_udp_receivers_started(&mut self) {
+        for (track_id, transport) in self.udp_tracks.clone() {
+            self.start_udp_receiver_for_track(track_id, Arc::clone(&transport.rtp_socket));
+        }
+    }
+    fn allocate_udp_port_pair(&self) -> (u16, u16) {
+        let base = (50000 + rand::random::<u16>() % 9998) & !1;
+        (base, base + 1)
     }
 
     pub fn is_udp_configured(&self) -> bool {
-        self.udp_sockets.is_some()
+        !self.udp_tracks.is_empty()
     }
 
-    pub async fn send_rtp_over_udp(&self, data: &[u8], track_id: u8) -> Result<()> {
-        let Some(ref udp_mgr) = self.udp_sockets else {
-            return Err(anyhow::anyhow!("UDP not configured"));
-        };
-        
-        let Some(ref client_addr) = udp_mgr.client_rtp_addr else {
-            return Err(anyhow::anyhow!("Client address not set"));
-        };
-        
-        let Some(ref socket) = udp_mgr.rtp_socket else {
-            return Err(anyhow::anyhow!("RTP socket not available"));
-        };
-        
-        RtspCommon::send_rtp_over_udp(socket, data, *client_addr).await?;
+    async fn send_rtp_over_udp_track(&self, data: &[u8], track_id: u8) -> Result<()> {
+        let transport = self
+            .udp_tracks
+            .get(&track_id)
+            .ok_or_else(|| anyhow::anyhow!("UDP track {} not configured", track_id))?;
+        RtspCommon::send_rtp_over_udp(&transport.rtp_socket, data, transport.client_rtp_addr)
+            .await?;
         Ok(())
     }
 
@@ -684,12 +690,40 @@ impl RtspServerSession {
         debug!("[RTSP] [{}] Request #{}, cseq={}", self.peer_addr, request_count, cseq);
         debug!("[RTSP] [{}] Received request:\n{}", self.peer_addr, format_rtsp_message(&request));
 
+        let method = request
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or("");
+        let mut setup_server_ports: Option<(u16, u16)> = None;
+        if method == "SETUP" {
+            let transport = extract_transport(&request);
+            if is_udp_transport(&transport) {
+                if let Some((client_rtp, client_rtcp)) = transport.client_port {
+                    let url = request
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("");
+                    let track_id = extract_track_id(url) as u8;
+                    match self
+                        .setup_udp_track(track_id, client_rtp, client_rtcp)
+                        .await
+                    {
+                        Ok(ports) => setup_server_ports = Some(ports),
+                        Err(e) => warn!("[RTSP] [{}] UDP SETUP failed: {}", self.peer_addr, e),
+                    }
+                }
+            }
+        }
+
         let response = RtspServer::process_rtsp_request(
             &request,
             &self.manager,
             &mut self.session,
             self.peer_addr,
             self.hls_server.clone(),
+            setup_server_ports,
         )
         .await?;
 
@@ -697,6 +731,10 @@ impl RtspServerSession {
         
         let parsed_response = RtspResponse::parse(&response).unwrap_or_else(|| RtspResponse::new(500, "Internal Server Error").with_cseq("0"));
         self.send_response(&parsed_response).await?;
+
+        if method == "RECORD" && self.session.transport_mode == TransportMode::Udp {
+            self.ensure_udp_receivers_started().await;
+        }
 
         if self.session.playing && self.session.stream_id.is_some() && !self.session.rtp_task_started {
             self.start_rtp_sender().await;
@@ -714,10 +752,15 @@ impl RtspServerSession {
         let manager = Arc::clone(&self.manager);
         let sps_cache = Arc::clone(&self.sps_cache);
         let pps_cache = Arc::clone(&self.pps_cache);
-        let peer_addr = self.peer_addr.clone();
+        let peer_addr = self.peer_addr;
+        let use_udp = self.session.transport_mode == TransportMode::Udp;
+        let udp_tracks = self.udp_tracks.clone();
 
         tokio::spawn(async move {
-            info!("[RTSP] [{}] Starting RTP sender task, SSRC={}", stream_id, rtp_ssrc);
+            info!(
+                "[RTSP] [{}] Starting RTP sender (udp={}) SSRC={}",
+                stream_id, use_udp, rtp_ssrc
+            );
 
             if let Some(mut rx) = manager.subscribe(&stream_id) {
                 info!("[RTSP] [{}] Successfully subscribed to stream channel", stream_id);
@@ -727,7 +770,50 @@ impl RtspServerSession {
                 while let Ok(frame) = rx.recv().await {
                     frame_count += 1;
 
-                    // If frame has original RTP data, send it directly
+                    if use_udp {
+                        let rtp_bytes = if let Some(ref rtp_data) = frame.rtp_data {
+                            rtp_data.to_vec()
+                        } else {
+                            let payload_type = match frame.codec {
+                                CodecType::H264 => 96,
+                                CodecType::AAC => 97,
+                                _ => 96,
+                            };
+                            let rtp_payload = if frame.codec == CodecType::H264 {
+                                let mut payload = Vec::with_capacity(4 + frame.data.len());
+                                payload.extend_from_slice(&(frame.data.len() as u32).to_be_bytes());
+                                payload.extend_from_slice(&frame.data);
+                                payload
+                            } else {
+                                frame.data.to_vec()
+                            };
+                            RtspCommon::build_rtp_packet(
+                                payload_type,
+                                frame_count as u16,
+                                frame.timestamp as u32,
+                                rtp_ssrc,
+                                frame.is_keyframe,
+                                &rtp_payload,
+                            )
+                        };
+
+                        if let Some(track) = udp_tracks.get(&frame.track_id) {
+                            if RtspCommon::send_rtp_over_udp(
+                                &track.rtp_socket,
+                                &rtp_bytes,
+                                track.client_rtp_addr,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                error!("[RTSP] [{}] Failed to send UDP RTP", stream_id);
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // TCP interleaved path
                     if let Some(ref rtp_data) = frame.rtp_data {
                         if write_tx.send(rtp_data.to_vec()).await.is_ok() {
                             if frame_count <= 10 || frame.is_keyframe || frame_count % 100 == 0 {
@@ -809,7 +895,7 @@ impl RtspServerSession {
         let mut sdp = format!("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=MediaServer Session: {}\r\nt=0 0\r\n", stream_id);
         
         // Video track (H264)
-        sdp.push_str("m=video 0 RTP/AVP/TCP 96\r\n");
+        sdp.push_str("m=video 0 RTP/AVP 96\r\n");
         sdp.push_str("c=IN IP4 0.0.0.0\r\n");
         sdp.push_str("a=rtpmap:96 H264/90000\r\n");
         sdp.push_str("a=control:trackID=0\r\n");
@@ -838,7 +924,7 @@ impl RtspServerSession {
         }
         
         // Audio track (AAC)
-        sdp.push_str("m=audio 0 RTP/AVP/TCP 97\r\n");
+        sdp.push_str("m=audio 0 RTP/AVP 97\r\n");
         sdp.push_str("c=IN IP4 0.0.0.0\r\n");
         sdp.push_str("t=0 0\r\n");
         sdp.push_str("a=rtpmap:97 mpeg4-generic/44100/2\r\n");

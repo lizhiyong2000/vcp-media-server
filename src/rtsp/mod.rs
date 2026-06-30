@@ -19,6 +19,7 @@ pub mod pusher;
 
 pub use messages::{RtspRequest, RtspResponse};
 pub use common::format_rtsp_message;
+pub use common::{extract_transport, extract_track_id, extract_stream_id, is_udp_transport, parse_transport_server_ports, url_prefers_udp, TransportInfo};
 pub use session::{RtspSession, TransportMode};
 pub use common::{RtspCommon, RtpHeader, UdpTransport};
 pub use client_session::RtspClientSession;
@@ -76,6 +77,7 @@ impl RtspServer {
         session: &mut RtspSession,
         peer_addr: std::net::SocketAddr,
         hls_server: Option<Arc<crate::hls::HlsServer>>,
+        setup_server_ports: Option<(u16, u16)>,
     ) -> Result<String> {
         let lines: Vec<&str> = request.lines().collect();
         if lines.is_empty() {
@@ -105,7 +107,7 @@ impl RtspServer {
             "DESCRIBE" => {
                 info!("[RTSP] [{}] Handling DESCRIBE request, cseq={}", peer_addr, cseq);
                 
-                let stream_id = Self::extract_stream_id(url);
+                let stream_id = extract_stream_id(url);
                 info!("[RTSP] [{}] DESCRIBE stream_id={}", peer_addr, stream_id);
                 
                 if manager.get_stream(&stream_id.to_string()).is_none() {
@@ -125,21 +127,24 @@ impl RtspServer {
                 info!("[RTSP] [{}] Handling SETUP request, cseq={}", peer_addr, cseq);
                 
                 if session.stream_id.is_none() {
-                    let stream_id = Self::extract_stream_id(url);
+                    let stream_id = extract_stream_id(url);
                     session.stream_id = Some(stream_id);
                 }
 
-                let track_id = Self::extract_track_id(url);
+                let track_id = extract_track_id(url);
                 info!("[RTSP] [{}] SETUP track_id={}", peer_addr, track_id);
 
                 if session.session_id.is_none() {
                     session.session_id = Some(rand_id());
                 }
 
-                let transport = Self::extract_transport(request);
+                let mut transport = extract_transport(request);
+                if let Some(ports) = setup_server_ports {
+                    transport.server_port = Some(ports);
+                }
                 info!("[RTSP] [{}] SETUP transport={:?}", peer_addr, transport);
                 
-                if transport.transport_type == "RTP/AVP/TCP" {
+                if transport.transport_type.to_uppercase().contains("TCP") {
                     session.transport_mode = TransportMode::Tcp;
                 } else {
                     session.transport_mode = TransportMode::Udp;
@@ -206,7 +211,7 @@ impl RtspServer {
                 let body = &request[body_start..];
                 debug!("[RTSP] [{}] ANNOUNCE body length={}", peer_addr, body.len());
                 
-                let stream_id = Self::extract_stream_id(url);
+                let stream_id = extract_stream_id(url);
                 info!("[RTSP] [{}] ANNOUNCE stream_id={}", peer_addr, stream_id);
                 
                 // Log the full SDP for debugging
@@ -273,7 +278,7 @@ impl RtspServer {
                 let stream_id = session
                     .stream_id
                     .clone()
-                    .unwrap_or_else(|| Self::extract_stream_id(url));
+                    .unwrap_or_else(|| extract_stream_id(url));
                 info!("[RTSP] [{}] RECORD stream_id={}", peer_addr, stream_id);
                 
                 if session.session_id.is_none() {
@@ -336,13 +341,19 @@ impl RtspServer {
     }
 
     fn build_setup_response(cseq: &str, session_id: &str, transport: &TransportInfo) -> String {
-        let transport_line = if transport.transport_type == "RTP/AVP/TCP" {
-            format!("RTP/AVP/TCP;interleaved={}-{}", transport.client_port.unwrap_or((0, 1)).0, transport.client_port.unwrap_or((0, 1)).1)
+        let transport_line = if transport.transport_type.to_uppercase().contains("TCP") {
+            format!(
+                "RTP/AVP/TCP;interleaved={}-{}",
+                transport.client_port.unwrap_or((0, 1)).0,
+                transport.client_port.unwrap_or((0, 1)).1
+            )
         } else {
             let server_ports = transport.server_port.unwrap_or((5000, 5001));
             let client_ports = transport.client_port.unwrap_or((5000, 5001));
-            format!("RTP/AVP;client_port={}-{};server_port={}-{}", 
-                    client_ports.0, client_ports.1, server_ports.0, server_ports.1)
+            format!(
+                "RTP/AVP;unicast;client_port={}-{};server_port={}-{}",
+                client_ports.0, client_ports.1, server_ports.0, server_ports.1
+            )
         };
         
         let mut response = RtspResponse::new(200, "OK")
@@ -450,7 +461,7 @@ impl RtspServer {
                     _ => ("video", "H264", 90000),
                 };
                 
-                sdp.push_str(&format!("m={} 0 RTP/AVP/TCP {}\r\n", media_type, track.payload_type));
+                sdp.push_str(&format!("m={} 0 RTP/AVP {}\r\n", media_type, track.payload_type));
                 sdp.push_str(&format!("c=IN IP4 0.0.0.0\r\n"));
                 sdp.push_str(&format!("a=rtpmap:{} {}/{}\r\n", track.payload_type, codec_name, clock_rate));
                 sdp.push_str(&format!("a=control:trackID={}\r\n", idx));
@@ -462,13 +473,13 @@ impl RtspServer {
                 }
             }
         } else {
-            sdp.push_str("m=video 0 RTP/AVP/TCP 96\r\n");
+            sdp.push_str("m=video 0 RTP/AVP 96\r\n");
             sdp.push_str("c=IN IP4 0.0.0.0\r\n");
             sdp.push_str("a=rtpmap:96 H264/90000\r\n");
             sdp.push_str("a=control:trackID=0\r\n");
             sdp.push_str(&h264_fmtp);
             
-            sdp.push_str("m=audio 0 RTP/AVP/TCP 97\r\n");
+            sdp.push_str("m=audio 0 RTP/AVP 97\r\n");
             sdp.push_str("c=IN IP4 0.0.0.0\r\n");
             sdp.push_str("a=rtpmap:97 mpeg4-generic/44100/2\r\n");
             sdp.push_str("a=control:trackID=1\r\n");
@@ -476,10 +487,6 @@ impl RtspServer {
         }
         
         sdp
-    }
-
-    fn build_rtp_info(stream_id: &str) -> String {
-        format!("url=rtsp://localhost:554/{}/trackID=0;seq=0;rtptime=0,url=rtsp://localhost:554/{}/trackID=1;seq=0;rtptime=0", stream_id, stream_id)
     }
 
     fn extract_cseq(request: &str) -> &str {
@@ -493,81 +500,8 @@ impl RtspServer {
         "0"
     }
 
-    fn extract_stream_id(url: &str) -> String {
-        let path = url::Url::parse(url).ok()
-            .map(|u| u.path().to_string())
-            .unwrap_or_else(|| url.to_string());
-        
-        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        
-        if let Some(last_part) = parts.last() {
-            if last_part.starts_with("trackID=") {
-                if parts.len() >= 2 {
-                    return parts[parts.len() - 2].to_string();
-                }
-            }
-            last_part.to_string()
-        } else {
-            "live".to_string()
-        }
-    }
-
-    fn extract_track_id(url: &str) -> u32 {
-        let path = url::Url::parse(url).ok()
-            .map(|u| u.path().to_string())
-            .unwrap_or_else(|| url.to_string());
-        
-        if let Some(idx) = path.find("trackID=") {
-            let rest = &path[idx + 8..];
-            if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
-                rest[..end].parse().unwrap_or(0)
-            } else {
-                rest.parse().unwrap_or(0)
-            }
-        } else {
-            0
-        }
-    }
-
-    fn extract_transport(request: &str) -> TransportInfo {
-        let mut info = TransportInfo::default();
-        
-        for line in request.lines() {
-            if line.starts_with("Transport:") {
-                let parts: Vec<&str> = line.split(';').collect();
-                for part in parts {
-                    let trimmed = part.trim();
-                    
-                    if trimmed.starts_with("Transport:") {
-                        info.transport_type = trimmed["Transport:".len()..].trim().to_string();
-                    } else if trimmed.starts_with("client_port=") {
-                        let ports: Vec<&str> = trimmed["client_port=".len()..].split('-').collect();
-                        if ports.len() >= 2 {
-                            if let (Ok(p1), Ok(p2)) = (ports[0].parse(), ports[1].parse()) {
-                                info.client_port = Some((p1, p2));
-                            }
-                        }
-                    } else if trimmed.starts_with("server_port=") {
-                        let ports: Vec<&str> = trimmed["server_port=".len()..].split('-').collect();
-                        if ports.len() >= 2 {
-                            if let (Ok(p1), Ok(p2)) = (ports[0].parse(), ports[1].parse()) {
-                                info.server_port = Some((p1, p2));
-                            }
-                        }
-                    } else if trimmed.starts_with("interleaved=") {
-                        let ports: Vec<&str> = trimmed["interleaved=".len()..].split('-').collect();
-                        if ports.len() >= 2 {
-                            if let (Ok(p1), Ok(p2)) = (ports[0].parse(), ports[1].parse()) {
-                                info.client_port = Some((p1, p2));
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        
-        info
+    fn build_rtp_info(stream_id: &str) -> String {
+        format!("url=rtsp://localhost:554/{}/trackID=0;seq=0;rtptime=0,url=rtsp://localhost:554/{}/trackID=1;seq=0;rtptime=0", stream_id, stream_id)
     }
 
     fn parse_sdp_tracks(sdp: &str) -> Vec<Track> {
@@ -578,7 +512,7 @@ impl RtspServer {
             if line.starts_with("m=") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 4 {
-                    let media_type = parts[1];
+                    let media_type = parts[0].strip_prefix("m=").unwrap_or("video");
                     let payload_type: u8 = parts[3].parse().unwrap_or(96);
                     
                     let codec = if media_type == "video" {
@@ -606,13 +540,6 @@ impl RtspServer {
         
         tracks
     }
-}
-
-#[derive(Debug, Default)]
-struct TransportInfo {
-    transport_type: String,
-    client_port: Option<(u16, u16)>,
-    server_port: Option<(u16, u16)>,
 }
 
 fn rand_id() -> String {

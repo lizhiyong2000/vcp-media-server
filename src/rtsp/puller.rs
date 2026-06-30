@@ -2,12 +2,14 @@ use anyhow::Result;
 use bytes::BytesMut;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UdpSocket;
 use tokio::time::Duration;
 use tracing::{info, warn, error, debug};
 
 use crate::core::{StreamManager, Track, CodecType, MediaFrame, StreamSourceMode, StreamProtocol};
 use crate::webrtc::H264RtpIngest;
 use super::client_session::RtspClientSession;
+use super::common::RtspCommon;
 use super::RtspRequest;
 
 pub struct RtspPuller {
@@ -111,13 +113,24 @@ impl RtspPuller {
 
         let manager_clone = self.stream_manager.clone();
         let stream_id_clone = local_stream_id.to_string();
+        let use_udp = session.use_udp();
+        let udp_sockets = session.udp_track_sockets();
         let session_clone = session;
         let remote_url_clone = remote_url.to_string();
-        
+
+        info!("[RTSP Puller] Transport: {}", if use_udp { "UDP" } else { "TCP" });
+
         tokio::spawn(async move {
-            tokio::select! {
-                _ = Self::rtp_receive_loop(reader, manager_clone.clone(), stream_id_clone.clone()) => (),
-                _ = Self::send_keepalive(writer, session_clone, remote_url_clone) => (),
+            if use_udp {
+                tokio::select! {
+                    _ = Self::udp_receive_loop(udp_sockets, manager_clone.clone(), stream_id_clone.clone()) => (),
+                    _ = Self::send_keepalive(writer, session_clone, remote_url_clone) => (),
+                }
+            } else {
+                tokio::select! {
+                    _ = Self::rtp_receive_loop(reader, manager_clone.clone(), stream_id_clone.clone()) => (),
+                    _ = Self::send_keepalive(writer, session_clone, remote_url_clone) => (),
+                }
             }
         });
 
@@ -219,6 +232,92 @@ impl RtspPuller {
         let _ = manager.set_unpublished(&stream_id);
         
         info!("[RTSP Puller] [RTP Loop] RTP receive loop ended for stream {}", stream_id);
+    }
+
+    async fn udp_receive_loop(
+        tracks: Vec<(usize, Arc<UdpSocket>)>,
+        manager: Arc<StreamManager>,
+        stream_id: String,
+    ) {
+        info!(
+            "[RTSP Puller] [UDP Loop] Starting for stream {} ({} tracks)",
+            stream_id,
+            tracks.len()
+        );
+
+        for (track_id, socket) in tracks {
+            let manager = Arc::clone(&manager);
+            let sid = stream_id.clone();
+
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 65535];
+                let mut frame_count: u64 = 0;
+                let mut h264_ingest = if track_id == 0 {
+                    Some(H264RtpIngest::new(manager.clone(), sid.clone(), "RTSP-Pull-UDP"))
+                } else {
+                    None
+                };
+
+                loop {
+                    match RtspCommon::receive_rtp_over_udp(&socket, &mut buffer).await {
+                        Ok((len, _)) => {
+                            if len < 12 || RtspCommon::is_rtcp_packet(&buffer[..len]) {
+                                continue;
+                            }
+
+                            if track_id == 0 {
+                                if let Some(ingest) = &mut h264_ingest {
+                                    if ingest.ingest_rtp_packet(&buffer[..len]) {
+                                        frame_count += 1;
+                                    }
+                                }
+                            } else {
+                                let marker = (buffer[1] & 0x80) != 0;
+                                let ts = u64::from(u32::from_be_bytes(
+                                    buffer[4..8].try_into().unwrap_or([0; 4]),
+                                ));
+                                let media = crate::webrtc::rtp_h264_media_payload(&buffer[..len])
+                                    .map(|(p, _, _)| p)
+                                    .unwrap_or(&buffer[12..len]);
+                                let aac_data = match super::common::strip_mpeg4_generic_aac(media) {
+                                    Some(raw) if !raw.is_empty() => raw,
+                                    _ => continue,
+                                };
+                                let frame = MediaFrame {
+                                    stream_id: sid.clone(),
+                                    track_id: track_id as u8,
+                                    timestamp: ts,
+                                    data: aac_data.into(),
+                                    is_keyframe: marker,
+                                    codec: CodecType::AAC,
+                                    rtp_data: None,
+                                };
+                                manager.publish_frame(frame);
+                                frame_count += 1;
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "[RTSP Puller] [UDP Loop] track={} error: {}",
+                                track_id, e
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(mut ingest) = h264_ingest {
+                    ingest.flush_remaining();
+                }
+                info!(
+                    "[RTSP Puller] [UDP Loop] track={} ended, frames={}",
+                    track_id, frame_count
+                );
+            });
+        }
+
+        // Keep task alive while UDP receivers run.
+        std::future::pending::<()>().await;
     }
     
     async fn send_keepalive(mut writer: tokio::net::tcp::OwnedWriteHalf, session: RtspClientSession, remote_url: String) {
