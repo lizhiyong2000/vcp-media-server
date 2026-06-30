@@ -13,9 +13,17 @@ use tracing::{info, warn, error, debug};
 use anyhow::Result;
 
 use crate::core::{StreamManager, MediaFrame, CodecType, drain_broadcast_lag};
-use crate::webrtc::annex_b_with_config;
+use crate::webrtc::{annex_b_with_config, request_publisher_keyframe, h264_util::is_keyframe_annex_b};
 use self::m3u8::M3u8Generator;
 use self::ts_muxer::TsMuxer;
+
+/// PAT/PMT only; segments smaller than this are not committed.
+const MIN_SEGMENT_BYTES: usize = 512;
+
+fn is_hls_video_keyframe(frame: &MediaFrame) -> bool {
+    matches!(frame.codec, CodecType::H264 | CodecType::H265)
+        && (frame.is_keyframe || is_keyframe_annex_b(&frame.data))
+}
 
 /// HLS configuration
 #[derive(Debug, Clone)]
@@ -100,6 +108,7 @@ impl HlsSession {
     fn recover_from_lag(&mut self) {
         self.segment_buffer.clear();
         self.segment_duration_acc = 0.0;
+        self.last_video_timestamp = 0;
         self.primed = false;
         self.begin_new_segment();
     }
@@ -162,10 +171,11 @@ impl HlsSession {
         }
 
         if !self.primed {
-            if !matches!(frame.codec, CodecType::H264 | CodecType::H265) || !frame.is_keyframe {
+            if !is_hls_video_keyframe(frame) {
                 return Ok(None);
             }
             self.primed = true;
+            info!("[HLS] [{}] Primed on video keyframe ({} bytes)", self.stream_id, frame.data.len());
         }
 
         // Initialize segment with PAT/PMT
@@ -195,12 +205,14 @@ impl HlsSession {
             self.playlist.target_duration()
         };
 
-        let should_split = frame.is_keyframe
-            && self.segment_duration_acc >= split_threshold;
+        let should_split = is_hls_video_keyframe(frame)
+            && (self.segment_duration_acc >= split_threshold
+                || (self.playlist.segment_count() == 0
+                    && self.segment_buffer.len() > 8 * 1024));
 
         let mut completed: Option<CompletedSegment> = None;
 
-        if should_split && !self.segment_buffer.is_empty() {
+        if should_split && self.segment_buffer.len() > MIN_SEGMENT_BYTES {
             let seq = self.playlist.next_sequence();
             let filename = M3u8Generator::slot_filename(seq, self.playlist.max_segments());
             let duration = self.segment_duration_acc.max(0.1);
@@ -363,13 +375,22 @@ impl HlsServer {
             let mut frame_count: u64 = 0;
 
             let mut rx = rx;
+            let dropped = drain_broadcast_lag(&mut rx);
+            if dropped > 0 {
+                info!(
+                    "[HLS] [{}] Flushed {} stale frames before live edge",
+                    stream_id_owned, dropped
+                );
+            }
+            request_publisher_keyframe(&stream_id_owned);
+
             loop {
                 match rx.recv().await {
                     Ok(mut frame) => {
                         if matches!(frame.codec, CodecType::Opus | CodecType::G711) {
                             continue;
                         }
-                        if frame.codec == CodecType::H264 && frame.is_keyframe {
+                        if frame.codec == CodecType::H264 && is_hls_video_keyframe(&frame) {
                             if let Some(stream) = stream_manager.get_stream(&stream_id_owned) {
                                 if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
                                     let data = annex_b_with_config(sps, pps, &frame.data);
@@ -434,6 +455,10 @@ impl HlsServer {
                             };
 
                             if write_ok {
+                                info!(
+                                    "[HLS] [{}] Committed segment {} ({:.2}s, {} bytes)",
+                                    stream_id_owned, filename, duration, data.len()
+                                );
                                 let playlist_content = {
                                     let sessions = sessions_clone.read();
                                     sessions.get(&stream_id_owned).map(|s| {

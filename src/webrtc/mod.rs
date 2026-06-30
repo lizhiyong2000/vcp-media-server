@@ -6,6 +6,7 @@ mod rtp_h264;
 mod sdp_h264;
 pub use sdp_h264::parse_sprop_parameter_sets;
 pub use outbound_h264::annex_b_with_config;
+pub use publish_signaling::request_publisher_keyframe;
 mod play_relay;
 mod player;
 mod publisher;
@@ -29,7 +30,7 @@ use crate::hls::HlsServer;
 use peer::create_api;
 use player::{cancel_play_relay, signal_play_relay_stop, start_play};
 use publisher::{add_ice_candidate, start_publish};
-use publish_signaling::{register_publish_signaling, request_publisher_keyframe, unregister_publish_signaling};
+use publish_signaling::{register_publish_signaling, unregister_publish_signaling};
 use signaling::{ClientSignal, ServerSignal};
 
 pub struct WebrtcServer {

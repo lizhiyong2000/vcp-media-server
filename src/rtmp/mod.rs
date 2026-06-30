@@ -641,69 +641,94 @@ impl RtmpServer {
                         drop(w);
 
                         let peer_log = peer_addr.to_string();
+                        let manager_clone = conn.stream_manager.clone();
                         let handle = tokio::spawn(async move {
+                            let mut pending = crate::rtsp::play_egress::prime_rtsp_play_rx(
+                                &mut rx,
+                                &manager_clone,
+                                &stream_id_clone,
+                            )
+                            .await;
+                            let mut video_streaming = false;
                             let mut frames_sent = 0u64;
                             let mut clock = session::RtmpPlayClock::default();
                             loop {
-                                match recv_flv_batch(&mut rx).await {
-                                    Ok(frames) => {
-                                        for frame in frames {
-                                            if frame.codec == CodecType::AAC && frame.data.len() < 8 {
-                                                continue;
-                                            }
-                                            if frames_sent == 0 {
-                                                info!(
-                                                    "[RTMP] >>> SEND first frame: codec={:?} keyframe={} raw_ts={} size={}",
-                                                    frame.codec, frame.is_keyframe, frame.timestamp, frame.data.len()
-                                                );
-                                            }
-                                            let data = match frame.codec {
-                                                CodecType::H264 | CodecType::H265 => {
-                                                    session::frame_to_rtmp_video(&frame)
-                                                }
-                                                CodecType::AAC | CodecType::Opus | CodecType::G711 => {
-                                                    session::frame_to_rtmp_audio(&frame)
-                                                }
-                                                _ => continue,
-                                            };
-                                            if data.is_empty() {
-                                                continue;
-                                            }
-                                            let (msg_type, csid) = match frame.codec {
-                                                CodecType::H264 | CodecType::H265 => (0x09u8, chunk::CSID_VIDEO),
-                                                _ => (0x08u8, chunk::CSID_AUDIO),
-                                            };
-                                            let rtmp_ts = clock.map(&frame);
-                                            let rtmp_msg = chunk::encode_message(
-                                                msg_type,
-                                                rtmp_ts,
-                                                server_stream_id,
-                                                &data,
-                                                chunk_size_val,
-                                                csid,
+                                let frames = if let Some(frame) = pending.take() {
+                                    vec![frame]
+                                } else {
+                                    match recv_flv_batch(&mut rx).await {
+                                        Ok(frames) => frames,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                            info!(
+                                                "[RTMP] [{}] Play lagged {} frames — jump to live edge",
+                                                peer_log, n
                                             );
-                                            let mut guard = writer_clone.lock().await;
-                                            if guard.write_all(&rtmp_msg).await.is_err() {
-                                                info!("[RTMP] [{}] Play client disconnected", peer_log);
-                                                return;
-                                            }
-                                            frames_sent += 1;
-                                            if frames_sent % 100 == 0 {
-                                                info!(
-                                                    "[RTMP] >>> SEND {} frames to player (codec={:?} rtmp_ts={})",
-                                                    frames_sent, frame.codec, rtmp_ts
-                                                );
-                                            }
+                                            drain_broadcast_lag(&mut rx);
+                                            continue;
                                         }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                     }
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                };
+                                for frame in frames {
+                                    if frame.codec == CodecType::Opus || frame.codec == CodecType::G711 {
+                                        continue;
+                                    }
+                                    if matches!(frame.codec, CodecType::H264 | CodecType::H265)
+                                        && !video_streaming
+                                    {
+                                        let is_idr = frame.is_keyframe
+                                            || crate::webrtc::h264_util::is_keyframe_annex_b(
+                                                &frame.data,
+                                            );
+                                        if !is_idr {
+                                            continue;
+                                        }
+                                        video_streaming = true;
+                                    }
+                                    if frame.codec == CodecType::AAC && frame.data.len() < 8 {
+                                        continue;
+                                    }
+                                    if frames_sent == 0 {
                                         info!(
-                                            "[RTMP] [{}] Play lagged {} frames — jump to live edge",
-                                            peer_log, n
+                                            "[RTMP] >>> SEND first frame: codec={:?} keyframe={} raw_ts={} size={}",
+                                            frame.codec, frame.is_keyframe, frame.timestamp, frame.data.len()
                                         );
-                                        drain_broadcast_lag(&mut rx);
                                     }
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                    let data = match frame.codec {
+                                        CodecType::H264 | CodecType::H265 => {
+                                            session::frame_to_rtmp_video(&frame)
+                                        }
+                                        CodecType::AAC => session::frame_to_rtmp_audio(&frame),
+                                        _ => continue,
+                                    };
+                                    if data.is_empty() {
+                                        continue;
+                                    }
+                                    let (msg_type, csid) = match frame.codec {
+                                        CodecType::H264 | CodecType::H265 => (0x09u8, chunk::CSID_VIDEO),
+                                        _ => (0x08u8, chunk::CSID_AUDIO),
+                                    };
+                                    let rtmp_ts = clock.map(&frame);
+                                    let rtmp_msg = chunk::encode_message(
+                                        msg_type,
+                                        rtmp_ts,
+                                        server_stream_id,
+                                        &data,
+                                        chunk_size_val,
+                                        csid,
+                                    );
+                                    let mut guard = writer_clone.lock().await;
+                                    if guard.write_all(&rtmp_msg).await.is_err() {
+                                        info!("[RTMP] [{}] Play client disconnected", peer_log);
+                                        return;
+                                    }
+                                    frames_sent += 1;
+                                    if frames_sent % 100 == 0 {
+                                        info!(
+                                            "[RTMP] >>> SEND {} frames to player (codec={:?} rtmp_ts={})",
+                                            frames_sent, frame.codec, rtmp_ts
+                                        );
+                                    }
                                 }
                             }
                         });

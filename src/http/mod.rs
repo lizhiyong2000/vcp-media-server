@@ -11,6 +11,7 @@ use crate::rtsp::{RtspPuller, RtspPusher};
 use crate::rtmp::RtmpPuller;
 use crate::hls::HlsServer;
 use crate::http_flv::{HttpFlvServer, HttpFlvSession, format_chunk};
+use crate::webrtc::request_publisher_keyframe;
 
 pub struct HttpServer {
     stream_manager: Arc<StreamManager>,
@@ -108,10 +109,16 @@ impl HttpServer {
                     }
                     manager.ensure_stream_broadcast(stream_id);
                     let _ = hls.ensure_stream(stream_id, false).await;
+                    request_publisher_keyframe(stream_id);
 
-                    let playlist = hls
-                        .get_playlist(stream_id)
-                        .unwrap_or_else(|| hls.empty_playlist());
+                    let deadline = Instant::now() + Duration::from_secs(8);
+                    let mut playlist = hls.get_playlist(stream_id);
+                    while playlist.is_none() && Instant::now() < deadline {
+                        request_publisher_keyframe(stream_id);
+                        sleep(Duration::from_millis(100)).await;
+                        playlist = hls.get_playlist(stream_id);
+                    }
+                    let playlist = playlist.unwrap_or_else(|| hls.empty_playlist());
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
                         playlist.len(), playlist
@@ -228,10 +235,48 @@ impl HttpServer {
                             socket.write_all(&chunk).await?;
                         }
 
+                        let manager = flv.stream_manager();
+                        let mut pending_idr = crate::rtsp::play_egress::prime_rtsp_play_rx(
+                            &mut rx,
+                            manager,
+                            &stream_id_owned,
+                        )
+                        .await;
+                        let mut video_streaming = false;
+
                         loop {
-                            match recv_flv_batch(&mut rx).await {
-                                Ok(frames) => {
-                                    for frame in frames {
+                            let frames = if let Some(frame) = pending_idr.take() {
+                                vec![frame]
+                            } else {
+                                match recv_flv_batch(&mut rx).await {
+                                    Ok(frames) => frames,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        info!(
+                                            "[HTTP-FLV] [{}] lagged {} frames — jump to live edge",
+                                            stream_id_owned, n
+                                        );
+                                        drain_broadcast_lag(&mut rx);
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            };
+                            for frame in frames {
+                                    if frame.codec == CodecType::Opus || frame.codec == CodecType::G711 {
+                                        continue;
+                                    }
+                                    if matches!(frame.codec, CodecType::H264 | CodecType::H265)
+                                        && !video_streaming
+                                    {
+                                        let is_idr = frame.is_keyframe
+                                            || crate::webrtc::h264_util::is_keyframe_annex_b(
+                                                &frame.data,
+                                            );
+                                        if !is_idr {
+                                            continue;
+                                        }
+                                        video_streaming = true;
+                                    }
                                     if frame.codec == CodecType::AAC && frame.data.len() < 8 {
                                         continue;
                                     }
@@ -258,16 +303,6 @@ impl HttpServer {
                                             break;
                                         }
                                     }
-                                    }
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                    info!(
-                                        "[HTTP-FLV] [{}] lagged {} frames — jump to live edge",
-                                        stream_id_owned, n
-                                    );
-                                    drain_broadcast_lag(&mut rx);
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
                         }
                         socket.flush().await?;

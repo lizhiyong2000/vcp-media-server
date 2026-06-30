@@ -7,6 +7,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tracing::info;
 
 use crate::core::{CodecType, MediaFrame, StreamManager};
+use crate::webrtc::request_publisher_keyframe;
 use crate::webrtc::h264_util::{contains_idr_nalu, contains_sps_or_pps_nalu, ensure_annex_b, is_parameter_set_only};
 use crate::webrtc::annex_b_with_config;
 
@@ -151,6 +152,7 @@ pub async fn prime_rtsp_play_rx(
     manager: &StreamManager,
     stream_id: &str,
 ) -> Option<MediaFrame> {
+    request_publisher_keyframe(stream_id);
     let dropped = flush_stale_rx(rx, manager, stream_id);
     if dropped > 0 {
         info!(
@@ -159,7 +161,7 @@ pub async fn prime_rtsp_play_rx(
         );
     }
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
     let mut pending: Option<MediaFrame> = None;
 
     while tokio::time::Instant::now() < deadline {
@@ -184,14 +186,6 @@ pub async fn prime_rtsp_play_rx(
             Ok(Err(RecvError::Closed)) => return None,
             Err(_) => break,
         }
-    }
-
-    if let Some(frame) = pending {
-        info!(
-            "[RTSP] [{}] PLAY prime using latest video frame ts={}",
-            stream_id, frame.timestamp
-        );
-        return Some(frame);
     }
 
     if let Some((data, ts)) = manager.get_last_keyframe(stream_id) {
