@@ -21,6 +21,24 @@ pub fn is_rtp_timestamp_before(curr: u64, prev: u64) -> bool {
     !is_rtp_timestamp_after(curr, prev)
 }
 
+/// Backward jump smaller than ~1 s at 90 kHz — reorder within the same GOP.
+pub fn is_rtp_stale_in_gop(curr: u64, prev: u64) -> bool {
+    if !is_rtp_timestamp_before(curr, prev) {
+        return false;
+    }
+    let backward = (prev as u32).wrapping_sub(curr as u32);
+    backward > 0 && backward < 90_000
+}
+
+/// Backward jump >= ~1 s — encoder reset / new timeline (e.g. replaceTrack).
+pub fn is_rtp_timeline_reset(curr: u64, prev: u64) -> bool {
+    if !is_rtp_timestamp_before(curr, prev) {
+        return false;
+    }
+    let backward = (prev as u32).wrapping_sub(curr as u32);
+    backward >= 90_000
+}
+
 /// Sample duration from consecutive RTP timestamps (90 kHz clock).
 pub fn duration_from_rtp_timestamps(prev: Option<u64>, curr: u64) -> Duration {
     let Some(prev) = prev else {

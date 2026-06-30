@@ -19,7 +19,7 @@
 </head>
 <body>
   <h1>vcp-media-server WebRTC 测试</h1>
-  <p><strong>双页测试：</strong>页面 A 推流、页面 B 播放，必须使用相同 <code>stream_id</code>，且先推流 2–3 秒再播放。播放时服务器会向<strong>推流页</strong>请求关键帧，无需在同一页面。</p>
+  <p><strong>测试方式：</strong>可双页（A 推流、B 播放），也可<strong>同页</strong>先推流再播放。多页播放同一 <code>stream_id</code> 互不影响。播放时服务器会向推流端请求关键帧。</p>
 
   <fieldset>
     <legend>连接</legend>
@@ -69,9 +69,46 @@
     let publishPc = null;
     let playPc = null;
     let localStream = null;
-    let activePc = null; // PC currently negotiating / receiving server ICE
+    let activePc = null; // deprecated: use negotiatingPc for answers
+    let negotiatingPc = null; // PC currently waiting for SDP answer
     let keyframeTimer = null;
-    let keyframeMethod = null; // 'setParameters' | 'generateKeyFrame' | 'replaceTrack' | null
+    let keyframeMethod = null; // 'generateKeyFrame' | 'setParameters' | 'replaceTrack' | null | 'none'
+    let publishVideoSenderRef = null;
+    let publishVideoTrackRef = null;
+    let keyframeRequestChain = Promise.resolve();
+
+    function publishVideoSender() {
+      if (publishVideoSenderRef) return publishVideoSenderRef;
+      const tr = publishPc?.getTransceivers().find(
+        (t) => t.sender && (t.direction === 'sendonly' || t.currentDirection === 'sendonly')
+      );
+      return tr?.sender ?? publishPc?.getSenders().find((s) => s.track?.kind === 'video') ?? null;
+    }
+
+    // Chrome requires getParameters() immediately before every setParameters() call.
+    function primePublishSenderParameters() {
+      const sender = publishVideoSender();
+      if (!sender) return;
+      try {
+        sender.getParameters();
+      } catch (_) { /* not negotiated yet */ }
+    }
+
+    async function trySetParametersKeyFrame(sender) {
+      const params = sender.getParameters();
+      if (!params.encodings?.length) return false;
+      await sender.setParameters(params, {
+        encodingOptions: params.encodings.map(() => ({ keyFrame: true })),
+      });
+      return true;
+    }
+
+    function enqueueKeyframeRequest(label) {
+      keyframeRequestChain = keyframeRequestChain
+        .then(() => requestPublishKeyframe(label))
+        .catch((e) => log(label + ': 关键帧队列错误 ' + e));
+      return keyframeRequestChain;
+    }
 
     async function requestPublishKeyframe(label) {
       if (!publishPc) {
@@ -82,20 +119,16 @@
       if (publishPc.connectionState !== 'connected') {
         return false;
       }
-      const sender = publishPc.getSenders().find((s) => s.track?.kind === 'video');
+      const sender = publishVideoSender();
       if (!sender) {
         log(label + ': 无视频 sender');
         return false;
       }
-
-      const trySetParameters = async () => {
-        const params = sender.getParameters();
-        if (!params.encodings?.length) return false;
-        await sender.setParameters(params, {
-          encodingOptions: params.encodings.map(() => ({ keyFrame: true })),
-        });
-        return true;
-      };
+      const videoTrack = publishVideoTrackRef ?? sender.track;
+      if (!videoTrack || videoTrack.readyState !== 'live') {
+        log(label + ': 视频 track 不可用');
+        return false;
+      }
 
       const tryGenerateKeyFrame = async () => {
         if (typeof sender.generateKeyFrame !== 'function') return false;
@@ -104,41 +137,54 @@
       };
 
       const tryReplaceTrack = async () => {
-        const track = sender.track;
-        if (!track || track.readyState !== 'live') return false;
+        log(label + ': 警告 — replaceTrack 会重置 RTP 时间戳，仅作兜底');
         await sender.replaceTrack(null);
-        await new Promise((r) => setTimeout(r, 30));
-        await sender.replaceTrack(track);
+        await new Promise((r) => setTimeout(r, 100));
+        await sender.replaceTrack(videoTrack);
         return true;
       };
 
-      const methods = [
-        ['setParameters', trySetParameters],
+      const serverTriggered = label.includes('need-keyframe') || label.includes('need_keyframe');
+      const allMethods = [
         ['generateKeyFrame', tryGenerateKeyFrame],
+        ['setParameters', () => trySetParametersKeyFrame(sender)],
       ];
-      if (label.includes('need-keyframe') || label.includes('need_keyframe')) {
-        methods.push(['replaceTrack', tryReplaceTrack]);
+      if (serverTriggered) {
+        allMethods.push(['replaceTrack', tryReplaceTrack]);
       }
 
-      for (const [name, fn] of methods) {
-        if (keyframeMethod && keyframeMethod !== name) continue;
+      const run = async (name, fn) => {
+        if (await fn()) return true;
+        throw new Error('returned false');
+      };
+
+      const order = keyframeMethod
+        ? [
+            ...allMethods.filter(([n]) => n === keyframeMethod),
+            ...allMethods.filter(([n]) => n !== keyframeMethod),
+          ]
+        : allMethods;
+
+      for (const [name, fn] of order) {
         try {
-          if (await fn()) {
-            if (keyframeMethod !== name) {
-              keyframeMethod = name;
-              log(label + ': 关键帧请求方式 → ' + name);
-            }
-            return true;
+          await run(name, fn);
+          if (keyframeMethod !== name) {
+            keyframeMethod = name;
+            log(label + ': 关键帧请求方式 → ' + name);
           }
+          return true;
         } catch (e) {
-          if (!keyframeMethod || keyframeMethod === name) {
-            log(label + ': ' + name + ' 失败 ' + e);
+          if (keyframeMethod === name) {
+            log(label + ': ' + name + ' 失败 ' + e + '，尝试其他方式');
+            keyframeMethod = null;
+          } else if (!keyframeMethod) {
+            log(label + ': ' + name + ' 不可用 ' + e);
           }
         }
       }
 
       if (!keyframeMethod) {
-        log(label + ': 无法请求关键帧（浏览器不支持），依赖编码器默认 GOP');
+        log(label + ': 无法请求关键帧，依赖编码器默认 GOP');
         keyframeMethod = 'none';
       }
       return false;
@@ -146,9 +192,11 @@
 
     function startPublishKeyframeInterval() {
       stopPublishKeyframeInterval();
-      requestPublishKeyframe('Publish-connected');
+      enqueueKeyframeRequest('Publish-connected');
       keyframeTimer = setInterval(() => {
-        requestPublishKeyframe('Publish-interval');
+        if (keyframeMethod === 'generateKeyFrame' || keyframeMethod === 'setParameters') {
+          enqueueKeyframeRequest('Publish-interval');
+        }
       }, 3000);
     }
 
@@ -178,6 +226,20 @@
       return [...h264, ...aux];
     }
 
+    async function addServerIceCandidate(msg) {
+      const ice = {
+        candidate: msg.candidate,
+        sdpMid: msg.sdp_mid,
+        sdpMLineIndex: msg.sdp_mline_index,
+      };
+      if (publishPc) {
+        try { await publishPc.addIceCandidate(ice); } catch (_) { /* wrong PC */ }
+      }
+      if (playPc) {
+        try { await playPc.addIceCandidate(ice); } catch (_) { /* wrong PC */ }
+      }
+    }
+
     function wireIce(pc, role) {
       pc.onicecandidate = (ev) => {
         if (!ev.candidate) return;
@@ -190,15 +252,6 @@
       };
       pc.onconnectionstatechange = () => log(`${role} PC state: ${pc.connectionState}`);
       pc.oniceconnectionstatechange = () => log(`${role} ICE state: ${pc.iceConnectionState}`);
-    }
-
-    async function addIceCandidate(pc, msg) {
-      if (!pc || !msg.candidate) return;
-      await pc.addIceCandidate({
-        candidate: msg.candidate,
-        sdpMid: msg.sdp_mid,
-        sdpMLineIndex: msg.sdp_mline_index,
-      });
     }
 
     $('btnConnect').onclick = () => {
@@ -223,13 +276,15 @@
         let msg;
         try { msg = JSON.parse(ev.data); } catch { log('无效 JSON: ' + ev.data); return; }
         if (msg.type === 'answer') {
-          if (!activePc) return;
-          await activePc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+          const pc = negotiatingPc;
+          if (!pc) return;
+          await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+          negotiatingPc = null;
           log('收到 answer');
         } else if (msg.type === 'ice') {
-          if (activePc) await addIceCandidate(activePc, msg);
+          await addServerIceCandidate(msg);
         } else if (msg.type === 'need_keyframe') {
-          requestPublishKeyframe('Server-need-keyframe');
+          enqueueKeyframeRequest('Server-need-keyframe');
         } else if (msg.type === 'error') {
           log('服务器错误: ' + msg.message);
         }
@@ -254,6 +309,7 @@
         wireIce(publishPc, 'publish');
         publishPc.addEventListener('connectionstatechange', () => {
           if (publishPc?.connectionState === 'connected') {
+            primePublishSenderParameters();
             startPublishKeyframeInterval();
           }
           if (publishPc?.connectionState === 'closed' || publishPc?.connectionState === 'failed') {
@@ -261,7 +317,9 @@
           }
         });
         const videoTrack = localStream.getVideoTracks()[0];
+        publishVideoTrackRef = videoTrack;
         const pubTr = publishPc.addTransceiver(videoTrack, { direction: 'sendonly' });
+        publishVideoSenderRef = pubTr.sender;
         const h264Prefs = h264CodecPreferences();
         if (h264Prefs.length) {
           pubTr.setCodecPreferences(h264Prefs);
@@ -272,6 +330,8 @@
           offerToReceiveVideo: false,
         });
         await publishPc.setLocalDescription(offer);
+        primePublishSenderParameters();
+        negotiatingPc = publishPc;
         activePc = publishPc;
         wsSend({ type: 'publish', stream_id: streamId, sdp: offer.sdp });
         log('已发送 publish offer, stream_id=' + streamId);
@@ -286,6 +346,10 @@
       const streamId = $('streamId').value.trim();
       stopPublishKeyframeInterval();
       keyframeMethod = null;
+      publishVideoSenderRef = null;
+      publishVideoTrackRef = null;
+      keyframeRequestChain = Promise.resolve();
+      if (negotiatingPc === publishPc) negotiatingPc = null;
       if (activePc === publishPc) activePc = null;
       if (publishPc) { publishPc.close(); publishPc = null; }
       if (localStream) {
@@ -322,6 +386,7 @@
         };
         const offer = await playPc.createOffer();
         await playPc.setLocalDescription(offer);
+        negotiatingPc = playPc;
         activePc = playPc;
         wsSend({ type: 'play', stream_id: streamId, sdp: offer.sdp });
         log('已发送 play offer, stream_id=' + streamId);
@@ -334,6 +399,7 @@
 
     $('btnStopPlay').onclick = () => {
       const streamId = $('streamId').value.trim();
+      if (negotiatingPc === playPc) negotiatingPc = null;
       if (activePc === playPc) activePc = null;
       if (playPc) { playPc.close(); playPc = null; }
       if (streamId) wsSend({ type: 'stop_play', stream_id: streamId });

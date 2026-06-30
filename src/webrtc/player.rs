@@ -13,9 +13,10 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 
 use crate::core::{CodecType, MediaFrame, StreamManager};
 use super::h264_util::{
-    contains_idr_nalu, contains_sps_or_pps_nalu, describe_annex_b, ensure_annex_b, extract_sps_pps,
-    is_parameter_set_only, is_rtp_timestamp_after, is_rtp_timestamp_before, iter_annex_b_nal_ranges,
-    looks_like_h265_misread_as_h264,
+    contains_idr_nalu, contains_sps_or_pps_nalu, describe_annex_b, duration_from_rtp_timestamps,
+    ensure_annex_b, extract_sps_pps, is_parameter_set_only, is_rtp_stale_in_gop,
+    is_rtp_timestamp_before, is_rtp_timeline_reset,
+    iter_annex_b_nal_ranges, looks_like_h265_misread_as_h264,
 };
 use super::outbound_h264::{annex_b_with_config, OutboundH264Track};
 use super::peer::{new_peer_connection, wire_pc_debug};
@@ -28,12 +29,10 @@ use webrtc::api::API;
 
 pub use super::play_relay::cancel_play_relay;
 
-/// Fixed playout interval — keeps WebRTC sample timing stable (25 fps ≈ 40 ms).
-const PLAY_FRAME_DURATION: Duration = Duration::from_millis(40);
-
 pub struct PlaySession {
     pub answer_sdp: String,
     pub pc: Arc<RTCPeerConnection>,
+    pub relay_id: String,
 }
 
 pub async fn start_play(
@@ -107,9 +106,10 @@ pub async fn start_play(
     );
 
     let outbound = OutboundH264Track::new(video_track);
-    let (stop_rx, is_replay) = register_play_relay(&stream_id);
+    let (relay_id, stop_rx, active_players) = register_play_relay(&stream_id);
     let manager_clone = manager.clone();
     let sid = stream_id.clone();
+    let rid = relay_id.clone();
     let pc_clone = pc.clone();
     let relay_handle = tokio::spawn(async move {
         let result = relay_stream_to_track(
@@ -118,20 +118,28 @@ pub async fn start_play(
             outbound,
             pc_clone,
             stop_rx,
-            is_replay,
+            active_players > 1,
+            &rid,
         )
         .await;
         if let Err(e) = result {
-            error!("[WebRTC] Play relay error stream='{}': {}", sid, e);
+            error!(
+                "[WebRTC] Play relay error stream='{}' relay='{}': {}",
+                sid, rid, e
+            );
         }
     });
-    attach_relay_abort_handle(&stream_id, relay_handle.abort_handle());
+    attach_relay_abort_handle(&relay_id, relay_handle.abort_handle());
 
-    info!("[WebRTC] Play session ready for stream '{}'", stream_id);
+    info!(
+        "[WebRTC] Play session ready stream='{}' relay='{}' active_players={}",
+        stream_id, relay_id, active_players
+    );
 
     Ok(PlaySession {
         answer_sdp,
         pc,
+        relay_id,
     })
 }
 
@@ -150,25 +158,21 @@ fn log_stream_codec_state(manager: &StreamManager, stream_id: &str, phase: &str)
     }
 }
 
-async fn wait_for_connected_collecting(
+async fn wait_for_connected(
     pc: &Arc<RTCPeerConnection>,
     rx: &mut tokio::sync::broadcast::Receiver<MediaFrame>,
+    manager: &StreamManager,
+    stream_id: &str,
     label: &str,
-) -> Result<Vec<MediaFrame>> {
-    let mut backlog = Vec::new();
-    for attempt in 0..200 {
-        collect_available_frames(rx, &mut backlog);
+) -> Result<()> {
+    for attempt in 0..100 {
+        drain_config_from_rx(rx, manager, stream_id);
 
         match pc.connection_state() {
             RTCPeerConnectionState::Connected => {
-                collect_available_frames(rx, &mut backlog);
-                info!(
-                    "[WebRTC] {} peer connection connected (attempt={}) backlog={}",
-                    label,
-                    attempt,
-                    backlog.len()
-                );
-                return Ok(backlog);
+                drain_config_from_rx(rx, manager, stream_id);
+                info!("[WebRTC] {} peer connection connected (attempt={})", label, attempt);
+                return Ok(());
             }
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
                 return Err(anyhow!(
@@ -180,59 +184,93 @@ async fn wait_for_connected_collecting(
             _ => {
                 if attempt == 0 || attempt % 20 == 0 {
                     debug!(
-                        "[WebRTC] {} waiting connected: {:?} (attempt={} backlog={})",
+                        "[WebRTC] {} waiting connected: {:?} (attempt={})",
                         label,
                         pc.connection_state(),
-                        attempt,
-                        backlog.len()
+                        attempt
                     );
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
     }
     Err(anyhow!("{} timeout waiting for peer connection", label))
 }
 
-fn collect_available_frames(
+fn drain_config_from_rx(
     rx: &mut tokio::sync::broadcast::Receiver<MediaFrame>,
-    backlog: &mut Vec<MediaFrame>,
+    manager: &StreamManager,
+    stream_id: &str,
 ) {
     use tokio::sync::broadcast::error::TryRecvError;
 
     loop {
         match rx.try_recv() {
-            Ok(frame) => backlog.push(frame),
-            Err(TryRecvError::Lagged(n)) => {
-                warn!("[WebRTC] Play collect lagged {} frames (dropped)", n);
-            }
-            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
-        }
-    }
-}
-
-/// Drain broadcast buffer and return the most recent IDR frame, if any.
-fn drain_to_latest_idr(rx: &mut tokio::sync::broadcast::Receiver<MediaFrame>) -> Option<MediaFrame> {
-    use tokio::sync::broadcast::error::TryRecvError;
-
-    let mut latest_idr: Option<MediaFrame> = None;
-    loop {
-        match rx.try_recv() {
             Ok(frame) => {
-                if !is_idr_frame(&frame) {
-                    continue;
+                if frame.codec == CodecType::H264 || frame.codec == CodecType::H265 {
+                    store_live_nalu_config(manager, stream_id, &ensure_annex_b(&frame.data));
                 }
-                latest_idr = Some(match latest_idr {
-                    None => frame,
-                    Some(prev) if is_rtp_timestamp_after(frame.timestamp, prev.timestamp) => frame,
-                    Some(prev) => prev,
-                });
             }
             Err(TryRecvError::Lagged(_)) => continue,
             Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
         }
     }
-    latest_idr
+}
+
+/// Drop all queued frames (keep SPS/PPS). Returns number of frames discarded.
+fn flush_stale_rx(
+    rx: &mut tokio::sync::broadcast::Receiver<MediaFrame>,
+    manager: &StreamManager,
+    stream_id: &str,
+) -> Option<u64> {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let mut dropped = 0u64;
+    loop {
+        match rx.try_recv() {
+            Ok(frame) => {
+                dropped += 1;
+                if frame.codec == CodecType::H264 || frame.codec == CodecType::H265 {
+                    store_live_nalu_config(manager, stream_id, &ensure_annex_b(&frame.data));
+                }
+            }
+            Err(TryRecvError::Lagged(n)) => {
+                dropped += n;
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+        }
+    }
+    if dropped > 0 { Some(dropped) } else { None }
+}
+
+fn is_playable_video_frame(frame: &MediaFrame) -> bool {
+    if frame.codec != CodecType::H264 && frame.codec != CodecType::H265 {
+        return false;
+    }
+    let data = ensure_annex_b(&frame.data);
+    !data.is_empty() && !is_parameter_set_only(&data)
+}
+
+/// Drain broadcast buffer and return the most recently received IDR (not max timestamp).
+/// After replaceTrack the newest IDR often has a lower RTP timestamp than older frames.
+fn drain_to_most_recent_idr(
+    rx: &mut tokio::sync::broadcast::Receiver<MediaFrame>,
+) -> Option<MediaFrame> {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let mut last_idr: Option<MediaFrame> = None;
+    loop {
+        match rx.try_recv() {
+            Ok(frame) => {
+                if is_idr_frame(&frame) {
+                    last_idr = Some(frame);
+                }
+            }
+            Err(TryRecvError::Lagged(_)) => continue,
+            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+        }
+    }
+    last_idr
 }
 
 fn stream_has_config(manager: &StreamManager, stream_id: &str) -> bool {
@@ -248,14 +286,15 @@ async fn relay_stream_to_track(
     outbound: OutboundH264Track,
     pc: Arc<RTCPeerConnection>,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
-    is_replay: bool,
+    is_late_joiner: bool,
+    relay_id: &str,
 ) -> Result<()> {
-    let _guard = RelayCleanup(&stream_id);
+    let _guard = RelayCleanup(relay_id.to_string());
 
-    struct RelayCleanup<'a>(&'a str);
-    impl Drop for RelayCleanup<'_> {
+    struct RelayCleanup(String);
+    impl Drop for RelayCleanup {
         fn drop(&mut self) {
-            unregister_play_relay(self.0);
+            unregister_play_relay(&self.0);
         }
     }
 
@@ -263,7 +302,7 @@ async fn relay_stream_to_track(
         return Err(anyhow!("No broadcast channel for stream {}", stream_id));
     };
 
-    let backlog = wait_for_connected_collecting(&pc, &mut rx, "play").await?;
+    wait_for_connected(&pc, &mut rx, &manager, &stream_id, "play").await?;
     if stop_requested(&mut stop_rx) {
         return Ok(());
     }
@@ -271,31 +310,31 @@ async fn relay_stream_to_track(
     outbound.wait_binding("play").await?;
     log_stream_codec_state(&manager, &stream_id, "relay-start");
 
-    // Use backlog only to learn SPS/PPS — do not replay P-frames (burst causes broadcast lag).
-    for frame in &backlog {
-        if frame.codec == CodecType::H264 || frame.codec == CodecType::H265 {
-            store_live_nalu_config(&manager, &stream_id, &ensure_annex_b(&frame.data));
-        }
-    }
     let mut config_ready = stream_has_config(&manager, &stream_id);
     if !config_ready {
         warn!(
-            "[WebRTC] Play stream='{}' no SPS/PPS yet in backlog ({} frames), wait for live config replay={}",
-            stream_id,
-            backlog.len(),
-            is_replay
-        );
-    } else {
-        info!(
-            "[WebRTC] Play stream='{}' config ready from backlog ({} frames), wait for live IDR replay={}",
-            stream_id,
-            backlog.len(),
-            is_replay
+            "[WebRTC] Play stream='{}' no SPS/PPS yet, wait for live config late_joiner={}",
+            stream_id, is_late_joiner
         );
     }
-    request_publisher_keyframe(&stream_id);
 
     let mut pending: VecDeque<MediaFrame> = VecDeque::new();
+    if let Some(idr) = prime_play_idr(&mut rx, &stream_id).await {
+        pending.push_back(idr);
+    } else {
+        warn!(
+            "[WebRTC] Play stream='{}' no IDR primed — waiting for live keyframe",
+            stream_id
+        );
+    }
+    // Drop any frames buffered during ICE / prime; start from live edge.
+    if let Some(skipped) = flush_stale_rx(&mut rx, &manager, &stream_id) {
+        info!(
+            "[WebRTC] Play stream='{}' flushed {} stale frames before live edge",
+            stream_id, skipped
+        );
+    }
+
     let mut rtp_sent: u64 = 0;
     let mut received: u64 = 0;
     let mut skipped: u64 = 0;
@@ -303,7 +342,8 @@ async fn relay_stream_to_track(
     let mut pace_next = Instant::now();
     let mut last_sent_ts: Option<u64> = None;
     let mut wait_start = Instant::now();
-    const KEYFRAME_WAIT: Duration = Duration::from_secs(10);
+    let mut last_keyframe_request = Instant::now();
+    const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 
     info!("[WebRTC] Play relay loop started for stream='{}'", stream_id);
 
@@ -321,14 +361,14 @@ async fn relay_stream_to_track(
             break;
         }
 
-        let frame = if let Some(f) = pending.pop_front() {
-            f
+        let (frame, coalesced) = if let Some(f) = pending.pop_front() {
+            (f, 0u64)
         } else {
-            match recv_next_frame(&mut rx, &mut stop_rx).await? {
-                RecvNext::Frame(f) => f,
-                RecvNext::Lagged(n) => {
+            match recv_coalesced_frame(&mut rx, &mut stop_rx).await? {
+                RecvCoalesced::Frame(f, n) => (f, n),
+                RecvCoalesced::Lagged(n) => {
                     warn!(
-                        "[WebRTC] Play lagged {} frames stream='{}' — resync to IDR",
+                        "[WebRTC] Play lagged {} frames stream='{}' — jump to live",
                         n, stream_id
                     );
                     streaming = false;
@@ -337,12 +377,13 @@ async fn relay_stream_to_track(
                     last_sent_ts = None;
                     request_publisher_keyframe(&stream_id);
                     pending.clear();
-                    if let Some(idr) = drain_to_latest_idr(&mut rx) {
+                    let _ = flush_stale_rx(&mut rx, &manager, &stream_id);
+                    if let Some(idr) = drain_to_most_recent_idr(&mut rx) {
                         pending.push_back(idr);
                     }
                     continue;
                 }
-                RecvNext::Stopped => break,
+                RecvCoalesced::Stopped => break,
             }
         };
 
@@ -379,13 +420,32 @@ async fn relay_stream_to_track(
 
         if streaming {
             if let Some(prev) = last_sent_ts {
-                if is_rtp_timestamp_before(frame.timestamp, prev) && !is_idr {
-                    debug!(
-                        "[WebRTC] Play drop stale frame stream='{}' ts={} last={}",
-                        stream_id, frame.timestamp, prev
-                    );
+                if is_rtp_stale_in_gop(frame.timestamp, prev) {
                     skipped += 1;
                     continue;
+                }
+                if is_rtp_timeline_reset(frame.timestamp, prev) {
+                    if is_idr || frame.is_keyframe {
+                        info!(
+                            "[WebRTC] Play new timeline IDR stream='{}' {} -> {}",
+                            stream_id, prev, frame.timestamp
+                        );
+                        last_sent_ts = None;
+                    } else {
+                        debug!(
+                            "[WebRTC] Play new timeline without IDR stream='{}' {} -> {}",
+                            stream_id, prev, frame.timestamp
+                        );
+                        streaming = false;
+                        last_sent_ts = None;
+                        request_publisher_keyframe(&stream_id);
+                        last_keyframe_request = Instant::now();
+                        skipped += 1;
+                        if let Some(idr) = drain_to_most_recent_idr(&mut rx) {
+                            pending.push_back(idr);
+                        }
+                        continue;
+                    }
                 }
             }
         }
@@ -393,53 +453,47 @@ async fn relay_stream_to_track(
         if !streaming {
             let can_start = is_idr || frame.is_keyframe;
             if !can_start {
-                if rtp_sent > 0 {
-                    skipped += 1;
-                    if skipped == 1 || skipped % 50 == 0 {
-                        debug!(
-                            "[WebRTC] Play wait IDR (resync) stream='{}' ts={} skipped={}",
-                            stream_id, frame.timestamp, skipped
-                        );
-                    }
-                    continue;
+                skipped += 1;
+                if last_keyframe_request.elapsed() >= KEYFRAME_REQUEST_INTERVAL {
+                    request_publisher_keyframe(&stream_id);
+                    last_keyframe_request = Instant::now();
                 }
-                if wait_start.elapsed() < KEYFRAME_WAIT {
-                    skipped += 1;
-                    if skipped == 1 || skipped % 25 == 0 {
-                        if skipped == 1 {
-                            request_publisher_keyframe(&stream_id);
-                        }
-                        debug!(
-                            "[WebRTC] Play wait IDR stream='{}' ts={} [{}] skipped={}",
-                            stream_id, frame.timestamp, nalu_desc, skipped
-                        );
-                    }
-                    continue;
+                if skipped == 1 || skipped % 25 == 0 {
+                    debug!(
+                        "[WebRTC] Play wait IDR stream='{}' ts={} [{}] skipped={} elapsed={:?}",
+                        stream_id,
+                        frame.timestamp,
+                        nalu_desc,
+                        skipped,
+                        wait_start.elapsed()
+                    );
                 }
-                warn!(
-                    "[WebRTC] Play stream='{}' forcing start after {:?} (no IDR seen)",
-                    stream_id, KEYFRAME_WAIT
-                );
+                continue;
             }
             streaming = true;
             last_sent_ts = None;
             sample_data = prepend_stream_config(&manager, &stream_id, &sample_data);
             info!(
-                "[WebRTC] Play streaming started stream='{}' ts={} [{}] idr={} replay={}",
-                stream_id, frame.timestamp, nalu_desc, is_idr, is_replay
+                "[WebRTC] Play streaming started stream='{}' relay='{}' ts={} [{}] idr={} late_joiner={}",
+                stream_id, relay_id, frame.timestamp, nalu_desc, is_idr, is_late_joiner
             );
         } else if is_idr || frame.is_keyframe {
             sample_data = prepend_stream_config(&manager, &stream_id, &sample_data);
         }
 
-        let duration = PLAY_FRAME_DURATION;
-        let now = Instant::now();
-        if pace_next > now {
-            tokio::time::sleep(pace_next - now).await;
+        let duration = duration_from_rtp_timestamps(last_sent_ts, frame.timestamp);
+        let catch_up = coalesced > 0;
+        if !catch_up {
+            let now = Instant::now();
+            if pace_next > now {
+                tokio::time::sleep(pace_next - now).await;
+            }
+            pace_next = Instant::now() + duration;
+        } else {
+            pace_next = Instant::now();
         }
         outbound.send_access_unit(&sample_data, duration).await?;
         last_sent_ts = Some(frame.timestamp);
-        pace_next = Instant::now() + duration;
         rtp_sent += 1;
 
         if rtp_sent <= 8 || is_idr || frame.is_keyframe {
@@ -489,6 +543,32 @@ fn prepend_stream_config(
     access_unit.to_vec()
 }
 
+/// Wait for publisher keyframe, then pick the most recently received live IDR.
+async fn prime_play_idr(
+    rx: &mut tokio::sync::broadcast::Receiver<MediaFrame>,
+    stream_id: &str,
+) -> Option<MediaFrame> {
+    request_publisher_keyframe(stream_id);
+    let deadline = Instant::now() + Duration::from_millis(800);
+    let mut last_idr: Option<MediaFrame> = None;
+
+    while Instant::now() < deadline {
+        if let Some(idr) = drain_to_most_recent_idr(rx) {
+            last_idr = Some(idr);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    if let Some(ref idr) = last_idr {
+        info!(
+            "[WebRTC] Play primed live IDR stream='{}' ts={}",
+            stream_id, idr.timestamp
+        );
+    }
+    last_idr
+}
+
 fn is_idr_frame(frame: &MediaFrame) -> bool {
     if frame.is_keyframe {
         return true;
@@ -508,38 +588,57 @@ fn pc_connection_ended(pc: &RTCPeerConnection) -> bool {
     )
 }
 
-enum RecvNext {
-    Frame(MediaFrame),
+enum RecvCoalesced {
+    Frame(MediaFrame, u64),
     Lagged(u64),
     Stopped,
 }
 
-async fn recv_next_frame(
+/// Block for one frame, then coalesce any burst to the latest playable frame.
+async fn recv_coalesced_frame(
     rx: &mut tokio::sync::broadcast::Receiver<MediaFrame>,
     stop_rx: &mut tokio::sync::watch::Receiver<bool>,
-) -> Result<RecvNext> {
-    use tokio::sync::broadcast::error::RecvError;
+) -> Result<RecvCoalesced> {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
     loop {
         if stop_requested(stop_rx) {
-            return Ok(RecvNext::Stopped);
+            return Ok(RecvCoalesced::Stopped);
         }
         tokio::select! {
             biased;
             _ = stop_rx.changed() => {
                 if *stop_rx.borrow() {
-                    return Ok(RecvNext::Stopped);
+                    return Ok(RecvCoalesced::Stopped);
                 }
             }
             result = rx.recv() => {
                 match result {
-                    Ok(frame) => return Ok(RecvNext::Frame(frame)),
+                    Ok(mut latest) => {
+                        let mut skipped = 0u64;
+                        loop {
+                            match rx.try_recv() {
+                                Ok(next) => {
+                                    if is_playable_video_frame(&next) {
+                                        skipped += 1;
+                                        latest = next;
+                                    }
+                                }
+                                Err(TryRecvError::Lagged(n)) => {
+                                    return Ok(RecvCoalesced::Lagged(n));
+                                }
+                                Err(TryRecvError::Closed) => return Ok(RecvCoalesced::Stopped),
+                                Err(TryRecvError::Empty) => break,
+                            }
+                        }
+                        return Ok(RecvCoalesced::Frame(latest, skipped));
+                    }
                     Err(RecvError::Lagged(n)) => {
                         if n > 0 {
-                            return Ok(RecvNext::Lagged(n));
+                            return Ok(RecvCoalesced::Lagged(n));
                         }
                     }
-                    Err(RecvError::Closed) => return Ok(RecvNext::Stopped),
+                    Err(RecvError::Closed) => return Ok(RecvCoalesced::Stopped),
                 }
             }
         }

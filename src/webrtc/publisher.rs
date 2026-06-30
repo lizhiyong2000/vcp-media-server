@@ -144,6 +144,7 @@ async fn read_h264_track(
     let mut depacketize_fail: u64 = 0;
     let mut empty_nalu: u64 = 0;
     let mut batch = AccessUnitBatch::default();
+    let mut last_pkt_ts: Option<u32> = None;
 
     while let Ok((pkt, _attrs)) = track.read_rtp().await {
         if access_units == 0 && batch.parts.is_empty() {
@@ -160,6 +161,22 @@ async fn read_h264_track(
         }
 
         let pkt_ts = pkt.header.timestamp;
+        if let Some(prev_ts) = last_pkt_ts {
+            let backward = prev_ts.wrapping_sub(pkt_ts);
+            // replaceTrack / encoder restart often resets the RTP clock backward.
+            if backward > 3000 && backward < 0x8000_0000 {
+                info!(
+                    "[WebRTC] RTP timestamp reset stream='{}' {} -> {}, flush depacketizer",
+                    stream_id, prev_ts, pkt_ts
+                );
+                depacketizer = H264Packet::default();
+                if !batch.parts.is_empty() {
+                    access_units += publish_access_unit(&manager, &stream_id, &mut batch);
+                }
+            }
+        }
+        last_pkt_ts = Some(pkt_ts);
+
         let marker = pkt.header.marker;
         match h264_rtp_to_frame(&mut depacketizer, &pkt, &stream_id, &manager) {
             Some(frame) => {

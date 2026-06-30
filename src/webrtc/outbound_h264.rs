@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::info;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocalWriter;
@@ -20,8 +20,8 @@ impl OutboundH264Track {
     }
 
     pub async fn wait_binding(&self, label: &str) -> Result<()> {
-        // Packetizer is created on bind during SDP negotiation.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // TrackLocal::bind runs during setLocalDescription; allow time after ICE connects.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         info!("[WebRTC] {} sample track ready", label);
         Ok(())
     }

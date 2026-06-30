@@ -24,8 +24,8 @@ use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::core::StreamManager;
 use peer::create_api;
-use publisher::{add_ice_candidate, start_publish};
 use player::{cancel_play_relay, start_play};
+use publisher::{add_ice_candidate, start_publish};
 use publish_signaling::{register_publish_signaling, request_publisher_keyframe, unregister_publish_signaling};
 use signaling::{ClientSignal, ServerSignal};
 
@@ -34,16 +34,18 @@ pub struct WebrtcServer {
     port: u16,
 }
 
+/// One WebSocket may hold both publish and play peer connections simultaneously.
 struct SessionState {
-    pc: Option<Arc<RTCPeerConnection>>,
-    role: Option<SignalRole>,
+    publish_pc: Option<Arc<RTCPeerConnection>>,
+    play_pc: Option<Arc<RTCPeerConnection>>,
     stream_id: Option<String>,
+    play_relay_id: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SignalRole {
-    Publish,
-    Play,
+impl SessionState {
+    fn has_publish(&self) -> bool {
+        self.publish_pc.is_some()
+    }
 }
 
 impl WebrtcServer {
@@ -91,9 +93,10 @@ async fn handle_connection(
 
     let (ice_tx, mut ice_rx) = mpsc::unbounded_channel::<ServerSignal>();
     let mut state = SessionState {
-        pc: None,
-        role: None,
+        publish_pc: None,
+        play_pc: None,
         stream_id: None,
+        play_relay_id: None,
     };
 
     loop {
@@ -123,22 +126,25 @@ async fn handle_connection(
         }
     }
 
-    if state.role == Some(SignalRole::Publish) {
-        let sid = state.stream_id.take();
-        let pc = state.pc.take();
-        if let Some(sid) = sid {
-            cleanup_publish_session(&manager, &sid, pc).await;
-        }
-    } else if state.role == Some(SignalRole::Play) {
-        if let Some(sid) = state.stream_id.take() {
-            cancel_play_relay(&sid);
-        }
-        if let Some(pc) = state.pc.take() {
-            let _ = pc.close().await;
-        }
-    }
-
+    cleanup_session(&manager, &mut state).await;
     Ok(())
+}
+
+async fn cleanup_session(manager: &Arc<StreamManager>, state: &mut SessionState) {
+    if let Some(relay_id) = state.play_relay_id.take() {
+        cancel_play_relay(&relay_id);
+    }
+    if let Some(pc) = state.play_pc.take() {
+        let _ = pc.close().await;
+    }
+    if state.has_publish() {
+        let sid = state
+            .stream_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let pc = state.publish_pc.take();
+        cleanup_publish_session(manager, &sid, pc).await;
+    }
 }
 
 async fn cleanup_publish_session(
@@ -155,6 +161,32 @@ async fn cleanup_publish_session(
         "[WebRTC] Publish session cleaned up stream='{}'",
         stream_id
     );
+}
+
+async fn route_ice_candidate(
+    state: &SessionState,
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u16>,
+) -> Result<()> {
+    let mut applied = false;
+
+    if let Some(pc) = &state.publish_pc {
+        if add_ice_candidate(pc, candidate.clone(), sdp_mid.clone(), sdp_mline_index).await.is_ok()
+        {
+            applied = true;
+        }
+    }
+    if let Some(pc) = &state.play_pc {
+        if add_ice_candidate(pc, candidate, sdp_mid, sdp_mline_index).await.is_ok() {
+            applied = true;
+        }
+    }
+
+    if !applied {
+        warn!("[WebRTC] ICE candidate did not match any PC on this connection");
+    }
+    Ok(())
 }
 
 async fn handle_signal<S>(
@@ -196,7 +228,7 @@ where
     match signal {
         ClientSignal::Publish { stream_id, sdp } => {
             info!("[WebRTC] Publish request stream='{}'", stream_id);
-            if let Some(old_pc) = state.pc.take() {
+            if let Some(old_pc) = state.publish_pc.take() {
                 let _ = old_pc.close().await;
             }
             state.stream_id = Some(stream_id.clone());
@@ -210,8 +242,7 @@ where
             )
             .await?;
 
-            state.pc = Some(session.pc);
-            state.role = Some(SignalRole::Publish);
+            state.publish_pc = Some(session.pc);
             let answer = ServerSignal::Answer {
                 sdp: session.answer_sdp,
             };
@@ -219,12 +250,16 @@ where
         }
         ClientSignal::Play { stream_id, sdp } => {
             info!("[WebRTC] Play request stream='{}'", stream_id);
-            if let Some(old_pc) = state.pc.take() {
+            if let Some(relay_id) = state.play_relay_id.take() {
+                cancel_play_relay(&relay_id);
+            }
+            if let Some(old_pc) = state.play_pc.take() {
                 let _ = old_pc.close().await;
             }
-            cancel_play_relay(&stream_id);
             let _ = request_publisher_keyframe(&stream_id);
-            state.stream_id = Some(stream_id.clone());
+            if state.stream_id.is_none() {
+                state.stream_id = Some(stream_id.clone());
+            }
             let session = start_play(
                 api.clone(),
                 manager.clone(),
@@ -234,43 +269,36 @@ where
             )
             .await?;
 
-            state.pc = Some(session.pc);
-            state.role = Some(SignalRole::Play);
+            state.play_pc = Some(session.pc);
+            state.play_relay_id = Some(session.relay_id);
             let answer = ServerSignal::Answer {
                 sdp: session.answer_sdp,
             };
             ws_tx.send(Message::Text(answer.to_json())).await?;
         }
-        ClientSignal::StopPlay { stream_id } => {
-            info!("[WebRTC] Stop play stream='{}'", stream_id);
-            cancel_play_relay(&stream_id);
-            if let Some(pc) = state.pc.take() {
+        ClientSignal::StopPlay { stream_id: _ } => {
+            info!("[WebRTC] Stop play");
+            if let Some(relay_id) = state.play_relay_id.take() {
+                cancel_play_relay(&relay_id);
+            }
+            if let Some(pc) = state.play_pc.take() {
                 let _ = pc.close().await;
             }
-            state.role = None;
-            state.stream_id = None;
         }
         ClientSignal::StopPublish { stream_id } => {
             info!("[WebRTC] Stop publish stream='{}'", stream_id);
-            let pc = state.pc.take();
+            let pc = state.publish_pc.take();
             cleanup_publish_session(manager, &stream_id, pc).await;
-            state.role = None;
-            state.stream_id = None;
+            if state.play_pc.is_none() {
+                state.stream_id = None;
+            }
         }
         ClientSignal::Ice {
             candidate,
             sdp_mid,
             sdp_mline_index,
         } => {
-            if let Some(pc) = &state.pc {
-                let role = state.role.map(|r| format!("{:?}", r)).unwrap_or_default();
-                if let Err(e) = add_ice_candidate(pc, candidate, sdp_mid, sdp_mline_index).await {
-                    warn!("[WebRTC] ICE add failed role={}: {}", role, e);
-                    return Err(e);
-                }
-            } else {
-                warn!("[WebRTC] ICE candidate received but no active PC");
-            }
+            route_ice_candidate(state, candidate, sdp_mid, sdp_mline_index).await?;
         }
     }
 
