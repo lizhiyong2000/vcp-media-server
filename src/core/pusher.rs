@@ -1,9 +1,9 @@
+use crate::core::StreamProtocol;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::collections::HashMap;
-use crate::core::StreamProtocol;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 pub type PusherId = String;
 
@@ -59,7 +59,7 @@ pub trait StreamPusher: Send + Sync {
     fn protocol(&self) -> StreamProtocol;
     fn remote_url(&self) -> &str;
     fn status(&self) -> PusherStatus;
-    
+
     async fn start(&mut self) -> Result<()>;
     async fn pause(&mut self) -> Result<()>;
     async fn resume(&mut self) -> Result<()>;
@@ -109,7 +109,13 @@ impl PusherManager {
         }
     }
 
-    pub async fn register_pusher(&self, pusher_id: PusherId, stream_id: &str, protocol: StreamProtocol, remote_url: &str) {
+    pub async fn register_pusher(
+        &self,
+        pusher_id: PusherId,
+        stream_id: &str,
+        protocol: StreamProtocol,
+        remote_url: &str,
+    ) {
         let protocol_clone = protocol.clone();
         let pusher_id_clone = pusher_id.clone();
         let state = Arc::new(PusherState {
@@ -121,7 +127,10 @@ impl PusherManager {
         });
         let mut pushers = self.pushers.write().await;
         pushers.insert(pusher_id, state);
-        info!("[Pusher Manager] Registered pusher: id={}, stream_id={}, protocol={:?}", pusher_id_clone, stream_id, protocol_clone);
+        info!(
+            "[Pusher Manager] Registered pusher: id={}, stream_id={}, protocol={:?}",
+            pusher_id_clone, stream_id, protocol_clone
+        );
     }
 
     pub async fn unregister_pusher(&self, pusher_id: &PusherId) {
@@ -135,7 +144,12 @@ impl PusherManager {
         let pushers = self.pushers.read().await;
         if let Some(state) = pushers.get(pusher_id) {
             let mut s = state.status.write().await;
-            info!("[Pusher Manager] Pusher {} status changed: {} -> {}", pusher_id, s.as_str(), status.as_str());
+            info!(
+                "[Pusher Manager] Pusher {} status changed: {} -> {}",
+                pusher_id,
+                s.as_str(),
+                status.as_str()
+            );
             *s = status;
         }
     }

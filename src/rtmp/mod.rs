@@ -1,23 +1,26 @@
 pub mod amf0;
 pub mod chunk;
-pub mod session;
 pub mod puller;
+pub mod session;
 
 pub use puller::RtmpPuller;
 
 use anyhow::Result;
-use bytes::{Bytes, BytesMut, Buf};
+use bytes::{Buf, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
-use crate::core::{StreamManager, CodecType, MediaFrame, StreamSourceMode, StreamProtocol, StreamStatus, default_live_tracks, DispatchPolicy};
 use crate::core::dispatch::DispatchError;
-use session::{RtmpSession, SessionState};
+use crate::core::{
+    default_live_tracks, CodecType, DispatchPolicy, MediaFrame, StreamManager, StreamProtocol,
+    StreamSourceMode, StreamStatus,
+};
 use chunk::RtmpMessage;
+use session::{RtmpSession, SessionState};
 
 /// 将 RTMP 消息类型 ID 转为可读名称
 fn msg_type_name(t: u8) -> &'static str {
@@ -71,7 +74,8 @@ fn fmt_amf0(val: &amf0::Amf0Value) -> String {
         amf0::Amf0Value::Null => "null".to_string(),
         amf0::Amf0Value::Undefined => "undefined".to_string(),
         amf0::Amf0Value::Object(map) | amf0::Amf0Value::EcmaArray(map) => {
-            let pairs: Vec<String> = map.iter()
+            let pairs: Vec<String> = map
+                .iter()
                 .map(|(k, v)| format!("{}={}", k, fmt_amf0(v)))
                 .collect();
             format!("{{{}}}", pairs.join(", "))
@@ -90,6 +94,7 @@ struct RtmpConnection {
     frames_received: usize,
     is_publishing: bool,
     stream_id: String,
+    publisher_id: Option<String>,
     play_abort: Option<tokio::task::AbortHandle>,
 }
 
@@ -111,6 +116,7 @@ impl RtmpConnection {
             frames_received: 0,
             is_publishing: false,
             stream_id: String::new(),
+            publisher_id: None,
             play_abort: None,
         }
     }
@@ -128,18 +134,30 @@ impl RtmpServer {
         port: u16,
         hls_server: Option<Arc<crate::hls::HlsServer>>,
     ) -> Self {
-        Self { stream_manager, port, hls_server }
+        Self {
+            stream_manager,
+            port,
+            hls_server,
+        }
     }
 
     pub async fn start(&self) -> Result<()> {
         let addr = format!("0.0.0.0:{}", self.port);
         info!("[RTMP] Initializing RTMP server on {}", addr);
-        info!("[RTMP] Binding to {}:{}", addr.split(':').next().unwrap_or("0.0.0.0"), self.port);
+        info!(
+            "[RTMP] Binding to {}:{}",
+            addr.split(':').next().unwrap_or("0.0.0.0"),
+            self.port
+        );
 
         let listener = TcpListener::bind(&addr).await?;
         info!("[RTMP] Successfully bound to address {}", addr);
         info!("[RTMP] RTMP server is ready and listening");
-        info!("[RTMP] Accepting connections on rtmp://{}:{}/<stream_name>", addr.split(':').next().unwrap_or("0.0.0.0"), self.port);
+        info!(
+            "[RTMP] Accepting connections on rtmp://{}:{}/<stream_name>",
+            addr.split(':').next().unwrap_or("0.0.0.0"),
+            self.port
+        );
 
         loop {
             match listener.accept().await {
@@ -150,7 +168,9 @@ impl RtmpServer {
                     let manager = self.stream_manager.clone();
                     let hls = self.hls_server.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(socket, manager, hls, peer_addr).await {
+                        if let Err(e) =
+                            Self::handle_connection(socket, manager, hls, peer_addr).await
+                        {
                             error!("[RTMP] Connection error from {}: {}", peer_addr, e);
                         }
                     });
@@ -172,7 +192,12 @@ impl RtmpServer {
         let (mut reader, writer) = socket.into_split();
         let writer = Arc::new(Mutex::new(writer));
         let mut buf = BytesMut::with_capacity(8192);
-        let mut conn = RtmpConnection::new(manager.clone(), hls_server, writer.clone(), &peer_addr.to_string());
+        let mut conn = RtmpConnection::new(
+            manager.clone(),
+            hls_server,
+            writer.clone(),
+            &peer_addr.to_string(),
+        );
         let mut chunk_size: usize = 128;
         let mut bytes_received = 0;
         let mut handshake_done = false;
@@ -182,23 +207,46 @@ impl RtmpServer {
 
         loop {
             let mut read_buf = [0u8; 8192];
-            let len = reader.read(&mut read_buf).await?;
-            
+            let len = match reader.read(&mut read_buf).await {
+                Ok(len) => len,
+                Err(e) => {
+                    Self::release_publish_connection(&mut conn);
+                    return Err(e.into());
+                }
+            };
+
             if len == 0 {
-                info!("[RTMP] [{}] Connection closed, bytes={}, frames={}", peer_addr, bytes_received, conn.frames_received);
+                info!(
+                    "[RTMP] [{}] Connection closed, bytes={}, frames={}",
+                    peer_addr, bytes_received, conn.frames_received
+                );
                 if let Some(handle) = conn.play_abort.take() {
                     handle.abort();
                 }
+                Self::release_publish_connection(&mut conn);
                 break;
             }
 
             bytes_received += len;
             buf.extend_from_slice(&read_buf[..len]);
-            debug!("[RTMP] [{}] Read {} bytes, buf_len={}, chunk_size={}", peer_addr, len, buf.len(), chunk_size);
+            debug!(
+                "[RTMP] [{}] Read {} bytes, buf_len={}, chunk_size={}",
+                peer_addr,
+                len,
+                buf.len(),
+                chunk_size
+            );
 
             if !handshake_done {
                 let mut writer_guard = writer.lock().await;
-                if Self::handle_handshake(&mut buf, &mut writer_guard, peer_addr, handshake_first_call).await? {
+                if Self::handle_handshake(
+                    &mut buf,
+                    &mut writer_guard,
+                    peer_addr,
+                    handshake_first_call,
+                )
+                .await?
+                {
                     handshake_done = true;
                     conn.session.state = SessionState::Connected;
                 } else {
@@ -211,12 +259,23 @@ impl RtmpServer {
             let initial_buf_len = buf.len();
             let mut messages_parsed = 0;
             let mut pending_chunk_size = None;
-            while let Some(msg) = chunk::parse_chunks(&mut buf, &mut conn.chunk_states, &mut conn.chunk_message_headers, chunk_size) {
+            while let Some(msg) = chunk::parse_chunks(
+                &mut buf,
+                &mut conn.chunk_states,
+                &mut conn.chunk_message_headers,
+                chunk_size,
+            ) {
                 messages_parsed += 1;
-                debug!("[RTMP] [{}] <<< RECV [{}] 0x{:02x} ts={} {}bytes",
-                    peer_addr, msg_type_name(msg.msg_type), msg.msg_type,
-                    msg.timestamp, msg.payload.len());
-                if let Some(new_size) = Self::handle_rtmp_message(&mut conn, msg, peer_addr).await? {
+                debug!(
+                    "[RTMP] [{}] <<< RECV [{}] 0x{:02x} ts={} {}bytes",
+                    peer_addr,
+                    msg_type_name(msg.msg_type),
+                    msg.msg_type,
+                    msg.timestamp,
+                    msg.payload.len()
+                );
+                if let Some(new_size) = Self::handle_rtmp_message(&mut conn, msg, peer_addr).await?
+                {
                     // Defer chunk_size update until all messages in this batch are parsed
                     // because remaining data was encoded with the old chunk_size
                     pending_chunk_size = Some(new_size);
@@ -225,42 +284,66 @@ impl RtmpServer {
             // Apply deferred chunk_size update
             if let Some(new_size) = pending_chunk_size {
                 chunk_size = new_size;
-                info!("[RTMP] [{}] chunk_size updated to {} (after batch)", peer_addr, chunk_size);
+                info!(
+                    "[RTMP] [{}] chunk_size updated to {} (after batch)",
+                    peer_addr, chunk_size
+                );
             }
             // Always log buffer state after parsing
             if buf.len() > 0 {
                 let preview_len = std::cmp::min(64, buf.len());
-                let preview: Vec<String> = buf[..preview_len].iter().map(|b| format!("{:02x}", *b)).collect();
+                let preview: Vec<String> = buf[..preview_len]
+                    .iter()
+                    .map(|b| format!("{:02x}", *b))
+                    .collect();
                 debug!("[RTMP] [{}] After parse: buf={} bytes, messages={}, chunk_size={}, preview: {}",
                     peer_addr, buf.len(), messages_parsed, chunk_size, preview.join(" "));
             } else {
-                debug!("[RTMP] [{}] After parse: buf empty, messages={}", peer_addr, messages_parsed);
+                debug!(
+                    "[RTMP] [{}] After parse: buf empty, messages={}",
+                    peer_addr, messages_parsed
+                );
             }
         }
 
         Ok(())
     }
 
-    async fn handle_handshake(buf: &mut BytesMut, writer: &mut tokio::net::tcp::OwnedWriteHalf, peer_addr: std::net::SocketAddr, first_call: bool) -> Result<bool> {
+    async fn handle_handshake(
+        buf: &mut BytesMut,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        peer_addr: std::net::SocketAddr,
+        first_call: bool,
+    ) -> Result<bool> {
         if buf.len() < 1537 {
             return Ok(false);
         }
 
         if first_call && buf[0] != 0x03 {
-            warn!("[RTMP] [{}] Invalid RTMP version: 0x{:02X}", peer_addr, buf[0]);
+            warn!(
+                "[RTMP] [{}] Invalid RTMP version: 0x{:02X}",
+                peer_addr, buf[0]
+            );
             buf.clear();
             return Ok(false);
         }
 
         if first_call {
-            info!("[RTMP] [{}] Received RTMP version 0x{:02X}, starting handshake", peer_addr, buf[0]);
+            info!(
+                "[RTMP] [{}] Received RTMP version 0x{:02X}, starting handshake",
+                peer_addr, buf[0]
+            );
 
             let mut response = vec![0x03];
             response.extend_from_slice(&[0u8; 1536]);
             response.extend_from_slice(&buf[1..1537]);
 
             writer.write_all(&response).await?;
-            info!("[RTMP] [{}] Sent handshake response ({} bytes)", peer_addr, response.len());
+            info!(
+                "[RTMP] [{}] Sent handshake response ({} bytes)",
+                peer_addr,
+                response.len()
+            );
 
             buf.advance(1537);
         }
@@ -274,6 +357,22 @@ impl RtmpServer {
         Ok(false)
     }
 
+    fn release_publish_connection(conn: &mut RtmpConnection) {
+        if !conn.is_publishing {
+            return;
+        }
+
+        if let Some(publisher_id) = conn.publisher_id.take() {
+            if conn
+                .stream_manager
+                .release_publisher(&conn.stream_id, &publisher_id)
+            {
+                let _ = conn.stream_manager.set_unpublished(&conn.stream_id);
+            }
+        }
+        conn.is_publishing = false;
+    }
+
     async fn handle_rtmp_message(
         conn: &mut RtmpConnection,
         msg: RtmpMessage,
@@ -285,17 +384,27 @@ impl RtmpServer {
             0x14 | 0x12 => {
                 if let Ok((command, args)) = amf0::parse_command(&msg.payload) {
                     let args_str: Vec<String> = args.iter().map(|a| fmt_amf0(a)).collect();
-                    info!("[RTMP] [{}] <<< CMD  {}({})",
-                        peer_addr, command, args_str.join(", "));
+                    info!(
+                        "[RTMP] [{}] <<< CMD  {}({})",
+                        peer_addr,
+                        command,
+                        args_str.join(", ")
+                    );
                     Self::handle_amf0_command(conn, &command, &args, peer_addr).await?;
                 } else {
-                    error!("[RTMP] [{}] <<< CMD  parse FAILED ({}bytes)", peer_addr, msg.payload.len());
+                    error!(
+                        "[RTMP] [{}] <<< CMD  parse FAILED ({}bytes)",
+                        peer_addr,
+                        msg.payload.len()
+                    );
                 }
             }
             // Video data
             0x09 => {
                 let data = &msg.payload;
-                if data.is_empty() { return Ok(None); }
+                if data.is_empty() {
+                    return Ok(None);
+                }
                 let frame_type_str = video_frame_type(data[0]);
                 let codec_str = video_codec_name(data[0]);
                 let avc_packet_type = if data.len() > 1 { data[1] } else { 0xFF };
@@ -303,7 +412,10 @@ impl RtmpServer {
                 match avc_packet_type {
                     0x00 => {
                         // AVC sequence header (SPS/PPS)
-                        info!("[RTMP] [{}] <<< VIDEO AVC SequenceHeader ({}+{})", peer_addr, frame_type_str, codec_str);
+                        info!(
+                            "[RTMP] [{}] <<< VIDEO AVC SequenceHeader ({}+{})",
+                            peer_addr, frame_type_str, codec_str
+                        );
                         if data.len() > 13 {
                             let config_data = &data[5..]; // skip frame_type + avc_type + composition_time
                             if config_data.len() > 7 {
@@ -311,10 +423,15 @@ impl RtmpServer {
                                 let mut offset = 6;
                                 let mut sps_data = Vec::new();
                                 for _ in 0..num_sps {
-                                    if offset + 2 > config_data.len() { break; }
-                                    let sps_len = ((config_data[offset] as usize) << 8) | config_data[offset + 1] as usize;
+                                    if offset + 2 > config_data.len() {
+                                        break;
+                                    }
+                                    let sps_len = ((config_data[offset] as usize) << 8)
+                                        | config_data[offset + 1] as usize;
                                     offset += 2;
-                                    if offset + sps_len > config_data.len() { break; }
+                                    if offset + sps_len > config_data.len() {
+                                        break;
+                                    }
                                     sps_data = config_data[offset..offset + sps_len].to_vec();
                                     offset += sps_len;
                                 }
@@ -323,16 +440,25 @@ impl RtmpServer {
                                     let num_pps = config_data[offset] & 0x1F;
                                     offset += 1;
                                     for _ in 0..num_pps as usize {
-                                        if offset + 2 > config_data.len() { break; }
-                                        let pps_len = ((config_data[offset] as usize) << 8) | config_data[offset + 1] as usize;
+                                        if offset + 2 > config_data.len() {
+                                            break;
+                                        }
+                                        let pps_len = ((config_data[offset] as usize) << 8)
+                                            | config_data[offset + 1] as usize;
                                         offset += 2;
-                                        if offset + pps_len > config_data.len() { break; }
+                                        if offset + pps_len > config_data.len() {
+                                            break;
+                                        }
                                         pps_data = config_data[offset..offset + pps_len].to_vec();
                                         offset += pps_len;
                                     }
                                 }
                                 if !sps_data.is_empty() {
-                                    conn.stream_manager.set_stream_sps_pps(&conn.stream_id, sps_data, pps_data);
+                                    conn.stream_manager.set_stream_sps_pps(
+                                        &conn.stream_id,
+                                        sps_data,
+                                        pps_data,
+                                    );
                                 }
                             }
                         }
@@ -343,10 +469,18 @@ impl RtmpServer {
                         let is_keyframe = (data[0] & 0xF0) == 0x10;
                         let avcc_payload = &data[5..];
 
-                        if conn.frames_received <= 3 || is_keyframe && conn.frames_received % 30 == 0 {
-                            debug!("[RTMP] [{}] <<< VIDEO {} {} ts={} size={} frame#{}",
-                                peer_addr, frame_type_str, codec_str,
-                                msg.timestamp, avcc_payload.len(), conn.frames_received);
+                        if conn.frames_received <= 3
+                            || is_keyframe && conn.frames_received % 30 == 0
+                        {
+                            debug!(
+                                "[RTMP] [{}] <<< VIDEO {} {} ts={} size={} frame#{}",
+                                peer_addr,
+                                frame_type_str,
+                                codec_str,
+                                msg.timestamp,
+                                avcc_payload.len(),
+                                conn.frames_received
+                            );
                         }
                         if conn.is_publishing {
                             // Convert AVCC format to Annex B (add start codes)
@@ -358,7 +492,9 @@ impl RtmpServer {
                                     | ((avcc_payload[offset + 2] as usize) << 8)
                                     | (avcc_payload[offset + 3] as usize);
                                 offset += 4;
-                                if offset + nalu_len > avcc_payload.len() { break; }
+                                if offset + nalu_len > avcc_payload.len() {
+                                    break;
+                                }
                                 annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
                                 annex_b.extend_from_slice(&avcc_payload[offset..offset + nalu_len]);
                                 offset += nalu_len;
@@ -366,38 +502,65 @@ impl RtmpServer {
 
                             if !annex_b.is_empty() {
                                 let frame = MediaFrame::new(
-                                    conn.stream_id.clone(), 0, msg.timestamp as u64,
-                                    Bytes::from(annex_b), is_keyframe, CodecType::H264,
+                                    conn.stream_id.clone(),
+                                    0,
+                                    msg.timestamp as u64,
+                                    Bytes::from(annex_b),
+                                    is_keyframe,
+                                    CodecType::H264,
                                 );
                                 conn.stream_manager.publish_frame(frame);
                             }
                         }
                     }
                     _ => {
-                        debug!("[RTMP] [{}] <<< VIDEO unknown avc_packet_type=0x{:02X} ({}bytes)",
-                            peer_addr, avc_packet_type, data.len());
+                        debug!(
+                            "[RTMP] [{}] <<< VIDEO unknown avc_packet_type=0x{:02X} ({}bytes)",
+                            peer_addr,
+                            avc_packet_type,
+                            data.len()
+                        );
                     }
                 }
             }
             // Audio data
             0x08 => {
                 let data = &msg.payload;
-                if data.is_empty() { return Ok(None); }
+                if data.is_empty() {
+                    return Ok(None);
+                }
                 let sound_format = (data[0] >> 4) & 0x0F;
                 let sound_rate = (data[0] >> 2) & 0x03;
                 let sound_size = (data[0] >> 1) & 0x01;
                 let sound_type = data[0] & 0x01;
                 let is_header = data.len() > 1 && data[1] == 0x00;
                 if is_header {
-                    info!("[RTMP] [{}] <<< AUDIO SequenceHeader format={} rate={}Hz bits={} ch={}",
+                    info!(
+                        "[RTMP] [{}] <<< AUDIO SequenceHeader format={} rate={}Hz bits={} ch={}",
                         peer_addr,
-                        match sound_format { 0x0A => "AAC", 0x02 => "MP3", _ => "Other" },
-                        match sound_rate { 0 => "5.5k", 1 => "11k", 2 => "22k", 3 => "44k", _ => "?" },
+                        match sound_format {
+                            0x0A => "AAC",
+                            0x02 => "MP3",
+                            _ => "Other",
+                        },
+                        match sound_rate {
+                            0 => "5.5k",
+                            1 => "11k",
+                            2 => "22k",
+                            3 => "44k",
+                            _ => "?",
+                        },
                         if sound_size == 1 { 16 } else { 8 },
-                        if sound_type == 1 { "stereo" } else { "mono" });
+                        if sound_type == 1 { "stereo" } else { "mono" }
+                    );
                 } else {
-                    debug!("[RTMP] [{}] <<< AUDIO ts={} size={} frame#{}",
-                        peer_addr, msg.timestamp, data.len(), conn.frames_received);
+                    debug!(
+                        "[RTMP] [{}] <<< AUDIO ts={} size={} frame#{}",
+                        peer_addr,
+                        msg.timestamp,
+                        data.len(),
+                        conn.frames_received
+                    );
                 }
                 conn.frames_received += 1;
                 if conn.is_publishing && !is_header {
@@ -410,8 +573,12 @@ impl RtmpServer {
                         data
                     };
                     let frame = MediaFrame::new(
-                        conn.stream_id.clone(), 1, msg.timestamp as u64,
-                        Bytes::copy_from_slice(audio_data), false, CodecType::AAC,
+                        conn.stream_id.clone(),
+                        1,
+                        msg.timestamp as u64,
+                        Bytes::copy_from_slice(audio_data),
+                        false,
+                        CodecType::AAC,
                     );
                     conn.stream_manager.publish_frame(frame);
                 }
@@ -445,13 +612,26 @@ impl RtmpServer {
                         | ((msg.payload[1] as u32) << 16)
                         | ((msg.payload[2] as u32) << 8)
                         | msg.payload[3] as u32;
-                    let limit = match msg.payload[4] { 0 => "Hard", 1 => "Soft", 2 => "Dynamic", _ => "?" };
-                    info!("[RTMP] [{}] <<< SetPeerBandwidth({}, {})", peer_addr, bw, limit);
+                    let limit = match msg.payload[4] {
+                        0 => "Hard",
+                        1 => "Soft",
+                        2 => "Dynamic",
+                        _ => "?",
+                    };
+                    info!(
+                        "[RTMP] [{}] <<< SetPeerBandwidth({}, {})",
+                        peer_addr, bw, limit
+                    );
                 }
             }
             _ => {
-                info!("[RTMP] [{}] <<< Unknown msg type={} (0x{:02x}) {}bytes",
-                    peer_addr, msg_type_name(msg.msg_type), msg.msg_type, msg.payload.len());
+                info!(
+                    "[RTMP] [{}] <<< Unknown msg type={} (0x{:02x}) {}bytes",
+                    peer_addr,
+                    msg_type_name(msg.msg_type),
+                    msg.msg_type,
+                    msg.payload.len()
+                );
             }
         }
         Ok(new_chunk_size)
@@ -466,7 +646,7 @@ impl RtmpServer {
         match command {
             "connect" => {
                 info!("[RTMP] [{}] --- handling connect", peer_addr);
-                 conn.stream_id = conn.session.handle_connect(args);
+                conn.stream_id = conn.session.handle_connect(args);
 
                 // Send Window Ack Size
                 let ack = chunk::encode_window_ack_size(2500000);
@@ -483,18 +663,24 @@ impl RtmpServer {
 
                 // Send _result using new chunk_size (SetChunkSize takes effect immediately for sender)
                 let result = session::build_result_response(conn.session.transaction_id, "Connect");
-                let response = chunk::encode_message(0x14, 0, 0, &result, conn.session.chunk_size, 3);
+                let response =
+                    chunk::encode_message(0x14, 0, 0, &result, conn.session.chunk_size, 3);
                 w.write_all(&response).await?;
                 w.flush().await?;
-                info!("[RTMP] [{}] >>> SENT _result(connect) + WindowAck + PeerBW + SetChunkSize({})",
-                    peer_addr, conn.session.chunk_size);
+                info!(
+                    "[RTMP] [{}] >>> SENT _result(connect) + WindowAck + PeerBW + SetChunkSize({})",
+                    peer_addr, conn.session.chunk_size
+                );
             }
             "releaseStream" | "FCPublish" | "FCUnpublish" => {
                 debug!("[RTMP] [{}] --- {} (ack)", peer_addr, command);
             }
             "createStream" => {
                 let stream_id = conn.session.handle_create_stream(args);
-                info!("[RTMP] [{}] --- createStream -> stream_id={}", peer_addr, stream_id);
+                info!(
+                    "[RTMP] [{}] --- createStream -> stream_id={}",
+                    peer_addr, stream_id
+                );
 
                 let mut result_values = vec![
                     amf0::Amf0Value::String("_result".to_string()),
@@ -503,25 +689,72 @@ impl RtmpServer {
                     amf0::Amf0Value::Number(stream_id as f64),
                 ];
                 let result = amf0::encode(&result_values);
-                let response = chunk::encode_message(0x14, 0, 0, &result, conn.session.chunk_size, 3);
+                let response =
+                    chunk::encode_message(0x14, 0, 0, &result, conn.session.chunk_size, 3);
                 let mut w = conn.writer.lock().await;
                 w.write_all(&response).await?;
-                info!("[RTMP] [{}] >>> SENT _result(createStream) stream_id={}", peer_addr, stream_id);
+                info!(
+                    "[RTMP] [{}] >>> SENT _result(createStream) stream_id={}",
+                    peer_addr, stream_id
+                );
             }
             "publish" => {
                 let stream_name = conn.session.handle_publish(args);
-                conn.is_publishing = true;
-                conn.stream_id = stream_name.clone();
+                let publisher_id = format!("rtmp:{}", peer_addr);
 
                 if conn.stream_manager.get_stream(&stream_name).is_none() {
-                    conn.stream_manager.create_stream(&stream_name, StreamSourceMode::Push, StreamProtocol::RTMP, None);
-                    conn.stream_manager.set_stream_tracks(&stream_name, default_live_tracks());
-                    let _ = conn.stream_manager.set_unpublished(&stream_name);
-                    info!("[RTMP] [{}] Created new stream: '{}'", peer_addr, stream_name);
-
-                } else if conn.stream_manager.get_stream(&stream_name).map(|s| s.tracks.is_empty()).unwrap_or(false) {
-                    conn.stream_manager.set_stream_tracks(&stream_name, default_live_tracks());
+                    conn.stream_manager.create_stream(
+                        &stream_name,
+                        StreamSourceMode::Push,
+                        StreamProtocol::RTMP,
+                        None,
+                    );
+                    info!(
+                        "[RTMP] [{}] Created new stream: '{}'",
+                        peer_addr, stream_name
+                    );
                 }
+
+                if let Err(e) = conn
+                    .stream_manager
+                    .acquire_publisher(&stream_name, &publisher_id)
+                {
+                    warn!(
+                        "[RTMP] [{}] Rejecting duplicate publisher for stream '{}': {}",
+                        peer_addr, stream_name, e
+                    );
+                    let status = session::build_on_status(
+                        "NetStream.Publish.BadName",
+                        "Stream already has an active publisher.",
+                        "error",
+                    );
+                    let response = chunk::encode_message(
+                        0x14,
+                        0,
+                        conn.session.server_stream_id,
+                        &status,
+                        conn.session.chunk_size,
+                        3,
+                    );
+                    let mut w = conn.writer.lock().await;
+                    w.write_all(&response).await?;
+                    return Ok(());
+                }
+
+                conn.is_publishing = true;
+                conn.stream_id = stream_name.clone();
+                conn.publisher_id = Some(publisher_id);
+
+                if conn
+                    .stream_manager
+                    .get_stream(&stream_name)
+                    .map(|s| s.tracks.is_empty())
+                    .unwrap_or(false)
+                {
+                    conn.stream_manager
+                        .set_stream_tracks(&stream_name, default_live_tracks());
+                }
+                let _ = conn.stream_manager.set_unpublished(&stream_name);
 
                 // // ========== 新增：先发送 Stream Begin ==========
                 // let mut stream_begin_data = Vec::new();
@@ -542,15 +775,29 @@ impl RtmpServer {
                 // }
                 // =============================================
 
-                let status = session::build_on_status("NetStream.Publish.Start", "Publishing started.", "status");
-                let response = chunk::encode_message(0x14, 0, conn.session.server_stream_id, &status, conn.session.chunk_size, 3);
+                let status = session::build_on_status(
+                    "NetStream.Publish.Start",
+                    "Publishing started.",
+                    "status",
+                );
+                let response = chunk::encode_message(
+                    0x14,
+                    0,
+                    conn.session.server_stream_id,
+                    &status,
+                    conn.session.chunk_size,
+                    3,
+                );
                 let mut w = conn.writer.lock().await;
                 w.write_all(&response).await?;
-                info!("[RTMP] [{}] >>> SENT onStatus(NetStream.Publish.Start) stream='{}'", peer_addr, stream_name);
+                info!(
+                    "[RTMP] [{}] >>> SENT onStatus(NetStream.Publish.Start) stream='{}'",
+                    peer_addr, stream_name
+                );
 
                 // conn.stream_manager.add_stream(&stream_name);
                 conn.stream_manager.set_stream_broadcast(&stream_name);
-                _= conn.stream_manager.set_publishing(&stream_name);
+                _ = conn.stream_manager.set_publishing(&stream_name);
 
                 if let Some(hls) = conn.hls_server.clone() {
                     let name = stream_name.clone();
@@ -562,12 +809,29 @@ impl RtmpServer {
             "play" => {
                 let play_stream_id = conn.session.handle_play(args);
                 conn.stream_id = play_stream_id.clone();
-                info!("[RTMP] [{}] --- play stream='{}'", peer_addr, play_stream_id);
+                info!(
+                    "[RTMP] [{}] --- play stream='{}'",
+                    peer_addr, play_stream_id
+                );
 
                 if conn.stream_manager.get_stream(&play_stream_id).is_none() {
-                    warn!("[RTMP] [{}] Stream '{}' does not exist", peer_addr, play_stream_id);
-                    let status = session::build_on_status("NetStream.Play.StreamNotFound", "Stream not found", "error");
-                    let response = chunk::encode_message(0x14, 0, conn.session.server_stream_id, &status, conn.session.chunk_size, 3);
+                    warn!(
+                        "[RTMP] [{}] Stream '{}' does not exist",
+                        peer_addr, play_stream_id
+                    );
+                    let status = session::build_on_status(
+                        "NetStream.Play.StreamNotFound",
+                        "Stream not found",
+                        "error",
+                    );
+                    let response = chunk::encode_message(
+                        0x14,
+                        0,
+                        conn.session.server_stream_id,
+                        &status,
+                        conn.session.chunk_size,
+                        3,
+                    );
                     let mut w = conn.writer.lock().await;
                     w.write_all(&response).await?;
 
@@ -575,24 +839,32 @@ impl RtmpServer {
                     return Ok(());
                 }
 
-
-
-
-
                 // Send AVC sequence header if available
                 if let Some(stream) = conn.stream_manager.get_stream(&play_stream_id) {
-
                     if stream.status != StreamStatus::Publishing {
-                        warn!("[RTMP] [{}] Stream '{}' not publishing", peer_addr, play_stream_id);
-                        let status = session::build_on_status("NetStream.Play.StreamNotFound", "Stream not found" , "error");
-                        let response = chunk::encode_message(0x14, 0, conn.session.server_stream_id, &status, conn.session.chunk_size, 3);
+                        warn!(
+                            "[RTMP] [{}] Stream '{}' not publishing",
+                            peer_addr, play_stream_id
+                        );
+                        let status = session::build_on_status(
+                            "NetStream.Play.StreamNotFound",
+                            "Stream not found",
+                            "error",
+                        );
+                        let response = chunk::encode_message(
+                            0x14,
+                            0,
+                            conn.session.server_stream_id,
+                            &status,
+                            conn.session.chunk_size,
+                            3,
+                        );
                         let mut w = conn.writer.lock().await;
                         w.write_all(&response).await?;
 
                         info!("[RTMP] [{}] >>> SENT onStatus('NetStream.Play.StreamNotFound') stream='{}'", peer_addr, play_stream_id);
                         return Ok(());
                     }
-
 
                     // Start forwarding frames
                     let writer_clone = conn.writer.clone();
@@ -602,11 +874,14 @@ impl RtmpServer {
                     if let Some(handle) = conn.play_abort.take() {
                         handle.abort();
                     }
-                    if let Some(mut reader) = conn.stream_manager.dispatch_subscribe(
-                        &play_stream_id,
-                        DispatchPolicy::LiveCoalesce,
-                    ) {
-                        info!("[RTMP] [{}] Subscribed to stream '{}'", peer_addr, play_stream_id);
+                    if let Some(mut reader) = conn
+                        .stream_manager
+                        .dispatch_subscribe(&play_stream_id, DispatchPolicy::LiveCoalesce)
+                    {
+                        info!(
+                            "[RTMP] [{}] Subscribed to stream '{}'",
+                            peer_addr, play_stream_id
+                        );
 
                         reader.snap_to_live_edge();
 
@@ -614,15 +889,30 @@ impl RtmpServer {
                         let mut w = conn.writer.lock().await;
 
                         // Send onStatus(NetStream.Play.Start)
-                        let status = session::build_on_status("NetStream.Play.Start", "Play started.", "status");
-                        let response = chunk::encode_message(0x14, 0, conn.session.server_stream_id, &status, conn.session.chunk_size, chunk::CSID_COMMAND);
+                        let status = session::build_on_status(
+                            "NetStream.Play.Start",
+                            "Play started.",
+                            "status",
+                        );
+                        let response = chunk::encode_message(
+                            0x14,
+                            0,
+                            conn.session.server_stream_id,
+                            &status,
+                            conn.session.chunk_size,
+                            chunk::CSID_COMMAND,
+                        );
                         w.write_all(&response).await?;
 
                         if let (Some(ref sps), Some(ref pps)) = (&stream.sps, &stream.pps) {
                             let avc_header = session::build_avc_sequence_header(sps, pps);
                             let header_msg = chunk::encode_message(
-                                0x09, 0, conn.session.server_stream_id, &avc_header,
-                                conn.session.chunk_size, chunk::CSID_VIDEO,
+                                0x09,
+                                0,
+                                conn.session.server_stream_id,
+                                &avc_header,
+                                conn.session.chunk_size,
+                                chunk::CSID_VIDEO,
                             );
                             w.write_all(&header_msg).await?;
                             info!("[RTMP] [{}] Sent AVC sequence header", peer_addr);
@@ -630,12 +920,19 @@ impl RtmpServer {
                         // Send AAC sequence header
                         let aac_header = session::build_aac_sequence_header();
                         let aac_msg = chunk::encode_message(
-                            0x08, 0, conn.session.server_stream_id, &aac_header,
-                            conn.session.chunk_size, chunk::CSID_AUDIO,
+                            0x08,
+                            0,
+                            conn.session.server_stream_id,
+                            &aac_header,
+                            conn.session.chunk_size,
+                            chunk::CSID_AUDIO,
                         );
                         w.write_all(&aac_msg).await?;
 
-                        info!("[RTMP] [{}] >>> SENT play response (onStatus+AVCHeader+AACHeader)", peer_addr);
+                        info!(
+                            "[RTMP] [{}] >>> SENT play response (onStatus+AVCHeader+AACHeader)",
+                            peer_addr
+                        );
                         drop(w);
 
                         let peer_log = peer_addr.to_string();
@@ -661,7 +958,9 @@ impl RtmpServer {
                                     }
                                 };
                                 for frame in frames {
-                                    if frame.codec == CodecType::Opus || frame.codec == CodecType::G711 {
+                                    if frame.codec == CodecType::Opus
+                                        || frame.codec == CodecType::G711
+                                    {
                                         continue;
                                     }
                                     if matches!(frame.codec, CodecType::H264 | CodecType::H265)
@@ -696,7 +995,9 @@ impl RtmpServer {
                                         continue;
                                     }
                                     let (msg_type, csid) = match frame.codec {
-                                        CodecType::H264 | CodecType::H265 => (0x09u8, chunk::CSID_VIDEO),
+                                        CodecType::H264 | CodecType::H265 => {
+                                            (0x09u8, chunk::CSID_VIDEO)
+                                        }
                                         _ => (0x08u8, chunk::CSID_AUDIO),
                                     };
                                     let rtmp_ts = clock.map(&frame);
@@ -724,32 +1025,46 @@ impl RtmpServer {
                             }
                         });
                         conn.play_abort = Some(handle.abort_handle());
-                    }else{
-                        warn!("[RTMP] [{}] Subscribe to stream '{}' error", peer_addr, play_stream_id);
-                        let status = session::build_on_status("NetStream.Play.StreamNotFound", "Stream not found", "error");
-                        let response = chunk::encode_message(0x14, 0, conn.session.server_stream_id, &status, conn.session.chunk_size, 3);
+                    } else {
+                        warn!(
+                            "[RTMP] [{}] Subscribe to stream '{}' error",
+                            peer_addr, play_stream_id
+                        );
+                        let status = session::build_on_status(
+                            "NetStream.Play.StreamNotFound",
+                            "Stream not found",
+                            "error",
+                        );
+                        let response = chunk::encode_message(
+                            0x14,
+                            0,
+                            conn.session.server_stream_id,
+                            &status,
+                            conn.session.chunk_size,
+                            3,
+                        );
                         let mut w = conn.writer.lock().await;
                         w.write_all(&response).await?;
                         info!("[RTMP] [{}] >>> SENT onStatus('NetStream.Play.StreamNotFound') stream='{}'", peer_addr, play_stream_id);
                         return Ok(());
                     }
-
                 }
-
-
             }
             "deleteStream" => {
                 info!("[RTMP] [{}] --- deleteStream", peer_addr);
-                conn.is_publishing = false;
+                Self::release_publish_connection(conn);
                 conn.session.state = SessionState::Ready;
             }
             "closeStream" => {
                 info!("[RTMP] [{}] --- closeStream", peer_addr);
-                conn.is_publishing = false;
+                Self::release_publish_connection(conn);
                 conn.session.state = SessionState::Closing;
             }
             _ => {
-                info!("[RTMP] [{}] --- unknown AMF0 command: '{}'", peer_addr, command);
+                info!(
+                    "[RTMP] [{}] --- unknown AMF0 command: '{}'",
+                    peer_addr, command
+                );
             }
         }
         Ok(())
@@ -757,7 +1072,10 @@ impl RtmpServer {
 
     // Legacy methods kept for backward compatibility
     #[allow(dead_code)]
-    fn parse_amf0_command(payload: &[u8], peer_addr: std::net::SocketAddr) -> Option<(String, HashMap<String, String>)> {
+    fn parse_amf0_command(
+        payload: &[u8],
+        peer_addr: std::net::SocketAddr,
+    ) -> Option<(String, HashMap<String, String>)> {
         if payload.is_empty() {
             return None;
         }
@@ -795,7 +1113,7 @@ impl RtmpServer {
             }
 
             let marker = payload[offset];
-            
+
             match marker {
                 0x02 => {
                     offset += 1;
@@ -807,7 +1125,8 @@ impl RtmpServer {
                     if offset + str_len > payload.len() {
                         break;
                     }
-                    let key = String::from_utf8_lossy(&payload[offset..offset + str_len]).to_string();
+                    let key =
+                        String::from_utf8_lossy(&payload[offset..offset + str_len]).to_string();
                     offset += str_len;
 
                     if offset + 1 > payload.len() {
@@ -820,12 +1139,14 @@ impl RtmpServer {
                             if offset + 2 > payload.len() {
                                 break;
                             }
-                            let v_len = ((payload[offset] as usize) << 8) | payload[offset + 1] as usize;
+                            let v_len =
+                                ((payload[offset] as usize) << 8) | payload[offset + 1] as usize;
                             offset += 2;
                             if offset + v_len > payload.len() {
                                 break;
                             }
-                            let val = String::from_utf8_lossy(&payload[offset..offset + v_len]).to_string();
+                            let val = String::from_utf8_lossy(&payload[offset..offset + v_len])
+                                .to_string();
                             offset += v_len;
                             val
                         }
@@ -855,12 +1176,15 @@ impl RtmpServer {
                                     if offset + 2 > payload.len() {
                                         break;
                                     }
-                                    let k_len = ((payload[offset] as usize) << 8) | payload[offset + 1] as usize;
+                                    let k_len = ((payload[offset] as usize) << 8)
+                                        | payload[offset + 1] as usize;
                                     offset += 2;
                                     if offset + k_len > payload.len() {
                                         break;
                                     }
-                                    let k = String::from_utf8_lossy(&payload[offset..offset + k_len]).to_string();
+                                    let k =
+                                        String::from_utf8_lossy(&payload[offset..offset + k_len])
+                                            .to_string();
                                     offset += k_len;
 
                                     if offset + 1 > payload.len() {
@@ -873,12 +1197,16 @@ impl RtmpServer {
                                             if offset + 2 > payload.len() {
                                                 break;
                                             }
-                                            let v_len = ((payload[offset] as usize) << 8) | payload[offset + 1] as usize;
+                                            let v_len = ((payload[offset] as usize) << 8)
+                                                | payload[offset + 1] as usize;
                                             offset += 2;
                                             if offset + v_len > payload.len() {
                                                 break;
                                             }
-                                            let val = String::from_utf8_lossy(&payload[offset..offset + v_len]).to_string();
+                                            let val = String::from_utf8_lossy(
+                                                &payload[offset..offset + v_len],
+                                            )
+                                            .to_string();
                                             offset += v_len;
                                             val
                                         }
@@ -953,7 +1281,9 @@ impl RtmpServer {
     fn frame_to_rtmp_data(frame: &MediaFrame) -> Vec<u8> {
         match frame.codec {
             CodecType::H264 | CodecType::H265 => session::frame_to_rtmp_video(frame),
-            CodecType::AAC | CodecType::Opus | CodecType::G711 => session::frame_to_rtmp_audio(frame),
+            CodecType::AAC | CodecType::Opus | CodecType::G711 => {
+                session::frame_to_rtmp_audio(frame)
+            }
             _ => Vec::new(),
         }
     }

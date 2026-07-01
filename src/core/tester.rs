@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::info;
 
-use crate::core::{StreamManager, Track, CodecType, MediaFrame, StreamSourceMode, StreamProtocol};
+use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track};
 use std::sync::Arc;
 
 pub struct StreamTester {
@@ -19,13 +19,9 @@ impl StreamTester {
     /// Generate a test H264 frame (SPS/PPS + NAL units)
     fn generate_h264_sps_pps() -> Bytes {
         // Minimal SPS (Sequence Parameter Set) for baseline profile
-        let sps = vec![
-            0x67, 0x42, 0xC0, 0x0A, 0xDA, 0x0F, 0x0A, 0x69, 0xA8,
-        ];
+        let sps = vec![0x67, 0x42, 0xC0, 0x0A, 0xDA, 0x0F, 0x0A, 0x69, 0xA8];
         // Minimal PPS (Picture Parameter Set)
-        let pps = vec![
-            0x68, 0xCE, 0x38, 0x80,
-        ];
+        let pps = vec![0x68, 0xCE, 0x38, 0x80];
         let mut data = Vec::new();
         data.extend_from_slice(&sps);
         data.extend_from_slice(&pps);
@@ -76,10 +72,17 @@ impl StreamTester {
     /// Push a test stream to the stream manager
     #[allow(dead_code)]
     pub async fn push_test_stream(&self, stream_id: &str, duration_secs: u64) -> Result<()> {
-        info!("[Tester] Starting test stream '{}' for {} seconds", stream_id, duration_secs);
+        info!(
+            "[Tester] Starting test stream '{}' for {} seconds",
+            stream_id, duration_secs
+        );
 
         // Create stream if not exists
-        if self.stream_manager.get_stream(&stream_id.to_string()).is_none() {
+        if self
+            .stream_manager
+            .get_stream(&stream_id.to_string())
+            .is_none()
+        {
             let tracks = vec![
                 Track {
                     id: 0,
@@ -96,7 +99,12 @@ impl StreamTester {
                     extra_params: std::collections::HashMap::new(),
                 },
             ];
-            self.stream_manager.create_stream(stream_id, StreamSourceMode::Push, StreamProtocol::Unknown, None);
+            self.stream_manager.create_stream(
+                stream_id,
+                StreamSourceMode::Push,
+                StreamProtocol::Unknown,
+                None,
+            );
             info!("[Tester] Created stream: {}", stream_id);
         }
 
@@ -140,7 +148,10 @@ impl StreamTester {
             self.stream_manager.publish_frame(audio_frame);
 
             if frame_idx % 100 == 0 {
-                info!("[Tester] Pushed {} frames, timestamp={}", frame_idx, timestamp);
+                info!(
+                    "[Tester] Pushed {} frames, timestamp={}",
+                    frame_idx, timestamp
+                );
             }
 
             timestamp += timestamp_inc_video;
@@ -157,41 +168,30 @@ impl StreamTester {
     #[allow(dead_code)]
     pub async fn push_single_frame(&self, stream_id: &str) -> Result<()> {
         // Create stream
-        let tracks = vec![
-            Track {
-                id: 0,
-                codec: CodecType::H264,
-                payload_type: 96,
-                clock_rate: 90000,
-                extra_params: std::collections::HashMap::new(),
-            },
-        ];
-        self.stream_manager.create_stream(stream_id, StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        let tracks = vec![Track {
+            id: 0,
+            codec: CodecType::H264,
+            payload_type: 96,
+            clock_rate: 90000,
+            extra_params: std::collections::HashMap::new(),
+        }];
+        self.stream_manager.create_stream(
+            stream_id,
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
 
         // Send SPS/PPS and IDR
         let sps_pps = Self::generate_h264_sps_pps();
         let idr = Self::generate_h264_idr_frame(0);
 
-        let frame = MediaFrame::new(
-            stream_id.to_string(),
-            0,
-            0,
-            sps_pps,
-            true,
-            CodecType::H264,
-        );
+        let frame = MediaFrame::new(stream_id.to_string(), 0, 0, sps_pps, true, CodecType::H264);
         self.stream_manager.publish_frame(frame);
 
         sleep(Duration::from_millis(33)).await;
 
-        let frame = MediaFrame::new(
-            stream_id.to_string(),
-            0,
-            3600,
-            idr,
-            true,
-            CodecType::H264,
-        );
+        let frame = MediaFrame::new(stream_id.to_string(), 0, 3600, idr, true, CodecType::H264);
         self.stream_manager.publish_frame(frame);
 
         info!("[Tester] Pushed single frame to '{}'", stream_id);
@@ -207,16 +207,19 @@ mod tests {
     #[test]
     fn test_stream_manager_create_stream() {
         let manager = StreamManager::new();
-        let tracks = vec![
-            Track {
-                id: 0,
-                codec: CodecType::H264,
-                payload_type: 96,
-                clock_rate: 90000,
-                extra_params: HashMap::new(),
-            },
-        ];
-        let stream = manager.create_stream("test", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        let tracks = vec![Track {
+            id: 0,
+            codec: CodecType::H264,
+            payload_type: 96,
+            clock_rate: 90000,
+            extra_params: HashMap::new(),
+        }];
+        let stream = manager.create_stream(
+            "test",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
         manager.set_stream_tracks("test", tracks);
         let stream = manager.get_stream(&"test".to_string()).unwrap();
         assert_eq!(stream.id, "test");
@@ -227,16 +230,19 @@ mod tests {
     #[test]
     fn test_stream_manager_get_stream() {
         let manager = StreamManager::new();
-        let tracks = vec![
-            Track {
-                id: 0,
-                codec: CodecType::H264,
-                payload_type: 96,
-                clock_rate: 90000,
-                extra_params: HashMap::new(),
-            },
-        ];
-        manager.create_stream("test", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        let tracks = vec![Track {
+            id: 0,
+            codec: CodecType::H264,
+            payload_type: 96,
+            clock_rate: 90000,
+            extra_params: HashMap::new(),
+        }];
+        manager.create_stream(
+            "test",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
 
         let stream = manager.get_stream(&"test".to_string());
         assert!(stream.is_some());
@@ -246,16 +252,19 @@ mod tests {
     #[test]
     fn test_stream_manager_remove_stream() {
         let manager = StreamManager::new();
-        let tracks = vec![
-            Track {
-                id: 0,
-                codec: CodecType::H264,
-                payload_type: 96,
-                clock_rate: 90000,
-                extra_params: HashMap::new(),
-            },
-        ];
-        manager.create_stream("test", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        let tracks = vec![Track {
+            id: 0,
+            codec: CodecType::H264,
+            payload_type: 96,
+            clock_rate: 90000,
+            extra_params: HashMap::new(),
+        }];
+        manager.create_stream(
+            "test",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
 
         let removed = manager.remove_stream(&"test".to_string());
         assert!(removed.is_some());
@@ -267,17 +276,25 @@ mod tests {
     #[test]
     fn test_stream_manager_list_streams() {
         let manager = StreamManager::new();
-        let tracks = vec![
-            Track {
-                id: 0,
-                codec: CodecType::H264,
-                payload_type: 96,
-                clock_rate: 90000,
-                extra_params: HashMap::new(),
-            },
-        ];
-        manager.create_stream("stream1", StreamSourceMode::Push, StreamProtocol::Unknown, None);
-        manager.create_stream("stream2", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        let tracks = vec![Track {
+            id: 0,
+            codec: CodecType::H264,
+            payload_type: 96,
+            clock_rate: 90000,
+            extra_params: HashMap::new(),
+        }];
+        manager.create_stream(
+            "stream1",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
+        manager.create_stream(
+            "stream2",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
 
         let streams = manager.list_streams();
         assert_eq!(streams.len(), 2);
@@ -288,19 +305,23 @@ mod tests {
     #[test]
     fn test_stream_manager_subscribe() {
         let manager = StreamManager::new();
-        let tracks = vec![
-            Track {
-                id: 0,
-                codec: CodecType::H264,
-                payload_type: 96,
-                clock_rate: 90000,
-                extra_params: HashMap::new(),
-            },
-        ];
-        manager.create_stream("test", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        let tracks = vec![Track {
+            id: 0,
+            codec: CodecType::H264,
+            payload_type: 96,
+            clock_rate: 90000,
+            extra_params: HashMap::new(),
+        }];
+        manager.create_stream(
+            "test",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
 
         manager.ensure_stream_hub("test");
-        let reader = manager.dispatch_subscribe("test", crate::core::DispatchPolicy::SequentialFromIdr);
+        let reader =
+            manager.dispatch_subscribe("test", crate::core::DispatchPolicy::SequentialFromIdr);
         assert!(reader.is_some());
     }
 
@@ -383,11 +404,11 @@ mod tests {
         // Test parsing an RTMP audio message (0x08)
         let buf = vec![
             0x02, 0x00, 0x00, 0x00, // chunk basic header
-            0x00, 0x00, 0x00,       // timestamp
-            0x00, 0x00, 0x10,       // message length (16)
-            0x08,                   // message type (audio)
+            0x00, 0x00, 0x00, // timestamp
+            0x00, 0x00, 0x10, // message length (16)
+            0x08, // message type (audio)
             0x00, 0x00, 0x00, 0x00, // message stream id
-            0x00, 0x00, 0x00,       // payload (abbreviated)
+            0x00, 0x00, 0x00, // payload (abbreviated)
         ];
         // This is a basic smoke test - parsing structure is correct
         // Real RTMP parsing would require more complete messages
@@ -490,7 +511,7 @@ mod tests {
         let mut c1 = vec![0; 1536];
         c1[0..4].copy_from_slice(&0x00000000u32.to_be_bytes()); // timestamp
         c1[4..8].copy_from_slice(&0u32.to_be_bytes()); // zero
-        // Fill with pattern for testing
+                                                       // Fill with pattern for testing
         for i in 8..1536 {
             c1[i] = (i % 256) as u8;
         }
@@ -627,12 +648,22 @@ mod tests {
         use std::sync::Arc;
 
         let manager = StreamManager::new();
-        manager.create_stream("test_stream", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        manager.create_stream(
+            "test_stream",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
         manager.ensure_stream_hub("test_stream");
 
-        let rtsp = manager.dispatch_subscribe("test_stream", crate::core::DispatchPolicy::SequentialFromIdr);
-        let rtmp = manager.dispatch_subscribe("test_stream", crate::core::DispatchPolicy::LiveCoalesce);
-        let webrtc = manager.dispatch_subscribe("test_stream", crate::core::DispatchPolicy::WebRtcPlay);
+        let rtsp = manager.dispatch_subscribe(
+            "test_stream",
+            crate::core::DispatchPolicy::SequentialFromIdr,
+        );
+        let rtmp =
+            manager.dispatch_subscribe("test_stream", crate::core::DispatchPolicy::LiveCoalesce);
+        let webrtc =
+            manager.dispatch_subscribe("test_stream", crate::core::DispatchPolicy::WebRtcPlay);
 
         assert!(rtsp.is_some());
         assert!(rtmp.is_some());
@@ -685,7 +716,12 @@ mod tests {
                 extra_params: HashMap::new(),
             },
         ];
-        let stream = manager.create_stream("multi_codec", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        let stream = manager.create_stream(
+            "multi_codec",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
         manager.set_stream_tracks("multi_codec", tracks);
         let stream = manager.get_stream(&"multi_codec".to_string()).unwrap();
         assert_eq!(stream.tracks.len(), 4);
@@ -707,16 +743,36 @@ mod tests {
         }];
 
         // Test various stream ID formats
-        let stream1 = manager.create_stream("simple", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        let stream1 = manager.create_stream(
+            "simple",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
         assert_eq!(stream1.id, "simple");
 
-        let stream2 = manager.create_stream("with_underscore", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        let stream2 = manager.create_stream(
+            "with_underscore",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
         assert_eq!(stream2.id, "with_underscore");
 
-        let stream3 = manager.create_stream("with-dash", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        let stream3 = manager.create_stream(
+            "with-dash",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
         assert_eq!(stream3.id, "with-dash");
 
-        let stream4 = manager.create_stream("123numeric", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        let stream4 = manager.create_stream(
+            "123numeric",
+            StreamSourceMode::Push,
+            StreamProtocol::Unknown,
+            None,
+        );
         assert_eq!(stream4.id, "123numeric");
     }
 

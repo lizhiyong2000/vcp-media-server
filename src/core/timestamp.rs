@@ -100,7 +100,14 @@ mod tests {
     use bytes::Bytes;
 
     fn h264(ts: u64) -> MediaFrame {
-        MediaFrame::new("s".into(), 0, ts, Bytes::from_static(b"v"), false, CodecType::H264)
+        MediaFrame::new(
+            "s".into(),
+            0,
+            ts,
+            Bytes::from_static(b"v"),
+            false,
+            CodecType::H264,
+        )
     }
 
     fn aac(n: u64) -> MediaFrame {
@@ -147,5 +154,22 @@ mod tests {
         let t0 = tl.map(&h264(1000));
         let t1 = tl.map(&h264(1000));
         assert!(t1 >= t0);
+    }
+
+    #[test]
+    fn hls_mux_timeline_tracks_rtp_gop_without_wall_drift() {
+        let base = 2_648_000_000u64;
+        let mut last_raw = 0u64;
+        let mut mux_ms = 0u64;
+        for i in 0..25u64 {
+            let ts = base + i * 3600;
+            let (new_raw, new_mux) = crate::hls::timing::advance_video_mux_ms(last_raw, mux_ms, ts);
+            last_raw = new_raw;
+            mux_ms = new_mux;
+        }
+        assert!(
+            (mux_ms as f64 - 960.0).abs() < 1.0,
+            "HLS video mux should follow publisher RTP (~960ms/GOP), got {mux_ms}ms"
+        );
     }
 }

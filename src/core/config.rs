@@ -97,26 +97,24 @@ impl Default for Config {
                 output_dir: Some("./hls".to_string()),
             }),
             http_flv: Some(HttpFlvConfig { enabled: true }),
-            streams: vec![
-                StreamConfig {
-                    id: "live".to_string(),
-                    tracks: vec![
-                        TrackConfig {
-                            codec: "H264".to_string(),
-                            payload_type: 96,
-                            clock_rate: 90000,
-                        },
-                        TrackConfig {
-                            codec: "AAC".to_string(),
-                            payload_type: 97,
-                            clock_rate: 44100,
-                        },
-                    ],
-                    source: None,
-                    protocol: None,
-                    pull_url: None,
-                },
-            ],
+            streams: vec![StreamConfig {
+                id: "live".to_string(),
+                tracks: vec![
+                    TrackConfig {
+                        codec: "H264".to_string(),
+                        payload_type: 96,
+                        clock_rate: 90000,
+                    },
+                    TrackConfig {
+                        codec: "AAC".to_string(),
+                        payload_type: 97,
+                        clock_rate: 44100,
+                    },
+                ],
+                source: None,
+                protocol: None,
+                pull_url: None,
+            }],
             log: LogConfig::default(),
         }
     }

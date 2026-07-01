@@ -7,6 +7,7 @@ pub struct RtspSession {
     pub playing: bool,
     /// True after ANNOUNCE/RECORD — UDP SETUP should ingest RTP from client.
     pub publishing: bool,
+    pub publisher_id: Option<String>,
     pub transport_mode: TransportMode,
     pub interleaved_channels: Vec<(u16, u16)>,
     pub tracks: Vec<Track>,
@@ -35,6 +36,7 @@ impl RtspSession {
             session_id: None,
             playing: false,
             publishing: false,
+            publisher_id: None,
             transport_mode: TransportMode::Tcp,
             interleaved_channels: Vec::new(),
             tracks: Vec::new(),

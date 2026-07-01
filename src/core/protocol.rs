@@ -96,7 +96,9 @@ impl ProtocolRegistry {
     }
 
     pub fn is_enabled(&self, protocol: ProtocolType) -> bool {
-        self.protocols.iter().any(|p| p.protocol == protocol && p.enabled)
+        self.protocols
+            .iter()
+            .any(|p| p.protocol == protocol && p.enabled)
     }
 }
 

@@ -8,12 +8,12 @@ use crate::core::{
     dispatch::{DispatchError, DispatchReader},
     CodecType, MediaFrame, StreamManager,
 };
+use crate::webrtc::annex_b_with_config;
 use crate::webrtc::h264_util::{
     contains_idr_nalu, contains_sps_or_pps_nalu, ensure_annex_b, is_parameter_set_only,
 };
-use crate::webrtc::annex_b_with_config;
 
-use super::common::{RtspCommon, wrap_mpeg4_generic_aac_hbr};
+use super::common::{wrap_mpeg4_generic_aac_hbr, RtspCommon};
 
 const RTP_CLOCK_HZ: u32 = 90_000;
 const AAC_CLOCK_HZ: u32 = 44_100;
@@ -135,7 +135,10 @@ pub async fn prime_rtsp_play(
         }
     }
 
-    info!("[RTSP] [{}] PLAY no IDR yet — wait in relay loop", stream_id);
+    info!(
+        "[RTSP] [{}] PLAY no IDR yet — wait in relay loop",
+        stream_id
+    );
     None
 }
 
@@ -170,13 +173,7 @@ pub fn egress_rtp_packets(
     match frame.codec {
         CodecType::H264 => {
             let annex = prepend_h264_config(manager, stream_id, frame);
-            RtspCommon::packetize_h264_access_unit_for_rtp(
-                &annex,
-                payload_type,
-                seq,
-                ts,
-                ssrc,
-            )
+            RtspCommon::packetize_h264_access_unit_for_rtp(&annex, payload_type, seq, ts, ssrc)
         }
         CodecType::AAC => {
             if frame.data.len() < 4 {
@@ -186,14 +183,7 @@ pub fn egress_rtp_packets(
             if payload.is_empty() {
                 return Vec::new();
             }
-            let pkt = RtspCommon::build_rtp_packet(
-                payload_type,
-                *seq,
-                ts,
-                ssrc,
-                true,
-                &payload,
-            );
+            let pkt = RtspCommon::build_rtp_packet(payload_type, *seq, ts, ssrc, true, &payload);
             *seq = seq.wrapping_add(1);
             vec![pkt]
         }

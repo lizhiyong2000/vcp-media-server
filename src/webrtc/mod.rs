@@ -1,19 +1,19 @@
-pub(crate) mod h264_util;
 mod h264_rtp_ingest;
+pub(crate) mod h264_util;
 mod outbound_h264;
 mod peer;
 mod rtp_h264;
 mod sdp_h264;
-pub use sdp_h264::parse_sprop_parameter_sets;
 pub use outbound_h264::annex_b_with_config;
 pub use publish_signaling::request_publisher_keyframe;
+pub use sdp_h264::parse_sprop_parameter_sets;
 mod play_relay;
 mod player;
-mod publisher;
 mod publish_signaling;
+mod publisher;
 mod signaling;
 
-pub use h264_rtp_ingest::{H264RtpIngest, rtp_h264_media_payload};
+pub use h264_rtp_ingest::{rtp_h264_media_payload, H264RtpIngest};
 
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -29,8 +29,8 @@ use crate::core::StreamManager;
 use crate::hls::HlsServer;
 use peer::create_api;
 use player::{cancel_play_relay, signal_play_relay_stop, start_play};
-use publisher::{add_ice_candidate, start_publish};
 use publish_signaling::{register_publish_signaling, unregister_publish_signaling};
+use publisher::{add_ice_candidate, start_publish};
 use signaling::{ClientSignal, ServerSignal};
 
 pub struct WebrtcServer {
@@ -50,6 +50,8 @@ struct SessionState {
     publish_pc: Option<Arc<RTCPeerConnection>>,
     play_pc: Option<Arc<RTCPeerConnection>>,
     stream_id: Option<String>,
+    publish_stream_id: Option<String>,
+    publisher_id: Option<String>,
     play_relay_id: Option<String>,
     play_relay_handle: Option<tokio::task::JoinHandle<()>>,
     pending_ice: Vec<PendingIce>,
@@ -119,6 +121,8 @@ async fn handle_connection(
         publish_pc: None,
         play_pc: None,
         stream_id: None,
+        publish_stream_id: None,
+        publisher_id: None,
         play_relay_id: None,
         play_relay_handle: None,
         pending_ice: Vec::new(),
@@ -168,28 +172,33 @@ async fn cleanup_session(manager: &Arc<StreamManager>, state: &mut SessionState)
     stop_play_session(state).await;
     if state.has_publish() {
         let sid = state
-            .stream_id
+            .publish_stream_id
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
+        let publisher_id = state.publisher_id.clone();
         let pc = state.publish_pc.take();
-        cleanup_publish_session(manager, &sid, pc).await;
+        cleanup_publish_session(manager, &sid, publisher_id.as_deref(), pc).await;
+        state.publish_stream_id = None;
+        state.publisher_id = None;
     }
 }
 
 async fn cleanup_publish_session(
     manager: &Arc<StreamManager>,
     stream_id: &str,
+    publisher_id: Option<&str>,
     pc: Option<Arc<RTCPeerConnection>>,
 ) {
     if let Some(pc) = pc {
         close_pc_async(pc);
     }
     unregister_publish_signaling(stream_id);
-    let _ = manager.set_unpublished(stream_id);
-    info!(
-        "[WebRTC] Publish session cleaned up stream='{}'",
-        stream_id
-    );
+    if let Some(publisher_id) = publisher_id {
+        if manager.release_publisher(stream_id, publisher_id) {
+            let _ = manager.set_unpublished(stream_id);
+        }
+    }
+    info!("[WebRTC] Publish session cleaned up stream='{}'", stream_id);
 }
 
 /// Close peer connection in the background so WebSocket signaling never blocks on DTLS teardown.
@@ -322,8 +331,8 @@ where
     S: SinkExt<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    let signal: ClientSignal = serde_json::from_str(text)
-        .map_err(|e| anyhow!("invalid signal JSON: {}", e))?;
+    let signal: ClientSignal =
+        serde_json::from_str(text).map_err(|e| anyhow!("invalid signal JSON: {}", e))?;
 
     match &signal {
         ClientSignal::Publish { stream_id, .. } => {
@@ -349,20 +358,54 @@ where
     match signal {
         ClientSignal::Publish { stream_id, sdp } => {
             info!("[WebRTC] Publish request stream='{}'", stream_id);
-            if let Some(old_pc) = state.publish_pc.take() {
-                close_pc_async(old_pc);
+            if state.has_publish() {
+                let old_stream_id = state
+                    .publish_stream_id
+                    .clone()
+                    .unwrap_or_else(|| stream_id.clone());
+                let old_publisher_id = state.publisher_id.clone();
+                let old_pc = state.publish_pc.take();
+                cleanup_publish_session(
+                    manager,
+                    &old_stream_id,
+                    old_publisher_id.as_deref(),
+                    old_pc,
+                )
+                .await;
+                state.publish_stream_id = None;
+                state.publisher_id = None;
             }
             state.stream_id = Some(stream_id.clone());
-            register_publish_signaling(&stream_id, ice_tx.clone());
+            let publisher_id = format!("webrtc:{}:{}", stream_id, rand::random::<u64>());
             let stream_id_for_hls = stream_id.clone();
-            let session = start_publish(
+            let session = match start_publish(
                 api.clone(),
                 manager.clone(),
-                stream_id,
+                stream_id.clone(),
+                publisher_id.clone(),
                 sdp,
                 ice_tx.clone(),
             )
-            .await?;
+            .await
+            {
+                Ok(session) => session,
+                Err(e) => {
+                    warn!(
+                        "[WebRTC] Rejecting publish request stream='{}': {}",
+                        stream_id, e
+                    );
+                    ws_tx
+                        .send(Message::Text(
+                            ServerSignal::Error {
+                                message: format!("publish rejected: {}", e),
+                            }
+                            .to_json(),
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+            };
+            register_publish_signaling(&stream_id, ice_tx.clone());
 
             if let Some(hls) = hls_server {
                 let hls = Arc::clone(hls);
@@ -377,6 +420,8 @@ where
             }
 
             state.publish_pc = Some(session.pc);
+            state.publish_stream_id = Some(stream_id);
+            state.publisher_id = Some(publisher_id);
             flush_pending_ice(state).await;
             let answer = ServerSignal::Answer {
                 sdp: session.answer_sdp,
@@ -390,14 +435,8 @@ where
             if state.stream_id.is_none() {
                 state.stream_id = Some(stream_id.clone());
             }
-            let session = start_play(
-                api.clone(),
-                manager.clone(),
-                stream_id,
-                sdp,
-                ice_tx.clone(),
-            )
-            .await?;
+            let session =
+                start_play(api.clone(), manager.clone(), stream_id, sdp, ice_tx.clone()).await?;
 
             state.play_pc = Some(session.pc);
             state.play_relay_id = Some(session.relay_id);
@@ -415,7 +454,9 @@ where
         ClientSignal::StopPublish { stream_id } => {
             info!("[WebRTC] Stop publish stream='{}'", stream_id);
             let pc = state.publish_pc.take();
-            cleanup_publish_session(manager, &stream_id, pc).await;
+            let publisher_id = state.publisher_id.take();
+            cleanup_publish_session(manager, &stream_id, publisher_id.as_deref(), pc).await;
+            state.publish_stream_id = None;
             if state.play_pc.is_none() {
                 state.stream_id = None;
             }

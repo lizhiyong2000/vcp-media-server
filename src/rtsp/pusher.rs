@@ -1,18 +1,21 @@
 use anyhow::Result;
 use bytes::BytesMut;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::Duration;
-use parking_lot::RwLock;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 use url;
 
-use crate::core::{StreamManager, Track, CodecType, MediaFrame, StreamPusher, PusherId, PusherStatus, StreamProtocol};
 use super::client_session::RtspClientSession;
 use super::common::RtspCommon;
+use crate::core::{
+    CodecType, MediaFrame, PusherId, PusherStatus, StreamManager, StreamProtocol, StreamPusher,
+    Track,
+};
 
 pub struct RtspPusher {
     id: PusherId,
@@ -45,12 +48,20 @@ impl RtspPusher {
 
     pub fn set_tracks(&mut self, tracks: Vec<Track>) {
         self.tracks = Some(tracks);
-        info!("[RTSP Pusher] Set {} tracks for stream {}", self.tracks.as_ref().unwrap().len(), self.stream_id);
+        info!(
+            "[RTSP Pusher] Set {} tracks for stream {}",
+            self.tracks.as_ref().unwrap().len(),
+            self.stream_id
+        );
     }
 
     fn set_status(&self, status: PusherStatus) {
         let mut s = self.status.write();
-        info!("[RTSP Pusher] Status changed: {} -> {}", s.as_str(), status.as_str());
+        info!(
+            "[RTSP Pusher] Status changed: {} -> {}",
+            s.as_str(),
+            status.as_str()
+        );
         *s = status;
     }
 
@@ -65,26 +76,33 @@ impl RtspPusher {
 
     pub async fn start(&mut self) -> Result<()> {
         info!("[RTSP Pusher] =========================================");
-        info!("[RTSP Pusher] Starting RTSP Pusher for stream: {}", self.stream_id);
+        info!(
+            "[RTSP Pusher] Starting RTSP Pusher for stream: {}",
+            self.stream_id
+        );
         info!("[RTSP Pusher] Target URL: {}", self.remote_url);
         info!("[RTSP Pusher] =========================================");
-        
+
         self.set_status(PusherStatus::Starting);
-        
+
         if self.tracks.is_none() {
             self.set_status(PusherStatus::Error("Tracks not set".to_string()));
-            return Err(anyhow::anyhow!("Tracks not set. Call set_tracks() before start()"));
+            return Err(anyhow::anyhow!(
+                "Tracks not set. Call set_tracks() before start()"
+            ));
         }
-        
+
         let tracks = self.tracks.as_ref().unwrap();
         info!("[RTSP Pusher] Number of tracks: {}", tracks.len());
         for (idx, track) in tracks.iter().enumerate() {
-            info!("[RTSP Pusher] Track {}: codec={:?}, payload_type={}, clock_rate={}", 
-                  idx, track.codec, track.payload_type, track.clock_rate);
+            info!(
+                "[RTSP Pusher] Track {}: codec={:?}, payload_type={}, clock_rate={}",
+                idx, track.codec, track.payload_type, track.clock_rate
+            );
         }
 
         let mut session = RtspClientSession::new(self.stream_manager.clone(), &self.remote_url);
-        
+
         info!("[RTSP Pusher] [Step 1/5] Connecting...");
         let (mut reader, mut writer) = session.connect().await?;
 
@@ -97,20 +115,35 @@ impl RtspPusher {
 
         let sdp = RtspClientSession::build_sdp(tracks);
         info!("[RTSP Pusher] [Step 3/5] Sending ANNOUNCE...");
-        let response = session.send_announce(&mut writer, &mut reader, &sdp).await?;
+        let response = session
+            .send_announce(&mut writer, &mut reader, &sdp)
+            .await?;
         if !response.starts_with("RTSP/1.0 200 OK") {
             self.set_status(PusherStatus::Error("ANNOUNCE failed".to_string()));
             return Err(anyhow::anyhow!("ANNOUNCE failed: {}", response));
         }
 
-        info!("[RTSP Pusher] [Step 4/5] Setting up {} tracks...", tracks.len());
+        info!(
+            "[RTSP Pusher] [Step 4/5] Setting up {} tracks...",
+            tracks.len()
+        );
         for (idx, track) in tracks.iter().enumerate() {
             let response = session.send_setup(&mut writer, &mut reader, idx).await?;
             if !response.starts_with("RTSP/1.0 200 OK") {
-                self.set_status(PusherStatus::Error(format!("SETUP failed for track {}", idx)));
-                return Err(anyhow::anyhow!("SETUP failed for track {}: {}", idx, response));
+                self.set_status(PusherStatus::Error(format!(
+                    "SETUP failed for track {}",
+                    idx
+                )));
+                return Err(anyhow::anyhow!(
+                    "SETUP failed for track {}: {}",
+                    idx,
+                    response
+                ));
             }
-            info!("[RTSP Pusher] [Step 4/5] Track {} setup completed (codec={:?})", idx, track.codec);
+            info!(
+                "[RTSP Pusher] [Step 4/5] Track {} setup completed (codec={:?})",
+                idx, track.codec
+            );
         }
 
         info!("[RTSP Pusher] [Step 5/5] Sending RECORD...");
@@ -122,7 +155,10 @@ impl RtspPusher {
 
         self.set_status(PusherStatus::Running);
         info!("[RTSP Pusher] =========================================");
-        info!("[RTSP Pusher] SUCCESS: RTSP Pusher started for stream {}", self.stream_id);
+        info!(
+            "[RTSP Pusher] SUCCESS: RTSP Pusher started for stream {}",
+            self.stream_id
+        );
         info!("[RTSP Pusher] Session ID: {:?}", session.session_id());
         info!("[RTSP Pusher] Remote URL: {}", self.remote_url);
         info!("[RTSP Pusher] Number of tracks: {}", tracks.len());
@@ -141,7 +177,10 @@ impl RtspPusher {
             .map(|(id, sock, addr)| (id, (sock, addr)))
             .collect();
 
-        info!("[RTSP Pusher] Transport: {}", if use_udp { "UDP" } else { "TCP" });
+        info!(
+            "[RTSP Pusher] Transport: {}",
+            if use_udp { "UDP" } else { "TCP" }
+        );
 
         tokio::spawn(async move {
             tokio::select! {
@@ -169,17 +208,25 @@ impl RtspPusher {
         let mut bytes_sent: u64 = 0;
         let mut last_log_time = std::time::Instant::now();
         let mut sequences: Vec<u16> = vec![0; tracks.len()];
-        
-        info!("[RTSP Pusher] [RTP Loop] Starting RTP send loop for stream {}", stream_id);
-        
-        let mut reader = match manager.dispatch_subscribe(&stream_id, crate::core::DispatchPolicy::SequentialFromIdr) {
+
+        info!(
+            "[RTSP Pusher] [RTP Loop] Starting RTP send loop for stream {}",
+            stream_id
+        );
+
+        let mut reader = match manager
+            .dispatch_subscribe(&stream_id, crate::core::DispatchPolicy::SequentialFromIdr)
+        {
             Some(r) => r,
             None => {
-                error!("[RTSP Pusher] [RTP Loop] Failed to subscribe to stream {}", stream_id);
+                error!(
+                    "[RTSP Pusher] [RTP Loop] Failed to subscribe to stream {}",
+                    stream_id
+                );
                 return;
             }
         };
-        
+
         info!("[RTSP Pusher] [RTP Loop] Waiting for media frames...");
 
         async fn send_rtp_packet(
@@ -200,7 +247,7 @@ impl RtspPusher {
             }
             Ok(())
         }
-        
+
         loop {
             let frames = match reader.recv_batch().await {
                 Ok(f) if !f.is_empty() => f,
@@ -208,180 +255,210 @@ impl RtspPusher {
                 Err(crate::core::dispatch::DispatchError::Closed) => break,
             };
             for frame in frames {
-            frame_count += 1;
-            
-            if *paused.read() {
-                debug!("[RTSP Pusher] [RTP Loop] Frame #{:>6} - Dropping frame, pusher is paused", frame_count);
-                continue;
-            }
-            
-            let track = tracks.iter().find(|t| t.id == frame.track_id);
-            if track.is_none() {
-                warn!("[RTSP Pusher] [RTP Loop] Frame #{:>6} - No track found for track_id={}", frame_count, frame.track_id);
-                continue;
-            }
-            
-            let track = track.unwrap();
-            let channel = track.id * 2;
-            
-            // Extract and cache SPS/PPS for H264 keyframes
-            if frame.codec == CodecType::H264 && frame.is_keyframe {
-                let (sps, pps) = RtspCommon::extract_sps_pps(&frame.data);
-                
-                if let Some(sps_data) = sps {
-                    let mut cached_sps = sps_cache.write();
-                    if cached_sps.is_none() {
-                        info!("[RTSP Pusher] [RTP Loop] Cached SPS: {} bytes", sps_data.len());
-                    }
-                    *cached_sps = Some(sps_data);
-                }
-                
-                if let Some(pps_data) = pps {
-                    let mut cached_pps = pps_cache.write();
-                    if cached_pps.is_none() {
-                        info!("[RTSP Pusher] [RTP Loop] Cached PPS: {} bytes", pps_data.len());
-                    }
-                    *cached_pps = Some(pps_data);
-                }
-                
-                // Send SPS/PPS before keyframe
-                let sps_copy = sps_cache.read().clone();
-                let pps_copy = pps_cache.read().clone();
-                
-                if let (Some(sps_data), Some(pps_data)) = (sps_copy, pps_copy) {
-                    let timestamp = frame.timestamp as u32;
-                    let seq = sequences[track.id as usize];
-                    
-                    // Send SPS packet
-                    let sps_rtp = RtspClientSession::build_rtp_packet(
-                        96, seq, timestamp, 0x12345678, false, &sps_data
-                    );
-                    if let Err(e) = send_rtp_packet(
-                        &mut writer,
-                        use_udp,
-                        &udp_tracks,
-                        track.id as usize,
-                        channel,
-                        &sps_rtp,
-                    )
-                    .await
-                    {
-                        error!("[RTSP Pusher] [RTP Loop] Failed to send SPS: {}", e);
-                        break;
-                    }
-                    info!("[RTSP Pusher] [RTP Loop] Sent SPS RTP ({} bytes)", sps_rtp.len());
-                    sequences[track.id as usize] = sequences[track.id as usize].wrapping_add(1);
-                    
-                    // Send PPS packet
-                    let pps_rtp = RtspClientSession::build_rtp_packet(
-                        96, sequences[track.id as usize], timestamp, 0x12345678, false, &pps_data
-                    );
-                    if let Err(e) = send_rtp_packet(
-                        &mut writer,
-                        use_udp,
-                        &udp_tracks,
-                        track.id as usize,
-                        channel,
-                        &pps_rtp,
-                    )
-                    .await
-                    {
-                        error!("[RTSP Pusher] [RTP Loop] Failed to send PPS: {}", e);
-                        break;
-                    }
-                    info!("[RTSP Pusher] [RTP Loop] Sent PPS RTP ({} bytes)", pps_rtp.len());
-                    sequences[track.id as usize] = sequences[track.id as usize].wrapping_add(1);
-                }
-            }
-            
-            let seq = sequences[track.id as usize];
-            
-            // Build RTP packet
-            let rtp_payload = if frame.codec == CodecType::H264 {
-                // Add length prefix for proper RTP payload format
-                let mut payload = Vec::with_capacity(4 + frame.data.len());
-                payload.extend_from_slice(&(frame.data.len() as u32).to_be_bytes());
-                payload.extend_from_slice(&frame.data);
-                payload
-            } else {
-                frame.data.to_vec()
-            };
-            
-            let rtp_packet = RtspClientSession::build_rtp_packet(
-                track.payload_type,
-                seq,
-                frame.timestamp as u32,
-                0x12345678,
-                frame.is_keyframe,
-                &rtp_payload
-            );
+                frame_count += 1;
 
-            if use_udp {
-                bytes_sent += rtp_packet.len() as u64;
-            }
+                if *paused.read() {
+                    debug!(
+                        "[RTSP Pusher] [RTP Loop] Frame #{:>6} - Dropping frame, pusher is paused",
+                        frame_count
+                    );
+                    continue;
+                }
 
-            if let Err(e) = send_rtp_packet(
-                &mut writer,
-                use_udp,
-                &udp_tracks,
-                track.id as usize,
-                channel,
-                &rtp_packet,
-            )
-            .await
-            {
-                error!(
-                    "[RTSP Pusher] [RTP Loop] Frame #{:>6} - Failed to send RTP packet: {}",
-                    frame_count, e
+                let track = tracks.iter().find(|t| t.id == frame.track_id);
+                if track.is_none() {
+                    warn!(
+                        "[RTSP Pusher] [RTP Loop] Frame #{:>6} - No track found for track_id={}",
+                        frame_count, frame.track_id
+                    );
+                    continue;
+                }
+
+                let track = track.unwrap();
+                let channel = track.id * 2;
+
+                // Extract and cache SPS/PPS for H264 keyframes
+                if frame.codec == CodecType::H264 && frame.is_keyframe {
+                    let (sps, pps) = RtspCommon::extract_sps_pps(&frame.data);
+
+                    if let Some(sps_data) = sps {
+                        let mut cached_sps = sps_cache.write();
+                        if cached_sps.is_none() {
+                            info!(
+                                "[RTSP Pusher] [RTP Loop] Cached SPS: {} bytes",
+                                sps_data.len()
+                            );
+                        }
+                        *cached_sps = Some(sps_data);
+                    }
+
+                    if let Some(pps_data) = pps {
+                        let mut cached_pps = pps_cache.write();
+                        if cached_pps.is_none() {
+                            info!(
+                                "[RTSP Pusher] [RTP Loop] Cached PPS: {} bytes",
+                                pps_data.len()
+                            );
+                        }
+                        *cached_pps = Some(pps_data);
+                    }
+
+                    // Send SPS/PPS before keyframe
+                    let sps_copy = sps_cache.read().clone();
+                    let pps_copy = pps_cache.read().clone();
+
+                    if let (Some(sps_data), Some(pps_data)) = (sps_copy, pps_copy) {
+                        let timestamp = frame.timestamp as u32;
+                        let seq = sequences[track.id as usize];
+
+                        // Send SPS packet
+                        let sps_rtp = RtspClientSession::build_rtp_packet(
+                            96, seq, timestamp, 0x12345678, false, &sps_data,
+                        );
+                        if let Err(e) = send_rtp_packet(
+                            &mut writer,
+                            use_udp,
+                            &udp_tracks,
+                            track.id as usize,
+                            channel,
+                            &sps_rtp,
+                        )
+                        .await
+                        {
+                            error!("[RTSP Pusher] [RTP Loop] Failed to send SPS: {}", e);
+                            break;
+                        }
+                        info!(
+                            "[RTSP Pusher] [RTP Loop] Sent SPS RTP ({} bytes)",
+                            sps_rtp.len()
+                        );
+                        sequences[track.id as usize] = sequences[track.id as usize].wrapping_add(1);
+
+                        // Send PPS packet
+                        let pps_rtp = RtspClientSession::build_rtp_packet(
+                            96,
+                            sequences[track.id as usize],
+                            timestamp,
+                            0x12345678,
+                            false,
+                            &pps_data,
+                        );
+                        if let Err(e) = send_rtp_packet(
+                            &mut writer,
+                            use_udp,
+                            &udp_tracks,
+                            track.id as usize,
+                            channel,
+                            &pps_rtp,
+                        )
+                        .await
+                        {
+                            error!("[RTSP Pusher] [RTP Loop] Failed to send PPS: {}", e);
+                            break;
+                        }
+                        info!(
+                            "[RTSP Pusher] [RTP Loop] Sent PPS RTP ({} bytes)",
+                            pps_rtp.len()
+                        );
+                        sequences[track.id as usize] = sequences[track.id as usize].wrapping_add(1);
+                    }
+                }
+
+                let seq = sequences[track.id as usize];
+
+                // Build RTP packet
+                let rtp_payload = if frame.codec == CodecType::H264 {
+                    // Add length prefix for proper RTP payload format
+                    let mut payload = Vec::with_capacity(4 + frame.data.len());
+                    payload.extend_from_slice(&(frame.data.len() as u32).to_be_bytes());
+                    payload.extend_from_slice(&frame.data);
+                    payload
+                } else {
+                    frame.data.to_vec()
+                };
+
+                let rtp_packet = RtspClientSession::build_rtp_packet(
+                    track.payload_type,
+                    seq,
+                    frame.timestamp as u32,
+                    0x12345678,
+                    frame.is_keyframe,
+                    &rtp_payload,
                 );
-                break;
-            }
 
-            if !use_udp {
-                bytes_sent += (4 + rtp_packet.len()) as u64;
-            }
-            
-            sequences[track.id as usize] = sequences[track.id as usize].wrapping_add(1);
-            
-            let elapsed = last_log_time.elapsed();
-            if elapsed >= Duration::from_secs(10) {
-                let fps = frame_count as f64 / elapsed.as_secs_f64();
-                let bps = bytes_sent as f64 / elapsed.as_secs_f64();
-                info!("[RTSP Pusher] [RTP Loop] Stats - Frames: {}, Bytes: {}, FPS: {:.2}, BPS: {:.2} KB/s", 
+                if use_udp {
+                    bytes_sent += rtp_packet.len() as u64;
+                }
+
+                if let Err(e) = send_rtp_packet(
+                    &mut writer,
+                    use_udp,
+                    &udp_tracks,
+                    track.id as usize,
+                    channel,
+                    &rtp_packet,
+                )
+                .await
+                {
+                    error!(
+                        "[RTSP Pusher] [RTP Loop] Frame #{:>6} - Failed to send RTP packet: {}",
+                        frame_count, e
+                    );
+                    break;
+                }
+
+                if !use_udp {
+                    bytes_sent += (4 + rtp_packet.len()) as u64;
+                }
+
+                sequences[track.id as usize] = sequences[track.id as usize].wrapping_add(1);
+
+                let elapsed = last_log_time.elapsed();
+                if elapsed >= Duration::from_secs(10) {
+                    let fps = frame_count as f64 / elapsed.as_secs_f64();
+                    let bps = bytes_sent as f64 / elapsed.as_secs_f64();
+                    info!("[RTSP Pusher] [RTP Loop] Stats - Frames: {}, Bytes: {}, FPS: {:.2}, BPS: {:.2} KB/s", 
                       frame_count, bytes_sent, fps, bps / 1024.0);
-                last_log_time = std::time::Instant::now();
-            }
-            
-            buffer.clear();
+                    last_log_time = std::time::Instant::now();
+                }
+
+                buffer.clear();
             }
         }
-        
-        info!("[RTSP Pusher] [RTP Loop] RTP send loop ended for stream {}", stream_id);
+
+        info!(
+            "[RTSP Pusher] [RTP Loop] RTP send loop ended for stream {}",
+            stream_id
+        );
     }
-    
+
     async fn monitor_connection(mut reader: tokio::net::tcp::OwnedReadHalf) {
         info!("[RTSP Pusher] [Monitor] Starting connection monitor");
-        
+
         let mut buffer = [0u8; 4096];
-        
+
         loop {
             match reader.read(&mut buffer).await {
                 Ok(n) => {
                     if n > 0 {
                         let response = String::from_utf8_lossy(&buffer[..n]);
-                        info!("[RTSP Pusher] [Monitor] Received {} bytes: {}", n, response.trim());
+                        info!(
+                            "[RTSP Pusher] [Monitor] Received {} bytes: {}",
+                            n,
+                            response.trim()
+                        );
                     } else {
                         info!("[RTSP Pusher] [Monitor] Connection closed by server");
                         break;
                     }
-                },
+                }
                 Err(e) => {
                     warn!("[RTSP Pusher] [Monitor] Error reading: {}", e);
                     break;
                 }
             }
         }
-        
+
         info!("[RTSP Pusher] [Monitor] Connection monitor ended");
     }
 
@@ -430,7 +507,10 @@ impl StreamPusher for RtspPusher {
     }
 
     async fn resume(&mut self) -> Result<()> {
-        info!("[RTSP Pusher] Resuming pusher for stream {}", self.stream_id);
+        info!(
+            "[RTSP Pusher] Resuming pusher for stream {}",
+            self.stream_id
+        );
         self.set_paused(false);
         let current_status = self.status.read().clone();
         if current_status.is_paused() {
@@ -440,7 +520,10 @@ impl StreamPusher for RtspPusher {
     }
 
     async fn stop(&mut self) -> Result<()> {
-        info!("[RTSP Pusher] Stopping pusher for stream {}", self.stream_id);
+        info!(
+            "[RTSP Pusher] Stopping pusher for stream {}",
+            self.stream_id
+        );
         self.set_status(PusherStatus::Stopped);
         Ok(())
     }

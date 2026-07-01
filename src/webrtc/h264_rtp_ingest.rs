@@ -9,7 +9,9 @@ use webrtc::rtp::packetizer::Depacketizer;
 
 use crate::core::{CodecType, MediaFrame, StreamManager};
 
-use super::h264_util::{describe_annex_b, is_keyframe_annex_b, is_parameter_set_only, contains_vcl_nalu};
+use super::h264_util::{
+    contains_vcl_nalu, describe_annex_b, is_keyframe_annex_b, is_parameter_set_only,
+};
 use super::rtp_h264::{
     self, annex_b_from_rtp_payload, describe_rtp_payload, extract_sps_pps_from_nalus,
     is_idr_rtp_payload, parse_rtp_h264,
@@ -68,12 +70,9 @@ impl H264RtpIngest {
         };
 
         let mut published = false;
-        if let Some(frame) = h264_rtp_to_annex_b(
-            &mut self.depacketizer,
-            &pkt,
-            &self.stream_id,
-            &self.manager,
-        ) {
+        if let Some(frame) =
+            h264_rtp_to_annex_b(&mut self.depacketizer, &pkt, &self.stream_id, &self.manager)
+        {
             if is_parameter_set_only(&frame.data) {
                 return false;
             }
@@ -172,8 +171,7 @@ pub fn rtp_h264_media_payload(rtp: &[u8]) -> Option<(&[u8], u32, bool)> {
         if offset + 4 > rtp.len() {
             return None;
         }
-        let ext_len =
-            ((rtp[offset + 2] as usize) << 8 | rtp[offset + 3] as usize) * 4 + 4;
+        let ext_len = ((rtp[offset + 2] as usize) << 8 | rtp[offset + 3] as usize) * 4 + 4;
         offset += ext_len;
     }
     if offset >= rtp.len() {

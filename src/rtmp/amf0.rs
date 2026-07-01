@@ -61,7 +61,11 @@ pub fn decode(data: &[u8]) -> Result<(Vec<Amf0Value>, usize), String> {
 
     while offset < data.len() {
         // Check for object-end marker (0x00 0x00 0x09)
-        if offset + 3 <= data.len() && data[offset] == 0x00 && data[offset + 1] == 0x00 && data[offset + 2] == 0x09 {
+        if offset + 3 <= data.len()
+            && data[offset] == 0x00
+            && data[offset + 1] == 0x00
+            && data[offset + 2] == 0x09
+        {
             offset += 3;
             break;
         }
@@ -107,15 +111,9 @@ fn decode_value(data: &[u8], offset: &mut usize) -> Result<Amf0Value, String> {
             *offset += 1;
             Ok(Amf0Value::Boolean(val))
         }
-        AMF0_STRING => {
-            decode_string(data, offset).map(Amf0Value::String)
-        }
-        AMF0_OBJECT => {
-            decode_object(data, offset)
-        }
-        AMF0_NULL | AMF0_UNDEFINED => {
-            Ok(Amf0Value::Null)
-        }
+        AMF0_STRING => decode_string(data, offset).map(Amf0Value::String),
+        AMF0_OBJECT => decode_object(data, offset),
+        AMF0_NULL | AMF0_UNDEFINED => Ok(Amf0Value::Null),
         AMF0_ECMA_ARRAY => {
             if *offset + 4 > data.len() {
                 return Err("Not enough data for ECMA array count".to_string());
@@ -124,9 +122,11 @@ fn decode_value(data: &[u8], offset: &mut usize) -> Result<Amf0Value, String> {
             *offset += 4;
             decode_object_inner(data, offset, true)
         }
-        _ => {
-            Err(format!("Unsupported AMF0 type: 0x{:02X} at offset {}", marker, *offset - 1))
-        }
+        _ => Err(format!(
+            "Unsupported AMF0 type: 0x{:02X} at offset {}",
+            marker,
+            *offset - 1
+        )),
     }
 }
 
@@ -139,7 +139,11 @@ fn decode_string(data: &[u8], offset: &mut usize) -> Result<String, String> {
     *offset += 2;
 
     if *offset + len > data.len() {
-        return Err(format!("Not enough data for string: need {} but have {}", len, data.len() - *offset));
+        return Err(format!(
+            "Not enough data for string: need {} but have {}",
+            len,
+            data.len() - *offset
+        ));
     }
 
     let s = String::from_utf8_lossy(&data[*offset..*offset + len]).to_string();
@@ -153,7 +157,11 @@ fn decode_object(data: &[u8], offset: &mut usize) -> Result<Amf0Value, String> {
 }
 
 /// Internal object decoder (shared between Object and ECMA Array)
-fn decode_object_inner(data: &[u8], offset: &mut usize, is_ecma: bool) -> Result<Amf0Value, String> {
+fn decode_object_inner(
+    data: &[u8],
+    offset: &mut usize,
+    is_ecma: bool,
+) -> Result<Amf0Value, String> {
     let mut map = HashMap::new();
 
     loop {
@@ -190,7 +198,9 @@ fn decode_object_inner(data: &[u8], offset: &mut usize, is_ecma: bool) -> Result
 
         // Read property value
         match decode_value(data, offset) {
-            Ok(val) => { map.insert(key, val); }
+            Ok(val) => {
+                map.insert(key, val);
+            }
             Err(_) => break,
         }
     }

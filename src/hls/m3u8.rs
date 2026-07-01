@@ -76,19 +76,22 @@ impl M3u8Generator {
 
         self.segments.push_back(segment);
         self.next_sequence = sequence + 1;
-        if discontinuity {
-            self.discontinuity_sequence += 1;
-        }
 
         while self.segments.len() > self.max_segments {
-            if self.segments.pop_front().is_some() {
+            if let Some(removed) = self.segments.pop_front() {
                 self.media_sequence += 1;
+                if removed.discontinuity {
+                    self.discontinuity_sequence += 1;
+                }
             }
         }
 
         debug!(
             "[HLS] Added segment seq={}, duration={:.2}s, media_seq={}, window={}",
-            sequence, duration, self.media_sequence, self.segments.len()
+            sequence,
+            duration,
+            self.media_sequence,
+            self.segments.len()
         );
     }
 
@@ -133,7 +136,10 @@ impl M3u8Generator {
             "#EXT-X-TARGETDURATION:{}\r\n",
             self.playlist_target_duration()
         ));
-        output.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\r\n", self.media_sequence));
+        output.push_str(&format!(
+            "#EXT-X-MEDIA-SEQUENCE:{}\r\n",
+            self.media_sequence
+        ));
         if self.discontinuity_sequence > 0 {
             output.push_str(&format!(
                 "#EXT-X-DISCONTINUITY-SEQUENCE:{}\r\n",
@@ -193,5 +199,52 @@ impl M3u8Generator {
 
     pub fn max_segments(&self) -> usize {
         self.max_segments
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    #[test]
+    fn target_duration_stays_at_one_for_sub_second_extinf() {
+        let mut gen = M3u8Generator::new(1.0, 3);
+        gen.add_segment(0.96, 0, SystemTime::now(), false);
+        let pl = gen.generate();
+        assert!(pl.contains("#EXT-X-TARGETDURATION:1"));
+        assert!(pl.contains("#EXTINF:0.960,"));
+        assert!(!pl.contains("TARGETDURATION:3"));
+    }
+
+    #[test]
+    fn playlist_carries_program_date_time_per_segment() {
+        let mut gen = M3u8Generator::new(1.0, 1);
+        let pdt = SystemTime::now();
+        gen.add_segment(1.0, 0, pdt, false);
+        let pl = gen.generate();
+        assert!(pl.contains("#EXT-X-PROGRAM-DATE-TIME:"));
+        assert!(pl.contains("#EXTINF:1.000,"));
+    }
+
+    #[test]
+    fn discontinuity_sequence_counts_only_segments_before_window() {
+        let mut gen = M3u8Generator::new(1.0, 2);
+        let now = SystemTime::now();
+
+        gen.add_segment(1.0, 0, now, false);
+        gen.add_segment(1.0, 1, now, true);
+        let pl = gen.generate();
+        assert!(!pl.contains("#EXT-X-DISCONTINUITY-SEQUENCE:"));
+        assert!(pl.contains("#EXT-X-DISCONTINUITY\r\n"));
+
+        gen.add_segment(1.0, 2, now, false);
+        let pl = gen.generate();
+        assert!(!pl.contains("#EXT-X-DISCONTINUITY-SEQUENCE:"));
+
+        gen.add_segment(1.0, 3, now, false);
+        let pl = gen.generate();
+        assert!(pl.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"));
+        assert!(!pl.contains("#EXT-X-DISCONTINUITY\r\n"));
     }
 }

@@ -1,12 +1,14 @@
+use anyhow::Result;
+use bytes::{BufMut, Bytes, BytesMut};
+use parking_lot::RwLock;
 /// HTTP-FLV streaming module
 /// Delivers live streams via HTTP with FLV container format using chunked transfer encoding.
 use std::sync::Arc;
-use bytes::{Bytes, BytesMut, BufMut};
-use parking_lot::RwLock;
-use tracing::{info, warn, error, debug};
-use anyhow::Result;
+use tracing::{debug, error, info, warn};
 
-use crate::core::{StreamManager, MediaFrame, CodecType, FlvPlayTimeline, DispatchPolicy, DispatchReader};
+use crate::core::{
+    CodecType, DispatchPolicy, DispatchReader, FlvPlayTimeline, MediaFrame, StreamManager,
+};
 use crate::rtmp::session::{frame_to_rtmp_audio, frame_to_rtmp_video};
 
 /// FLV file header (9 bytes)
@@ -48,7 +50,7 @@ fn generate_flv_tag(tag_type: u8, timestamp: u32, data: &[u8]) -> Vec<u8> {
     tag.push(((timestamp >> 8) & 0xFF) as u8);
     tag.push((timestamp & 0xFF) as u8);
     tag.push(((timestamp >> 24) & 0xFF) as u8); // Timestamp extension
-    // Stream ID (always 0)
+                                                // Stream ID (always 0)
     tag.extend_from_slice(&[0x00, 0x00, 0x00]);
     // Tag data
     tag.extend_from_slice(data);
@@ -252,7 +254,9 @@ impl HttpFlvSession {
         let timestamp = self.tag_timestamp_ms(frame);
         match frame.codec {
             CodecType::H264 | CodecType::H265 => frame_to_flv_video(frame, timestamp),
-            CodecType::AAC | CodecType::Opus | CodecType::G711 => frame_to_flv_audio(frame, timestamp),
+            CodecType::AAC | CodecType::Opus | CodecType::G711 => {
+                frame_to_flv_audio(frame, timestamp)
+            }
             _ => Vec::new(),
         }
     }
@@ -279,7 +283,9 @@ impl HttpFlvServer {
 
     /// Check if a stream exists
     pub fn has_stream(&self, stream_id: &str) -> bool {
-        self.stream_manager.get_stream(&stream_id.to_string()).is_some()
+        self.stream_manager
+            .get_stream(&stream_id.to_string())
+            .is_some()
     }
 
     /// Get the stream manager reference

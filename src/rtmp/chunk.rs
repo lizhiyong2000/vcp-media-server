@@ -1,6 +1,6 @@
 /// RTMP Chunk Stream protocol encoder/decoder
 /// Handles chunk basic header, message header, and chunk data assembly.
-use bytes::{BytesMut, BufMut, Buf};
+use bytes::{Buf, BufMut, BytesMut};
 use std::collections::HashMap;
 use tracing::{debug, error, info, trace, warn};
 
@@ -63,16 +63,25 @@ pub struct RtmpMessage {
 }
 
 /// Parse a chunk from the buffer. Returns (header, header_size) or None if not enough data.
-pub fn parse_chunk_header(buf: &[u8], chunk_message_headers: &mut HashMap<u32, ChunkHeader>) -> Option<(ChunkHeader, usize)> {
-
+pub fn parse_chunk_header(
+    buf: &[u8],
+    chunk_message_headers: &mut HashMap<u32, ChunkHeader>,
+) -> Option<(ChunkHeader, usize)> {
     if buf.is_empty() {
         return None;
     }
 
     if buf.len() > 0 {
         let preview_len = std::cmp::min(64, buf.len());
-        let preview: Vec<String> = buf[..preview_len].iter().map(|b| format!("{:02x}", *b)).collect();
-        debug!("[RTMP] before parse: buf={} bytes, preview: {}", buf.len(), preview.join(" "));
+        let preview: Vec<String> = buf[..preview_len]
+            .iter()
+            .map(|b| format!("{:02x}", *b))
+            .collect();
+        debug!(
+            "[RTMP] before parse: buf={} bytes, preview: {}",
+            buf.len(),
+            preview.join(" ")
+        );
     }
 
     let fmt_val = (buf[0] >> 6) & 0x03;
@@ -80,11 +89,15 @@ pub fn parse_chunk_header(buf: &[u8], chunk_message_headers: &mut HashMap<u32, C
 
     let (basic_header_size, chunk_stream_id) = match cs_id_raw {
         0 => {
-            if buf.len() < 2 { return None; }
+            if buf.len() < 2 {
+                return None;
+            }
             (2, 64 + buf[1] as u32)
         }
         1 => {
-            if buf.len() < 3 { return None; }
+            if buf.len() < 3 {
+                return None;
+            }
             (3, 64 + buf[1] as u32 + (buf[2] as u32) * 256)
         }
         _ => (1, cs_id_raw as u32),
@@ -97,8 +110,6 @@ pub fn parse_chunk_header(buf: &[u8], chunk_message_headers: &mut HashMap<u32, C
         3 => ChunkFmt::Type3,
         _ => return None,
     };
-
-
 
     let msg_header_size = match fmt {
         ChunkFmt::Type0 => 11,
@@ -157,7 +168,6 @@ pub fn parse_chunk_header(buf: &[u8], chunk_message_headers: &mut HashMap<u32, C
         has_extended_timestamp = true;
     }
 
-
     if fmt != ChunkFmt::Type0 {
         if let Some(last_header) = chunk_message_headers.get(&chunk_stream_id) {
             match fmt {
@@ -180,11 +190,13 @@ pub fn parse_chunk_header(buf: &[u8], chunk_message_headers: &mut HashMap<u32, C
                 _ => {}
             }
             //
-        }else{
-            error!("previous header for CSID {} not found in headers", chunk_stream_id);
+        } else {
+            error!(
+                "previous header for CSID {} not found in headers",
+                chunk_stream_id
+            );
             return None;
         }
-
     }
 
     let chunk_header = ChunkHeader {
@@ -217,8 +229,7 @@ pub fn parse_chunks(
         let mut remaining_msg = header.msg_length as usize;
 
         if let Some(assembler) = assemblers.get(&header.chunk_stream_id) {
-
-            if assembler.msg_length > 0{
+            if assembler.msg_length > 0 {
                 // info!("[RTMP] message parse CSID {} has assembler: {} received: {} header: {}", header.chunk_stream_id, assembler.msg_length, assembler.received, header.msg_length);
                 remaining_msg = (assembler.msg_length as usize).saturating_sub(assembler.received);
             }
@@ -235,7 +246,9 @@ pub fn parse_chunks(
 
         let data = &buf[header_size..header_size + data_size];
 
-        let assembler = assemblers.entry(header.chunk_stream_id).or_insert_with(ChunkAssembler::default);
+        let assembler = assemblers
+            .entry(header.chunk_stream_id)
+            .or_insert_with(ChunkAssembler::default);
         assembler.timestamp = header.timestamp;
         assembler.msg_length = header.msg_length;
         assembler.msg_type_id = header.msg_type_id;
@@ -321,7 +334,13 @@ pub fn encode_message(
         if first {
             // Type 0 chunk header
             encode_basic_header(&mut output, 0, chunk_stream_id);
-            encode_type0_header(&mut output, timestamp, payload.len() as u32, msg_type, msg_stream_id);
+            encode_type0_header(
+                &mut output,
+                timestamp,
+                payload.len() as u32,
+                msg_type,
+                msg_stream_id,
+            );
             first = false;
         } else {
             // Type 3 chunk header (continuation)
@@ -357,7 +376,13 @@ fn encode_basic_header(buf: &mut Vec<u8>, fmt: u8, cs_id: u32) {
 }
 
 /// Encode Type 0 message header
-fn encode_type0_header(buf: &mut Vec<u8>, timestamp: u32, msg_length: u32, msg_type: u8, msg_stream_id: u32) {
+fn encode_type0_header(
+    buf: &mut Vec<u8>,
+    timestamp: u32,
+    msg_length: u32,
+    msg_type: u8,
+    msg_stream_id: u32,
+) {
     if timestamp >= 0xFFFFFF {
         buf.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
     } else {

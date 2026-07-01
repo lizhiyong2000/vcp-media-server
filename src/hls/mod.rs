@@ -1,33 +1,32 @@
 /// HLS (HTTP Live Streaming) module
 /// Subscribes to streams and generates HLS segments (MPEG-TS) with M3U8 playlists.
 pub mod m3u8;
+pub mod timing;
 pub mod ts_muxer;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
-use parking_lot::RwLock;
-use tokio::fs;
-use tracing::{info, warn, error, debug};
 use anyhow::Result;
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+use tokio::fs;
+use tracing::{debug, error, info, warn};
 
-use crate::core::{StreamManager, MediaFrame, CodecType, DispatchPolicy};
-use crate::core::dispatch::DispatchError;
-use crate::webrtc::{annex_b_with_config, request_publisher_keyframe, h264_util::is_keyframe_annex_b};
 use self::m3u8::M3u8Generator;
 use self::ts_muxer::TsMuxer;
+use crate::core::dispatch::DispatchError;
+use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager};
+use crate::webrtc::{
+    annex_b_with_config, h264_util::is_keyframe_annex_b, request_publisher_keyframe,
+};
 
-/// First live segment: commit on keyframe after this many seconds (wall clock).
-const FIRST_SEGMENT_WALL_SECS: f64 = 0.35;
-/// Minimum completed segment media duration for EXTINF.
-const MIN_SEGMENT_DURATION: f64 = 0.25;
-/// Split when mux or publisher span reaches this fraction of target (25fps GOP ≈ 960ms).
-const SPLIT_THRESHOLD_RATIO: f64 = 0.85;
+use self::timing::{
+    closed_segment_secs as timing_closed_segment_secs, live_pdt, should_split_segment,
+    split_threshold_secs, SplitEval,
+};
 /// PAT/PMT only; segments smaller than this are not committed.
 const MIN_SEGMENT_BYTES: usize = 512;
-/// Fallback video step when publisher timestamps stall or jump backward (25 fps).
-const MIN_VIDEO_MUX_STEP_MS: u64 = 40;
 
 fn is_hls_video_keyframe(frame: &MediaFrame) -> bool {
     matches!(frame.codec, CodecType::H264 | CodecType::H265)
@@ -156,18 +155,16 @@ impl HlsSession {
     }
 
     fn segment_mux_secs(&self) -> f64 {
-        self.segment_last_mux_ms
-            .saturating_sub(self.segment_open_mux_ms_at_split.max(self.segment_open_mux_ms))
-            as f64
+        self.segment_last_mux_ms.saturating_sub(
+            self.segment_open_mux_ms_at_split
+                .max(self.segment_open_mux_ms),
+        ) as f64
             / 1000.0
     }
 
     /// Closed segment EXTINF from mux PTS span (must match TS payload).
     fn closed_segment_secs(&self) -> f64 {
-        let span_ms = self
-            .segment_last_mux_ms
-            .saturating_sub(self.segment_open_mux_ms_at_split);
-        (span_ms as f64 / 1000.0).max(MIN_SEGMENT_DURATION)
+        timing_closed_segment_secs(self.segment_last_mux_ms, self.segment_open_mux_ms_at_split)
     }
 
     /// New TS file; session PTS/CC continue (ffmpeg treats segments as one timeline).
@@ -179,13 +176,6 @@ impl HlsSession {
         self.segment_last_idr_mux_ms = 0;
         self.segment_wall_start = None;
         self.muxer.reset_for_new_segment();
-    }
-
-    /// PDT = live edge (wall now − duration); pairs with accurate EXTINF + session PTS.
-    fn live_pdt(duration: f64) -> SystemTime {
-        SystemTime::now()
-            .checked_sub(Duration::from_secs_f64(duration.max(0.0)))
-            .unwrap_or_else(SystemTime::now)
     }
 
     fn ensure_wall_timeline(&mut self) {
@@ -211,33 +201,13 @@ impl HlsSession {
                 pts.min(self.session_video_mux_ms.saturating_add(100))
             }
             CodecType::H264 | CodecType::H265 => {
-                let step = if self.session_last_raw_video > 0
-                    && frame.timestamp > self.session_last_raw_video
-                {
-                    let delta = crate::core::media_timestamp_delta_ms(
-                        self.session_last_raw_video,
-                        frame.timestamp,
-                    );
-                    if delta > 0 && delta < 500 {
-                        delta
-                    } else {
-                        MIN_VIDEO_MUX_STEP_MS
-                    }
-                } else if self.session_video_mux_ms == 0 {
-                    0
-                } else {
-                    MIN_VIDEO_MUX_STEP_MS
-                };
-                self.session_last_raw_video = frame.timestamp;
-                self.session_video_mux_ms = if self.session_video_mux_ms == 0 && step == 0 {
-                    0
-                } else {
-                    self.session_video_mux_ms.saturating_add(if step == 0 {
-                        MIN_VIDEO_MUX_STEP_MS
-                    } else {
-                        step
-                    })
-                };
+                let (last_raw, mux_ms) = timing::advance_video_mux_ms(
+                    self.session_last_raw_video,
+                    self.session_video_mux_ms,
+                    frame.timestamp,
+                );
+                self.session_last_raw_video = last_raw;
+                self.session_video_mux_ms = mux_ms;
                 self.session_video_mux_ms
             }
             _ => 0,
@@ -280,7 +250,11 @@ impl HlsSession {
                 return Ok(None);
             }
             self.primed = true;
-            info!("[HLS] [{}] Primed on video keyframe ({} bytes)", self.stream_id, frame.data.len());
+            info!(
+                "[HLS] [{}] Primed on video keyframe ({} bytes)",
+                self.stream_id,
+                frame.data.len()
+            );
         }
 
         // Initialize segment with PAT/PMT
@@ -288,8 +262,7 @@ impl HlsSession {
             self.segment_wall_start = Some(Instant::now());
             self.segment_open_mux_ms = self.session_video_mux_ms;
             self.segment_open_mux_ms_at_split = self.session_video_mux_ms;
-            let has_audio =
-                self.session_audio_frames > 0 || frame.codec == CodecType::AAC;
+            let has_audio = self.session_audio_frames > 0 || frame.codec == CodecType::AAC;
             let pat_pmt = self.muxer.generate_pat_pmt(true, has_audio);
             self.segment_buffer.extend(pat_pmt);
         }
@@ -297,8 +270,10 @@ impl HlsSession {
         // Track segment duration from video timestamps only (audio/video RTMP clocks differ)
         if matches!(frame.codec, CodecType::H264 | CodecType::H265) {
             if self.last_video_timestamp > 0 && frame.timestamp > self.last_video_timestamp {
-                let delta_ms =
-                    crate::core::media_timestamp_delta_ms(self.last_video_timestamp, frame.timestamp);
+                let delta_ms = crate::core::media_timestamp_delta_ms(
+                    self.last_video_timestamp,
+                    frame.timestamp,
+                );
                 if delta_ms > 0 && delta_ms < 2000 {
                     self.segment_duration_acc += delta_ms as f64 / 1000.0;
                 }
@@ -308,12 +283,10 @@ impl HlsSession {
 
         let mux_secs = self.segment_mux_secs();
 
-        // First segment commits quickly; later segments use configured target duration.
-        let split_threshold = if self.playlist.segment_count() == 0 {
-            FIRST_SEGMENT_WALL_SECS
-        } else {
-            self.playlist.target_duration()
-        };
+        let split_threshold = split_threshold_secs(
+            self.playlist.target_duration(),
+            self.playlist.segment_count(),
+        );
 
         // Ask publisher for IDR before we hit the segment cap (RTSP push may ignore).
         if matches!(frame.codec, CodecType::H264 | CodecType::H265)
@@ -325,22 +298,16 @@ impl HlsSession {
             request_publisher_keyframe(&self.stream_id);
         }
 
-        let ready_by_time = mux_secs >= split_threshold * SPLIT_THRESHOLD_RATIO
-            || self.segment_duration_acc >= split_threshold * SPLIT_THRESHOLD_RATIO;
-        let force_on_long_gop = is_hls_video_keyframe(frame)
-            && (mux_secs >= split_threshold * 1.5
-                || self.segment_duration_acc >= split_threshold * 1.5)
-            && self.segment_buffer.len() > MIN_SEGMENT_BYTES;
-
-        let has_muxed_media =
-            self.segment_last_mux_ms > self.segment_open_mux_ms_at_split;
-
-        let should_split = is_hls_video_keyframe(frame)
-            && has_muxed_media
-            && (ready_by_time
-                || force_on_long_gop
-                || (self.playlist.segment_count() == 0
-                    && mux_secs >= FIRST_SEGMENT_WALL_SECS));
+        let should_split = should_split_segment(&SplitEval {
+            is_keyframe: is_hls_video_keyframe(frame),
+            mux_secs,
+            publisher_secs: self.segment_duration_acc,
+            split_threshold,
+            committed_segments: self.playlist.segment_count(),
+            has_muxed_media: self.segment_last_mux_ms > self.segment_open_mux_ms_at_split,
+            buffer_len: self.segment_buffer.len(),
+            min_segment_bytes: MIN_SEGMENT_BYTES,
+        });
 
         let mut completed: Option<CompletedSegment> = None;
 
@@ -350,18 +317,24 @@ impl HlsSession {
             let duration = self.closed_segment_secs();
             let discontinuity = self.pending_discontinuity;
             self.pending_discontinuity = false;
-            let pdt = Self::live_pdt(duration);
+            let pdt = live_pdt(duration, SystemTime::now());
             let data = std::mem::take(&mut self.segment_buffer);
 
             if duration > self.playlist.target_duration() * 2.0 {
                 warn!(
                     "[HLS] [{}] segment seq={} duration {:.2}s (target {:.1}s) — check encoder GOP",
-                    self.stream_id, seq, duration, self.playlist.target_duration()
+                    self.stream_id,
+                    seq,
+                    duration,
+                    self.playlist.target_duration()
                 );
             } else {
                 info!(
                     "[HLS] [{}] segment seq={} duration {:.2}s ({} bytes)",
-                    self.stream_id, seq, duration, data.len()
+                    self.stream_id,
+                    seq,
+                    duration,
+                    data.len()
                 );
             }
 
@@ -413,6 +386,14 @@ impl HlsSession {
     /// Get the output directory
     pub fn output_dir(&self) -> &Path {
         &self.output_dir
+    }
+}
+
+#[cfg(test)]
+impl HlsSession {
+    fn record_completed_segment(&mut self, seg: &CompletedSegment) {
+        self.playlist
+            .add_segment(seg.duration, seg.seq, seg.pdt, seg.discontinuity);
     }
 }
 
@@ -475,7 +456,11 @@ impl HlsServer {
 
     /// Ensure HLS generation is running; `reset` clears prior session and files.
     pub async fn ensure_stream(&self, stream_id: &str, reset: bool) -> Result<bool> {
-        if self.stream_manager.get_stream(&stream_id.to_string()).is_none() {
+        if self
+            .stream_manager
+            .get_stream(&stream_id.to_string())
+            .is_none()
+        {
             return Ok(false);
         }
         if reset && self.has_stream(stream_id) {
@@ -539,7 +524,10 @@ impl HlsServer {
         let task_aborts = self.task_aborts.clone();
 
         let handle = tokio::spawn(async move {
-            info!("[HLS] [{}] HLS frame processing loop started", stream_id_owned);
+            info!(
+                "[HLS] [{}] HLS frame processing loop started",
+                stream_id_owned
+            );
             let mut frame_count: u64 = 0;
 
             reader.finish_prime();
@@ -559,117 +547,134 @@ impl HlsServer {
                 }
 
                 for mut frame in frames {
-                        if matches!(frame.codec, CodecType::Opus | CodecType::G711) {
-                            continue;
-                        }
-                        if frame.codec == CodecType::H264 && is_hls_video_keyframe(&frame) {
-                            if let Some(stream) = stream_manager.get_stream(&stream_id_owned) {
-                                if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
-                                    let data = annex_b_with_config(sps, pps, &frame.data);
-                                    frame = MediaFrame::new(
-                                        frame.stream_id,
-                                        frame.track_id,
-                                        frame.timestamp,
-                                        bytes::Bytes::from(data),
-                                        frame.is_keyframe,
-                                        frame.codec,
-                                    );
-                                }
+                    if matches!(frame.codec, CodecType::Opus | CodecType::G711) {
+                        continue;
+                    }
+                    if frame.codec == CodecType::H264 && is_hls_video_keyframe(&frame) {
+                        if let Some(stream) = stream_manager.get_stream(&stream_id_owned) {
+                            if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
+                                let data = annex_b_with_config(sps, pps, &frame.data);
+                                frame = MediaFrame::new(
+                                    frame.stream_id,
+                                    frame.track_id,
+                                    frame.timestamp,
+                                    bytes::Bytes::from(data),
+                                    frame.is_keyframe,
+                                    frame.codec,
+                                );
                             }
                         }
+                    }
 
-                        frame_count += 1;
-                        
-                        // Process frame synchronously (no await while holding lock)
-                        let segment_to_write = {
-                            let session_guard = {
-                                let sessions = sessions_clone.read();
-                                sessions.get(&stream_id_owned).cloned()
-                            };
+                    frame_count += 1;
 
-                            if let Some(session) = session_guard {
-                                let mut sess = session.write();
-                                match sess.on_frame(&frame) {
-                                    Ok(Some(seg)) => Some((
-                                        seg.data,
-                                        seg.filename,
-                                        seg.duration,
-                                        seg.seq,
-                                        seg.pdt,
-                                        seg.discontinuity,
-                                        sess.output_dir.clone(),
-                                    )),
-                                    Ok(None) => None,
-                                    Err(e) => {
-                                        error!("[HLS] [{}] Frame error: {}", stream_id_owned, e);
-                                        None
-                                    }
-                                }
-                            } else {
-                                info!("[HLS] [{}] Session removed, stopping", stream_id_owned);
-                                break;
-                            }
+                    // Process frame synchronously (no await while holding lock)
+                    let segment_to_write = {
+                        let session_guard = {
+                            let sessions = sessions_clone.read();
+                            sessions.get(&stream_id_owned).cloned()
                         };
 
-                        // Write segment to disk outside of lock
-                        if let Some((data, filename, duration, seq, pdt, discontinuity, output_dir)) =
-                            segment_to_write
-                        {
-                            let filepath = output_dir.join(&filename);
-                            let tmp_path = output_dir.join(format!("{}.part", filename));
-                            let write_ok = if let Err(e) = fs::write(&tmp_path, &data).await {
-                                error!("[HLS] [{}] Failed to write segment: {}", stream_id_owned, e);
-                                false
-                            } else if let Err(e) = fs::rename(&tmp_path, &filepath).await {
-                                error!("[HLS] [{}] Failed to finalize segment: {}", stream_id_owned, e);
-                                let _ = fs::remove_file(&tmp_path).await;
-                                false
-                            } else {
-                                debug!("[HLS] [{}] Wrote segment: {} ({:.2}s, {} bytes)",
-                                      stream_id_owned, filename, duration, data.len());
-                                true
-                            };
-
-                            if write_ok {
-                                info!(
-                                    "[HLS] [{}] Committed segment {} ({:.2}s, {} bytes)",
-                                    stream_id_owned, filename, duration, data.len()
-                                );
-                                let playlist_update = {
-                                    let sessions = sessions_clone.read();
-                                    sessions.get(&stream_id_owned).map(|s| {
-                                        let mut sess = s.write();
-                                        sess.playlist
-                                            .add_segment(duration, seq, pdt, discontinuity);
-                                        let prune = seq.saturating_sub(
-                                            sess.playlist.max_segments() as u64 + 2,
-                                        );
-                                        (sess.get_playlist(), prune)
-                                    })
-                                };
-                                if let Some((content, prune_before)) = playlist_update {
-                                    let m3u8_path = output_dir.join("live.m3u8");
-                                    let tmp = output_dir.join("live.m3u8.part");
-                                    if fs::write(&tmp, &content).await.is_ok() {
-                                        let _ = fs::rename(&tmp, &m3u8_path).await;
-                                    }
-                                    prune_old_segments(&output_dir, prune_before).await;
+                        if let Some(session) = session_guard {
+                            let mut sess = session.write();
+                            match sess.on_frame(&frame) {
+                                Ok(Some(seg)) => Some((
+                                    seg.data,
+                                    seg.filename,
+                                    seg.duration,
+                                    seg.seq,
+                                    seg.pdt,
+                                    seg.discontinuity,
+                                    sess.output_dir.clone(),
+                                )),
+                                Ok(None) => None,
+                                Err(e) => {
+                                    error!("[HLS] [{}] Frame error: {}", stream_id_owned, e);
+                                    None
                                 }
                             }
+                        } else {
+                            info!("[HLS] [{}] Session removed, stopping", stream_id_owned);
+                            break;
                         }
+                    };
 
-                        if frame_count % 100 == 0 {
-                            debug!("[HLS] [{}] Processed {} frames", stream_id_owned, frame_count);
+                    // Write segment to disk outside of lock
+                    if let Some((data, filename, duration, seq, pdt, discontinuity, output_dir)) =
+                        segment_to_write
+                    {
+                        let filepath = output_dir.join(&filename);
+                        let tmp_path = output_dir.join(format!("{}.part", filename));
+                        let write_ok = if let Err(e) = fs::write(&tmp_path, &data).await {
+                            error!("[HLS] [{}] Failed to write segment: {}", stream_id_owned, e);
+                            false
+                        } else if let Err(e) = fs::rename(&tmp_path, &filepath).await {
+                            error!(
+                                "[HLS] [{}] Failed to finalize segment: {}",
+                                stream_id_owned, e
+                            );
+                            let _ = fs::remove_file(&tmp_path).await;
+                            false
+                        } else {
+                            debug!(
+                                "[HLS] [{}] Wrote segment: {} ({:.2}s, {} bytes)",
+                                stream_id_owned,
+                                filename,
+                                duration,
+                                data.len()
+                            );
+                            true
+                        };
+
+                        if write_ok {
+                            info!(
+                                "[HLS] [{}] Committed segment {} ({:.2}s, {} bytes)",
+                                stream_id_owned,
+                                filename,
+                                duration,
+                                data.len()
+                            );
+                            let playlist_update = {
+                                let sessions = sessions_clone.read();
+                                sessions.get(&stream_id_owned).map(|s| {
+                                    let mut sess = s.write();
+                                    sess.playlist.add_segment(duration, seq, pdt, discontinuity);
+                                    let prune =
+                                        seq.saturating_sub(sess.playlist.max_segments() as u64 + 2);
+                                    (sess.get_playlist(), prune)
+                                })
+                            };
+                            if let Some((content, prune_before)) = playlist_update {
+                                let m3u8_path = output_dir.join("live.m3u8");
+                                let tmp = output_dir.join("live.m3u8.part");
+                                if fs::write(&tmp, &content).await.is_ok() {
+                                    let _ = fs::rename(&tmp, &m3u8_path).await;
+                                }
+                                prune_old_segments(&output_dir, prune_before).await;
+                            }
                         }
+                    }
+
+                    if frame_count % 100 == 0 {
+                        debug!(
+                            "[HLS] [{}] Processed {} frames",
+                            stream_id_owned, frame_count
+                        );
+                    }
                 }
             }
 
-            info!("[HLS] [{}] HLS frame processing loop stopped after {} frames",
-                  stream_id_owned, frame_count);
+            info!(
+                "[HLS] [{}] HLS frame processing loop stopped after {} frames",
+                stream_id_owned, frame_count
+            );
 
             let mut sessions = sessions_clone.write();
             if sessions.remove(&stream_id_owned).is_some() {
-                info!("[HLS] [{}] Session removed after loop exit", stream_id_owned);
+                info!(
+                    "[HLS] [{}] Session removed after loop exit",
+                    stream_id_owned
+                );
             }
             task_aborts.write().remove(&stream_id_owned);
         });
@@ -704,7 +709,9 @@ impl HlsServer {
                 return Some(path);
             }
         }
-        let path = PathBuf::from(&self.config.output_dir).join(stream_id).join(filename);
+        let path = PathBuf::from(&self.config.output_dir)
+            .join(stream_id)
+            .join(filename);
         if path.exists() {
             Some(path)
         } else {
@@ -769,5 +776,158 @@ async fn prune_old_segments(output_dir: &Path, prune_before_seq: u64) {
         if seq < prune_before_seq {
             let _ = fs::remove_file(entry.path()).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod playback_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    const RTP_BASE: u64 = 2_648_000_000;
+    const FRAME_TICKS: u64 = 3600;
+
+    fn annex_b_idr() -> Bytes {
+        Bytes::from(vec![0, 0, 0, 1, 0x65, 0x88, 0x84, 0])
+    }
+
+    fn annex_b_p() -> Bytes {
+        Bytes::from(vec![0, 0, 0, 1, 0x41, 0x9a, 0])
+    }
+
+    fn h264_frame(ts: u64, key: bool) -> MediaFrame {
+        MediaFrame::new(
+            "test".into(),
+            0,
+            ts,
+            if key { annex_b_idr() } else { annex_b_p() },
+            key,
+            CodecType::H264,
+        )
+    }
+
+    fn temp_hls_config(suffix: &str) -> HlsConfig {
+        let dir =
+            std::env::temp_dir().join(format!("vcp_hls_test_{}_{suffix}", std::process::id()));
+        HlsConfig {
+            enabled: true,
+            segment_duration: 1.0,
+            max_segments: 6,
+            output_dir: dir.to_string_lossy().into(),
+        }
+    }
+
+    fn push_one_second_gop(session: &mut HlsSession, gop_index: u64) -> Vec<CompletedSegment> {
+        let mut completed = Vec::new();
+        for f in 0..25u64 {
+            let ts = RTP_BASE + (gop_index * 25 + f) * FRAME_TICKS;
+            let frame = h264_frame(ts, f == 0);
+            if let Ok(Some(seg)) = session.on_frame(&frame) {
+                completed.push(seg);
+            }
+        }
+        completed
+    }
+
+    fn push_until_segment(session: &mut HlsSession) -> CompletedSegment {
+        push_one_second_gop(session, 0);
+        let completed = push_one_second_gop(session, 1);
+        completed
+            .into_iter()
+            .last()
+            .expect("two 1s GOPs should close one segment")
+    }
+
+    #[test]
+    fn one_second_gop_splits_near_target_not_three_seconds() {
+        let config = temp_hls_config("split");
+        let mut session = HlsSession::new("t", &config).unwrap();
+        let mut durations = Vec::new();
+
+        for gop in 0..4 {
+            for seg in push_one_second_gop(&mut session, gop) {
+                durations.push(seg.duration);
+            }
+        }
+
+        assert!(
+            durations.len() >= 3,
+            "expected multiple completed segments, got {:?}",
+            durations
+        );
+        for &d in &durations {
+            assert!(
+                d <= 1.5,
+                "segment {:.3}s should track ~1s GOP, not accumulate to 3s",
+                d
+            );
+            assert!(
+                (d - 3.0).abs() > 0.1,
+                "segment {:.3}s matches stale 3s EXTINF bug",
+                d
+            );
+        }
+    }
+
+    #[test]
+    fn committed_segment_pdt_aligns_with_extinf() {
+        let config = temp_hls_config("pdt");
+        let mut session = HlsSession::new("t", &config).unwrap();
+        let seg = push_until_segment(&mut session);
+
+        let edge = timing::pdt_to_live_edge_secs(seg.pdt, SystemTime::now());
+        assert!(
+            (edge - seg.duration).abs() < 0.25,
+            "PDT should be ~EXTINF behind wall now (edge={edge:.3}, extinf={:.3})",
+            seg.duration
+        );
+    }
+
+    #[test]
+    fn playlist_extinf_matches_committed_segment_duration() {
+        let config = temp_hls_config("playlist");
+        let mut session = HlsSession::new("t", &config).unwrap();
+        let seg = push_until_segment(&mut session);
+        session.record_completed_segment(&seg);
+
+        let playlist = session.get_playlist();
+        assert!(
+            playlist.contains(&format!("#EXTINF:{:.3},", seg.duration)),
+            "playlist missing EXTINF for {:.3}s segment:\n{playlist}",
+            seg.duration
+        );
+        assert!(
+            playlist.contains("#EXT-X-TARGETDURATION:1"),
+            "target duration should stay at 1s, not inflate to 3:\n{playlist}"
+        );
+    }
+
+    #[test]
+    fn mux_pts_continuous_across_segment_splits() {
+        let config = temp_hls_config("pts");
+        let mut session = HlsSession::new("t", &config).unwrap();
+
+        let mut last_closed_mux_ms = 0u64;
+        for gop in 0..3 {
+            let completed = push_one_second_gop(&mut session, gop);
+            if let Some(seg) = completed.last() {
+                let closed_mux_ms = (seg.duration * 1000.0).round() as u64;
+                assert!(
+                    closed_mux_ms >= last_closed_mux_ms,
+                    "closed segment mux ms should not rewind"
+                );
+                last_closed_mux_ms = closed_mux_ms;
+            }
+        }
+
+        let ts = RTP_BASE + 3 * 25 * FRAME_TICKS;
+        let frame = h264_frame(ts, true);
+        let _ = session.on_frame(&frame).unwrap();
+        assert!(
+            session.session_video_mux_ms >= last_closed_mux_ms,
+            "open segment PTS must continue after split (mux={} closed={})",
+            session.session_video_mux_ms,
+            last_closed_mux_ms
+        );
     }
 }

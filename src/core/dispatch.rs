@@ -194,9 +194,10 @@ impl DispatchReader {
         }
 
         let batch_end = match self.policy {
-            DispatchPolicy::SequentialFromIdr | DispatchPolicy::LiveSequential => {
-                latest.min(self.cursor.saturating_add(MAX_SEQUENTIAL_BATCH.saturating_sub(1)))
-            }
+            DispatchPolicy::SequentialFromIdr | DispatchPolicy::LiveSequential => latest.min(
+                self.cursor
+                    .saturating_add(MAX_SEQUENTIAL_BATCH.saturating_sub(1)),
+            ),
             DispatchPolicy::LiveCoalesce | DispatchPolicy::WebRtcPlay => self.cursor,
         };
 
@@ -208,10 +209,7 @@ impl DispatchReader {
                         "[Dispatch] [{}] ring gap at seq {} (oldest {}) — jump to IDR",
                         self.stream_id, self.cursor, oldest
                     );
-                    self.cursor = self
-                        .hub
-                        .snap(SnapMode::LatestIdr)
-                        .max(oldest);
+                    self.cursor = self.hub.snap(SnapMode::LatestIdr).max(oldest);
                     let latest = self.hub.latest_seq();
                     if self.cursor <= latest {
                         let end = latest.min(
@@ -246,7 +244,10 @@ impl DispatchReader {
                 self.ensure_data().await?;
                 continue;
             }
-            if matches!(self.policy, DispatchPolicy::LiveCoalesce | DispatchPolicy::WebRtcPlay) {
+            if matches!(
+                self.policy,
+                DispatchPolicy::LiveCoalesce | DispatchPolicy::WebRtcPlay
+            ) {
                 if let Some(v) = batch.iter().rev().find(|f| is_playable_video(f)) {
                     return Ok(v.clone());
                 }
@@ -267,7 +268,7 @@ impl DispatchReader {
     }
 
     async fn ensure_data(&mut self) -> Result<(), DispatchError> {
-        if self.cursor <= self.hub.latest_seq() {
+        if !self.hub.is_empty() && self.cursor <= self.hub.latest_seq() {
             return Ok(());
         }
         if self.wake.changed().await.is_err() {
@@ -317,13 +318,131 @@ mod tests {
     #[test]
     fn coalesce_keeps_latest_video() {
         let frames = vec![
-            MediaFrame::new("s".into(), 0, 1, Bytes::from_static(b"v1"), false, CodecType::H264),
-            MediaFrame::new("s".into(), 1, 2, Bytes::from_static(b"a1"), false, CodecType::AAC),
-            MediaFrame::new("s".into(), 0, 3, Bytes::from_static(b"v2"), false, CodecType::H264),
+            MediaFrame::new(
+                "s".into(),
+                0,
+                1,
+                Bytes::from_static(b"v1"),
+                false,
+                CodecType::H264,
+            ),
+            MediaFrame::new(
+                "s".into(),
+                1,
+                2,
+                Bytes::from_static(b"a1"),
+                false,
+                CodecType::AAC,
+            ),
+            MediaFrame::new(
+                "s".into(),
+                0,
+                3,
+                Bytes::from_static(b"v2"),
+                false,
+                CodecType::H264,
+            ),
         ];
         let out = coalesce_flv_batch(frames);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].codec, CodecType::AAC);
         assert_eq!(&out[1].data[..], b"v2");
+    }
+
+    fn annex_b_idr() -> Bytes {
+        Bytes::from(vec![0, 0, 0, 1, 0x65, 0x88, 0x84, 0])
+    }
+
+    fn annex_b_p() -> Bytes {
+        Bytes::from(vec![0, 0, 0, 1, 0x41, 0x9a, 0])
+    }
+
+    fn publish_gop(hub: &StreamHub, gop: u64, base: u64) {
+        let ticks = 3600u64;
+        for f in 0..25u64 {
+            let ts = base + (gop * 25 + f) * ticks;
+            let key = f == 0;
+            hub.publish(MediaFrame::new(
+                hub.stream_id.clone(),
+                0,
+                ts,
+                if key { annex_b_idr() } else { annex_b_p() },
+                key,
+                CodecType::H264,
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_from_idr_delivers_all_frames_under_lag_threshold() {
+        let hub = StreamHub::new("s");
+        let base = 2_648_000_000u64;
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::SequentialFromIdr);
+        reader.cursor = 0;
+
+        for gop in 0..2 {
+            publish_gop(&hub, gop, base);
+        }
+
+        let mut delivered = 0usize;
+        while delivered < 50 {
+            let batch = reader.recv_batch().await.unwrap();
+            assert!(
+                !reader.take_muxer_resync(),
+                "must not snap on lag < {} frames",
+                MAX_LAG_HLS
+            );
+            if batch.is_empty() {
+                break;
+            }
+            delivered += batch.len();
+        }
+
+        assert_eq!(
+            delivered, 50,
+            "SequentialFromIdr should deliver every frame when lag is below snap threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_from_idr_waits_when_ring_is_empty() {
+        let hub = StreamHub::new("s");
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::SequentialFromIdr);
+
+        let timed_out = tokio::time::timeout(Duration::from_millis(20), reader.recv_batch()).await;
+        assert!(
+            timed_out.is_err(),
+            "empty ring should wait for a frame instead of returning an empty batch"
+        );
+
+        publish_gop(&hub, 0, 2_648_000_000);
+        let batch = tokio::time::timeout(Duration::from_millis(100), reader.recv_batch())
+            .await
+            .expect("reader should wake after first publish")
+            .expect("reader should stay open");
+        assert!(!batch.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sequential_from_idr_snaps_only_when_lag_exceeds_threshold() {
+        let hub = StreamHub::new("s");
+        let base = 2_648_000_000u64;
+        for gop in 0..4 {
+            publish_gop(&hub, gop, base);
+        }
+
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::SequentialFromIdr);
+        reader.cursor = 0;
+
+        let batch = reader.recv_batch().await.unwrap();
+        assert!(
+            batch.len() < 100,
+            "lag snap should drop frames when lag > {MAX_LAG_HLS}, delivered all {}",
+            batch.len()
+        );
+        assert!(
+            reader.take_muxer_resync(),
+            "large lag should flag muxer resync for discontinuity"
+        );
     }
 }

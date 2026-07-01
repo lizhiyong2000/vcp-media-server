@@ -3,10 +3,10 @@ use bytes::BytesMut;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
-use crate::core::{Track, CodecType};
 use super::messages::RtspRequest;
+use crate::core::{CodecType, Track};
 
 /// Format RTSP message for human-readable logging (CRLF → LF, trim trailing blank line).
 pub fn format_rtsp_message(message: &str) -> String {
@@ -214,7 +214,14 @@ impl RtspCommon {
         Some((channel, &data[4..4 + length]))
     }
 
-    pub fn build_rtp_packet(payload_type: u8, seq: u16, ts: u32, ssrc: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
+    pub fn build_rtp_packet(
+        payload_type: u8,
+        seq: u16,
+        ts: u32,
+        ssrc: u32,
+        marker: bool,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut buf = Vec::with_capacity(12 + payload.len());
         buf.push((2 << 6) | 0);
         buf.push(((marker as u8) << 7) | payload_type);
@@ -314,7 +321,10 @@ impl RtspCommon {
         let lines: Vec<&str> = sdp.lines().collect();
         let mut i = 0;
 
-        debug!("[RTSP Common] parse_sdp_with_sps_pps called, {} lines total", lines.len());
+        debug!(
+            "[RTSP Common] parse_sdp_with_sps_pps called, {} lines total",
+            lines.len()
+        );
 
         while i < lines.len() {
             let line = lines[i];
@@ -335,10 +345,18 @@ impl RtspCommon {
                         debug!("[RTSP Common] params after trim: '{}'", params);
                         // SPS and PPS are comma-separated
                         let param_parts: Vec<&str> = params.split(',').collect();
-                        debug!("[RTSP Common] Found sprop-parameter-sets: {} parts", param_parts.len());
-                        
+                        debug!(
+                            "[RTSP Common] Found sprop-parameter-sets: {} parts",
+                            param_parts.len()
+                        );
+
                         for (idx, param) in param_parts.iter().enumerate() {
-                            debug!("[RTSP Common] param[{}] = '{}', is_empty={}", idx, param, param.is_empty());
+                            debug!(
+                                "[RTSP Common] param[{}] = '{}', is_empty={}",
+                                idx,
+                                param,
+                                param.is_empty()
+                            );
                             if !param.is_empty() {
                                 use base64::Engine;
                                 match base64::engine::general_purpose::STANDARD.decode(param) {
@@ -348,18 +366,30 @@ impl RtspCommon {
                                             debug!("[RTSP Common] Decoded parameter set {}: length={} bytes, nal_type={}", 
                                                    idx, decoded.len(), nal_type);
                                             if nal_type == 7 && sps.is_none() {
-                                                info!("[RTSP Common] Found SPS in SDP: {} bytes", decoded.len());
-                                                debug!("[RTSP Common] SPS first 16 bytes: {:02X?}", &decoded[..std::cmp::min(16, decoded.len())]);
+                                                info!(
+                                                    "[RTSP Common] Found SPS in SDP: {} bytes",
+                                                    decoded.len()
+                                                );
+                                                debug!(
+                                                    "[RTSP Common] SPS first 16 bytes: {:02X?}",
+                                                    &decoded[..std::cmp::min(16, decoded.len())]
+                                                );
                                                 sps = Some(decoded);
                                             } else if nal_type == 8 && pps.is_none() {
-                                                info!("[RTSP Common] Found PPS in SDP: {} bytes", decoded.len());
-                                                debug!("[RTSP Common] PPS first 16 bytes: {:02X?}", &decoded[..std::cmp::min(16, decoded.len())]);
+                                                info!(
+                                                    "[RTSP Common] Found PPS in SDP: {} bytes",
+                                                    decoded.len()
+                                                );
+                                                debug!(
+                                                    "[RTSP Common] PPS first 16 bytes: {:02X?}",
+                                                    &decoded[..std::cmp::min(16, decoded.len())]
+                                                );
                                                 pps = Some(decoded);
                                             }
                                         } else {
                                             warn!("[RTSP Common] Decoded parameter set too short: {} bytes", decoded.len());
                                         }
-                                    },
+                                    }
                                     Err(e) => {
                                         warn!("[RTSP Common] Failed to decode base64 parameter: {}, error: {}", param, e);
                                     }
@@ -403,20 +433,26 @@ impl RtspCommon {
                             i += 1;
                         } else if next_line.starts_with("a=fmtp:") && sps.is_none() {
                             // Extract SPS/PPS from fmtp line for H264
-                            debug!("[RTSP Common] Found fmtp line inside m= loop: {}", next_line);
+                            debug!(
+                                "[RTSP Common] Found fmtp line inside m= loop: {}",
+                                next_line
+                            );
                             let fmtp_parts: Vec<&str> = next_line.split_whitespace().collect();
                             for part in fmtp_parts {
                                 if part.starts_with("sprop-parameter-sets=") {
-                                    let params = part.strip_prefix("sprop-parameter-sets=").unwrap_or("");
+                                    let params =
+                                        part.strip_prefix("sprop-parameter-sets=").unwrap_or("");
                                     let params = params.trim_end_matches(';');
                                     let param_parts: Vec<&str> = params.split(',').collect();
                                     debug!("[RTSP Common] Found sprop-parameter-sets inside m= loop: {} parts", param_parts.len());
-                                    
+
                                     for (idx, param) in param_parts.iter().enumerate() {
                                         debug!("[RTSP Common] param[{}] = '{}'", idx, param);
                                         if !param.is_empty() {
                                             use base64::Engine;
-                                            match base64::engine::general_purpose::STANDARD.decode(param) {
+                                            match base64::engine::general_purpose::STANDARD
+                                                .decode(param)
+                                            {
                                                 Ok(decoded) => {
                                                     if decoded.len() >= 2 {
                                                         let nal_type = decoded[0] & 0x1F;
@@ -430,7 +466,7 @@ impl RtspCommon {
                                                             pps = Some(decoded);
                                                         }
                                                     }
-                                                },
+                                                }
                                                 Err(e) => {
                                                     warn!("[RTSP Common] Failed to decode base64 parameter: {}, error: {}", param, e);
                                                 }
@@ -480,10 +516,16 @@ impl RtspCommon {
                 _ => ("video", "H264"),
             };
 
-            sdp.push_str(&format!("m={} 0 RTP/AVP {}\r\n", media_type, track.payload_type));
+            sdp.push_str(&format!(
+                "m={} 0 RTP/AVP {}\r\n",
+                media_type, track.payload_type
+            ));
             sdp.push_str("c=IN IP4 0.0.0.0\r\n");
             sdp.push_str("t=0 0\r\n");
-            sdp.push_str(&format!("a=rtpmap:{} {}/{}\r\n", track.payload_type, codec_name, track.clock_rate));
+            sdp.push_str(&format!(
+                "a=rtpmap:{} {}/{}\r\n",
+                track.payload_type, codec_name, track.clock_rate
+            ));
             sdp.push_str(&format!("a=control:trackID={}\r\n", idx));
 
             if track.codec == CodecType::H264 {
@@ -510,14 +552,20 @@ impl RtspCommon {
         None
     }
 
-    pub async fn write_request(writer: &mut tokio::net::tcp::OwnedWriteHalf, request: &RtspRequest) -> Result<()> {
+    pub async fn write_request(
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        request: &RtspRequest,
+    ) -> Result<()> {
         let request_str = request.to_string();
         writer.write_all(request_str.as_bytes()).await?;
         writer.flush().await?;
         Ok(())
     }
 
-    pub async fn write_response(writer: &mut tokio::net::tcp::OwnedWriteHalf, response: &str) -> Result<()> {
+    pub async fn write_response(
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        response: &str,
+    ) -> Result<()> {
         writer.write_all(response.as_bytes()).await?;
         writer.flush().await?;
         Ok(())
@@ -535,10 +583,14 @@ impl RtspCommon {
         let marker = (data[1] >> 7) & 0x01;
         let payload_type = data[1] & 0x7F;
         let sequence_number = ((data[2] as u16) << 8) | (data[3] as u16);
-        let timestamp = ((data[4] as u32) << 24) | ((data[5] as u32) << 16) 
-                      | ((data[6] as u32) << 8) | (data[7] as u32);
-        let ssrc = ((data[8] as u32) << 24) | ((data[9] as u32) << 16) 
-                 | ((data[10] as u32) << 8) | (data[11] as u32);
+        let timestamp = ((data[4] as u32) << 24)
+            | ((data[5] as u32) << 16)
+            | ((data[6] as u32) << 8)
+            | (data[7] as u32);
+        let ssrc = ((data[8] as u32) << 24)
+            | ((data[9] as u32) << 16)
+            | ((data[10] as u32) << 8)
+            | (data[11] as u32);
 
         Some(RtpHeader {
             version,
@@ -560,22 +612,32 @@ impl RtspCommon {
         Ok(socket)
     }
 
-    pub async fn send_rtp_over_udp(socket: &UdpSocket, data: &[u8], dest: SocketAddr) -> Result<usize> {
+    pub async fn send_rtp_over_udp(
+        socket: &UdpSocket,
+        data: &[u8],
+        dest: SocketAddr,
+    ) -> Result<usize> {
         let sent = socket.send_to(data, dest).await?;
         debug!("[RTSP Common] Sent {} bytes RTP over UDP to {}", sent, dest);
         Ok(sent)
     }
 
-    pub async fn receive_rtp_over_udp(socket: &UdpSocket, buffer: &mut [u8]) -> Result<(usize, SocketAddr)> {
+    pub async fn receive_rtp_over_udp(
+        socket: &UdpSocket,
+        buffer: &mut [u8],
+    ) -> Result<(usize, SocketAddr)> {
         let (len, src) = socket.recv_from(buffer).await?;
-        debug!("[RTSP Common] Received {} bytes RTP over UDP from {}", len, src);
+        debug!(
+            "[RTSP Common] Received {} bytes RTP over UDP from {}",
+            len, src
+        );
         Ok((len, src))
     }
 
     pub fn build_rtcp_rr(ssrc: u32, last_seq: u16, jitter: u32, lsr: u32, dlsr: u32) -> Vec<u8> {
         let mut rtcp = Vec::with_capacity(32);
         let report_count = 0;
-        
+
         rtcp.push((2 << 6) | (report_count & 0x1F));
         rtcp.push(201);
         rtcp.extend_from_slice(&((4u16).to_be_bytes()));
@@ -585,19 +647,24 @@ impl RtspCommon {
         rtcp.extend_from_slice(&jitter.to_be_bytes());
         rtcp.extend_from_slice(&lsr.to_be_bytes());
         rtcp.extend_from_slice(&dlsr.to_be_bytes());
-        
+
         rtcp
     }
 
-    pub fn build_rtcp_sr(ssrc: u32, timestamp: u32, packet_count: u32, octet_count: u32) -> Vec<u8> {
+    pub fn build_rtcp_sr(
+        ssrc: u32,
+        timestamp: u32,
+        packet_count: u32,
+        octet_count: u32,
+    ) -> Vec<u8> {
         let mut rtcp = Vec::with_capacity(28);
         let report_count = 0;
-        
+
         rtcp.push((2 << 6) | (report_count & 0x1F));
         rtcp.push(200);
         rtcp.extend_from_slice(&((6u16).to_be_bytes()));
         rtcp.extend_from_slice(&ssrc.to_be_bytes());
-        
+
         let ntp_sec = (timestamp as u64 >> 32) as u32;
         let ntp_frac = timestamp;
         rtcp.extend_from_slice(&ntp_sec.to_be_bytes());
@@ -605,7 +672,7 @@ impl RtspCommon {
         rtcp.extend_from_slice(&timestamp.to_be_bytes());
         rtcp.extend_from_slice(&packet_count.to_be_bytes());
         rtcp.extend_from_slice(&octet_count.to_be_bytes());
-        
+
         rtcp
     }
 
@@ -644,7 +711,8 @@ impl RtspCommon {
                     if payload[next_start] == 0x00 && payload[next_start + 1] == 0x00 {
                         if payload[next_start + 2] == 0x01 {
                             break;
-                        } else if payload[next_start + 2] == 0x00 && payload[next_start + 3] == 0x01 {
+                        } else if payload[next_start + 2] == 0x00 && payload[next_start + 3] == 0x01
+                        {
                             next_start += 1;
                             break;
                         }
@@ -674,7 +742,12 @@ impl RtspCommon {
                     nal_units.push(nal_unit);
                 }
 
-                i = next_start + (if payload[next_start + 2] == 0x01 { 3 } else { 4 });
+                i = next_start
+                    + (if payload[next_start + 2] == 0x01 {
+                        3
+                    } else {
+                        4
+                    });
                 if i >= payload.len() {
                     break;
                 }
@@ -699,13 +772,16 @@ impl RtspCommon {
         let mut sps: Option<Vec<u8>> = None;
         let mut pps: Option<Vec<u8>> = None;
 
-        debug!("[RTSP Common] extract_sps_pps: payload length={} bytes", payload.len());
+        debug!(
+            "[RTSP Common] extract_sps_pps: payload length={} bytes",
+            payload.len()
+        );
 
         // Check if payload uses start codes (00 00 00 01 or 00 00 01)
         if payload.len() >= 4 && payload[0] == 0x00 && payload[1] == 0x00 {
             let start_code_len = if payload[2] == 0x01 { 3 } else { 4 };
             debug!("[RTSP Common] Found start code, length={}", start_code_len);
-            
+
             let mut i = start_code_len;
 
             while i < payload.len() {
@@ -715,7 +791,8 @@ impl RtspCommon {
                     if payload[next_start] == 0x00 && payload[next_start + 1] == 0x00 {
                         if payload[next_start + 2] == 0x01 {
                             break;
-                        } else if payload[next_start + 2] == 0x00 && payload[next_start + 3] == 0x01 {
+                        } else if payload[next_start + 2] == 0x00 && payload[next_start + 3] == 0x01
+                        {
                             next_start += 1;
                             break;
                         }
@@ -731,26 +808,47 @@ impl RtspCommon {
 
                 if !nal_unit.is_empty() {
                     let nal_type = nal_unit[0] & 0x1F;
-                    debug!("[RTSP Common] Found NAL unit: type={}, length={} bytes", nal_type, nal_unit.len());
-                    
+                    debug!(
+                        "[RTSP Common] Found NAL unit: type={}, length={} bytes",
+                        nal_type,
+                        nal_unit.len()
+                    );
+
                     match nal_type {
                         7 if sps.is_none() => {
-                            info!("[RTSP Common] Found SPS in start-code formatted data: {} bytes", nal_unit.len());
-                            debug!("[RTSP Common] SPS first 16 bytes: {:02X?}", &nal_unit[..std::cmp::min(16, nal_unit.len())]);
+                            info!(
+                                "[RTSP Common] Found SPS in start-code formatted data: {} bytes",
+                                nal_unit.len()
+                            );
+                            debug!(
+                                "[RTSP Common] SPS first 16 bytes: {:02X?}",
+                                &nal_unit[..std::cmp::min(16, nal_unit.len())]
+                            );
                             sps = Some(nal_unit);
-                        },
+                        }
                         8 if pps.is_none() => {
-                            info!("[RTSP Common] Found PPS in start-code formatted data: {} bytes", nal_unit.len());
-                            debug!("[RTSP Common] PPS first 16 bytes: {:02X?}", &nal_unit[..std::cmp::min(16, nal_unit.len())]);
+                            info!(
+                                "[RTSP Common] Found PPS in start-code formatted data: {} bytes",
+                                nal_unit.len()
+                            );
+                            debug!(
+                                "[RTSP Common] PPS first 16 bytes: {:02X?}",
+                                &nal_unit[..std::cmp::min(16, nal_unit.len())]
+                            );
                             pps = Some(nal_unit);
-                        },
+                        }
                         _ => {
                             debug!("[RTSP Common] Skipping non-SPS/PPS NAL type {}", nal_type);
                         }
                     }
                 }
 
-                i = next_start + (if payload[next_start + 2] == 0x01 { 3 } else { 4 });
+                i = next_start
+                    + (if payload[next_start + 2] == 0x01 {
+                        3
+                    } else {
+                        4
+                    });
                 if i >= payload.len() {
                     break;
                 }
@@ -758,29 +856,51 @@ impl RtspCommon {
         } else if !payload.is_empty() {
             // Single NAL unit without start codes
             let nal_type = payload[0] & 0x1F;
-            debug!("[RTSP Common] Single NAL unit without start code: type={}, length={} bytes", 
-                   nal_type, payload.len());
-            
+            debug!(
+                "[RTSP Common] Single NAL unit without start code: type={}, length={} bytes",
+                nal_type,
+                payload.len()
+            );
+
             match nal_type {
                 7 => {
-                    info!("[RTSP Common] Found SPS in single NAL unit: {} bytes", payload.len());
-                    debug!("[RTSP Common] SPS first 16 bytes: {:02X?}", &payload[..std::cmp::min(16, payload.len())]);
+                    info!(
+                        "[RTSP Common] Found SPS in single NAL unit: {} bytes",
+                        payload.len()
+                    );
+                    debug!(
+                        "[RTSP Common] SPS first 16 bytes: {:02X?}",
+                        &payload[..std::cmp::min(16, payload.len())]
+                    );
                     sps = Some(payload.to_vec());
-                },
+                }
                 8 => {
-                    info!("[RTSP Common] Found PPS in single NAL unit: {} bytes", payload.len());
-                    debug!("[RTSP Common] PPS first 16 bytes: {:02X?}", &payload[..std::cmp::min(16, payload.len())]);
+                    info!(
+                        "[RTSP Common] Found PPS in single NAL unit: {} bytes",
+                        payload.len()
+                    );
+                    debug!(
+                        "[RTSP Common] PPS first 16 bytes: {:02X?}",
+                        &payload[..std::cmp::min(16, payload.len())]
+                    );
                     pps = Some(payload.to_vec());
-                },
+                }
                 _ => {
-                    debug!("[RTSP Common] Single NAL unit is not SPS/PPS (type={})", nal_type);
+                    debug!(
+                        "[RTSP Common] Single NAL unit is not SPS/PPS (type={})",
+                        nal_type
+                    );
                 }
             }
         } else {
             debug!("[RTSP Common] Payload is empty, returning None for both SPS and PPS");
         }
 
-        debug!("[RTSP Common] extract_sps_pps completed: SPS={}, PPS={}", sps.is_some(), pps.is_some());
+        debug!(
+            "[RTSP Common] extract_sps_pps completed: SPS={}, PPS={}",
+            sps.is_some(),
+            pps.is_some()
+        );
         (sps, pps)
     }
 
@@ -799,7 +919,7 @@ impl RtspCommon {
         pps: &[u8],
         seq: u16,
         timestamp: u32,
-        ssrc: u32
+        ssrc: u32,
     ) -> Vec<Vec<u8>> {
         let mut packets = Vec::new();
 
@@ -868,7 +988,12 @@ impl RtspCommon {
             payload.extend_from_slice(&data[offset..offset + chunk_size]);
             let mark = marker && is_end;
             packets.push(Self::build_rtp_packet(
-                payload_type, *seq, ts, ssrc, mark, &payload,
+                payload_type,
+                *seq,
+                ts,
+                ssrc,
+                mark,
+                &payload,
             ));
             *seq = seq.wrapping_add(1);
             offset += chunk_size;
@@ -971,9 +1096,8 @@ pub fn wrap_mpeg4_generic_aac_hbr(aac: &[u8]) -> Vec<u8> {
 /// Return AAC raw frame bytes without a leading ADTS header when present.
 pub fn aac_payload_without_adts(data: &[u8]) -> &[u8] {
     if data.len() >= 7 && data[0] == 0xFF && (data[1] & 0xF0) == 0xF0 {
-        let frame_length = ((data[3] as usize & 0x03) << 11)
-            | (data[4] as usize) << 3
-            | (data[5] as usize >> 5);
+        let frame_length =
+            ((data[3] as usize & 0x03) << 11) | (data[4] as usize) << 3 | (data[5] as usize >> 5);
         if frame_length > 7 && frame_length <= data.len() {
             return &data[7..frame_length];
         }

@@ -18,16 +18,16 @@ pub enum ClientSignal {
         #[serde(default)]
         sdp_mline_index: Option<u16>,
     },
-  /// Client stopped publishing; release peer connection and stream state.
-  #[serde(rename = "stop_publish")]
-  StopPublish {
-    stream_id: String,
-  },
-  /// Client stopped playback; release relay and peer connection.
-  #[serde(rename = "stop_play")]
-  StopPlay {
-    stream_id: String,
-  },
+    /// Client stopped publishing; release peer connection and stream state.
+    #[serde(rename = "stop_publish")]
+    StopPublish {
+        stream_id: String,
+    },
+    /// Client stopped playback; release relay and peer connection.
+    #[serde(rename = "stop_play")]
+    StopPlay {
+        stream_id: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -53,8 +53,7 @@ pub enum ServerSignal {
 
 impl ServerSignal {
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| {
-            r#"{"type":"error","message":"serialization failed"}"#.to_string()
-        })
+        serde_json::to_string(self)
+            .unwrap_or_else(|_| r#"{"type":"error","message":"serialization failed"}"#.to_string())
     }
 }

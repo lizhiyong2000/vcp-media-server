@@ -11,21 +11,21 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager};
-use crate::core::dispatch::DispatchError;
 use super::h264_util::{
     contains_idr_nalu, contains_sps_or_pps_nalu, describe_annex_b, duration_from_rtp_timestamps,
     ensure_annex_b, extract_sps_pps, is_parameter_set_only, is_rtp_stale_in_gop,
-    is_rtp_timestamp_before, is_rtp_timeline_reset,
-    iter_annex_b_nal_ranges, looks_like_h265_misread_as_h264,
+    is_rtp_timeline_reset, is_rtp_timestamp_before, iter_annex_b_nal_ranges,
+    looks_like_h265_misread_as_h264,
 };
 use super::outbound_h264::{annex_b_with_config, OutboundH264Track};
 use super::peer::{new_peer_connection, wire_pc_debug};
-use super::publisher::wire_ice_candidates;
 use super::play_relay::{attach_relay_abort_handle, register_play_relay, unregister_play_relay};
 use super::publish_signaling::request_publisher_keyframe;
+use super::publisher::wire_ice_candidates;
 use super::sdp_h264::{build_h264_sdp_fmtp, patch_answer_sdp_h264};
 use super::signaling::ServerSignal;
+use crate::core::dispatch::DispatchError;
+use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager};
 use webrtc::api::API;
 
 pub use super::play_relay::{cancel_play_relay, signal_play_relay_stop};
@@ -51,12 +51,12 @@ pub async fn start_play(
     manager.ensure_stream_hub(&stream_id);
     log_stream_codec_state(&manager, &stream_id, "play-request");
 
-    let h264_fmtp = manager.get_stream(&stream_id.to_string()).and_then(|stream| {
-        match (&stream.sps, &stream.pps) {
+    let h264_fmtp = manager
+        .get_stream(&stream_id.to_string())
+        .and_then(|stream| match (&stream.sps, &stream.pps) {
             (Some(sps), Some(pps)) => Some(build_h264_sdp_fmtp(sps, pps)),
             _ => None,
-        }
-    });
+        });
 
     let pc = new_peer_connection(&api).await?;
     wire_pc_debug(pc.clone(), "play");
@@ -70,8 +70,7 @@ pub async fn start_play(
         codec_capability.sdp_fmtp_line = fmtp.clone();
         info!(
             "[WebRTC] Play track codec fmtp stream='{}' {}",
-            stream_id,
-            fmtp
+            stream_id, fmtp
         );
     }
 
@@ -82,9 +81,13 @@ pub async fn start_play(
     ));
 
     let _rtp_sender = pc
-        .add_track(Arc::clone(&video_track) as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
+        .add_track(Arc::clone(&video_track)
+            as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
         .await?;
-    info!("[WebRTC] Play added outbound RTP video track stream='{}'", stream_id);
+    info!(
+        "[WebRTC] Play added outbound RTP video track stream='{}'",
+        stream_id
+    );
 
     wire_ice_candidates(pc.clone(), ice_tx.clone());
 
@@ -158,7 +161,10 @@ fn log_stream_codec_state(manager: &StreamManager, stream_id: &str, phase: &str)
             stream.pps.as_ref().map(|p| p.len()).unwrap_or(0)
         );
     } else {
-        warn!("[WebRTC] Stream state [{}] id='{}' NOT FOUND", phase, stream_id);
+        warn!(
+            "[WebRTC] Stream state [{}] id='{}' NOT FOUND",
+            phase, stream_id
+        );
     }
 }
 
@@ -172,7 +178,10 @@ async fn wait_for_connected(
         match pc.connection_state() {
             RTCPeerConnectionState::Connected => {
                 log_stream_codec_state(manager, stream_id, "connected");
-                info!("[WebRTC] {} peer connection connected (attempt={})", label, attempt);
+                info!(
+                    "[WebRTC] {} peer connection connected (attempt={})",
+                    label, attempt
+                );
                 return Ok(());
             }
             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
@@ -223,7 +232,8 @@ async fn relay_stream_to_track(
         }
     }
 
-    let Some(mut reader) = manager.dispatch_subscribe(&stream_id, DispatchPolicy::WebRtcPlay) else {
+    let Some(mut reader) = manager.dispatch_subscribe(&stream_id, DispatchPolicy::WebRtcPlay)
+    else {
         return Err(anyhow!("No StreamHub for stream {}", stream_id));
     };
 
@@ -264,7 +274,10 @@ async fn relay_stream_to_track(
     let mut last_keyframe_request = Instant::now();
     const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 
-    info!("[WebRTC] Play relay loop started for stream='{}'", stream_id);
+    info!(
+        "[WebRTC] Play relay loop started for stream='{}'",
+        stream_id
+    );
 
     loop {
         if stop_requested(&stop_rx) {
@@ -471,11 +484,7 @@ async fn relay_stream_to_track(
     Ok(())
 }
 
-fn prepend_stream_config(
-    manager: &StreamManager,
-    stream_id: &str,
-    access_unit: &[u8],
-) -> Vec<u8> {
+fn prepend_stream_config(manager: &StreamManager, stream_id: &str, access_unit: &[u8]) -> Vec<u8> {
     if contains_sps_or_pps_nalu(access_unit) {
         return access_unit.to_vec();
     }
@@ -552,4 +561,3 @@ fn store_live_nalu_config(manager: &StreamManager, stream_id: &str, data: &[u8])
         manager.merge_stream_nalu_config(stream_id, &data[start..end]);
     }
 }
-

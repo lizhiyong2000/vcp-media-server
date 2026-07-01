@@ -11,15 +11,17 @@ use webrtc::rtp::packetizer::Depacketizer;
 use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::track::track_remote::TrackRemote;
 
-use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, default_live_tracks};
 use super::h264_util::{describe_annex_b, is_keyframe_annex_b, is_parameter_set_only};
 use super::peer::{new_peer_connection, wire_pc_debug};
 use super::rtp_h264::{
-    self, annex_b_from_rtp_payload, describe_rtp_payload, extract_sps_pps_from_nalus,
-    hex_prefix, is_idr_rtp_payload, parse_rtp_h264,
+    self, annex_b_from_rtp_payload, describe_rtp_payload, extract_sps_pps_from_nalus, hex_prefix,
+    is_idr_rtp_payload, parse_rtp_h264,
 };
 use super::sdp_h264::parse_sprop_parameter_sets;
 use super::signaling::ServerSignal;
+use crate::core::{
+    default_live_tracks, CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode,
+};
 use webrtc::api::API;
 
 pub struct PublishSession {
@@ -31,6 +33,7 @@ pub async fn start_publish(
     api: Arc<API>,
     manager: Arc<StreamManager>,
     stream_id: String,
+    publisher_id: String,
     offer_sdp: String,
     ice_tx: mpsc::UnboundedSender<ServerSignal>,
 ) -> Result<PublishSession> {
@@ -43,6 +46,7 @@ pub async fn start_publish(
         StreamProtocol::WebRTC,
         None,
     );
+    manager.acquire_publisher(&stream_id, &publisher_id)?;
     manager.set_stream_tracks(&stream_id, default_live_tracks());
     let _ = manager.set_unpublished(&stream_id);
     manager.ensure_stream_broadcast(&stream_id);
@@ -73,19 +77,40 @@ pub async fn start_publish(
         let sid_for_task = sid.clone();
         Box::pin(async move {
             if let Err(e) = read_track_to_stream(manager_track, sid_for_task.clone(), track).await {
-                error!("[WebRTC] Publish track error stream='{}': {}", sid_for_task, e);
+                error!(
+                    "[WebRTC] Publish track error stream='{}': {}",
+                    sid_for_task, e
+                );
             }
         })
     }));
 
     wire_ice_candidates(pc.clone(), ice_tx.clone());
 
-    let offer = RTCSessionDescription::offer(offer_sdp)?;
-    pc.set_remote_description(offer).await?;
+    let offer = match RTCSessionDescription::offer(offer_sdp) {
+        Ok(offer) => offer,
+        Err(e) => {
+            manager.release_publisher(&stream_id, &publisher_id);
+            return Err(e.into());
+        }
+    };
+    if let Err(e) = pc.set_remote_description(offer).await {
+        manager.release_publisher(&stream_id, &publisher_id);
+        return Err(e.into());
+    }
     info!("[WebRTC] Publish set remote offer stream='{}'", stream_id);
 
-    let answer = pc.create_answer(None).await?;
-    pc.set_local_description(answer.clone()).await?;
+    let answer = match pc.create_answer(None).await {
+        Ok(answer) => answer,
+        Err(e) => {
+            manager.release_publisher(&stream_id, &publisher_id);
+            return Err(e.into());
+        }
+    };
+    if let Err(e) = pc.set_local_description(answer.clone()).await {
+        manager.release_publisher(&stream_id, &publisher_id);
+        return Err(e.into());
+    }
     info!(
         "[WebRTC] Publish local answer ready stream='{}' sdp_len={}",
         stream_id,
@@ -110,10 +135,7 @@ async fn read_track_to_stream(
     let codec = track.codec();
     info!(
         "[WebRTC] Reading incoming track kind={:?} stream_id='{}' mime={} clock={}",
-        kind,
-        stream_id,
-        codec.capability.mime_type,
-        codec.capability.clock_rate
+        kind, stream_id, codec.capability.mime_type, codec.capability.clock_rate
     );
 
     if kind == RTPCodecType::Video {
@@ -382,7 +404,10 @@ fn h264_rtp_to_frame(
     ))
 }
 
-pub fn wire_ice_candidates(pc: Arc<RTCPeerConnection>, ice_tx: mpsc::UnboundedSender<ServerSignal>) {
+pub fn wire_ice_candidates(
+    pc: Arc<RTCPeerConnection>,
+    ice_tx: mpsc::UnboundedSender<ServerSignal>,
+) {
     pc.on_ice_candidate(Box::new(move |c| {
         let ice_tx = ice_tx.clone();
         Box::pin(async move {

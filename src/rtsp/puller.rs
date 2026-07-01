@@ -4,13 +4,13 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::time::Duration;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
-use crate::core::{StreamManager, Track, CodecType, MediaFrame, StreamSourceMode, StreamProtocol};
-use crate::webrtc::H264RtpIngest;
 use super::client_session::RtspClientSession;
 use super::common::RtspCommon;
 use super::RtspRequest;
+use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track};
+use crate::webrtc::H264RtpIngest;
 
 pub struct RtspPuller {
     stream_manager: Arc<StreamManager>,
@@ -23,7 +23,10 @@ impl RtspPuller {
 
     pub async fn pull(&self, remote_url: &str, local_stream_id: &str) -> Result<()> {
         info!("[RTSP Puller] =========================================");
-        info!("[RTSP Puller] Starting RTSP Pull from {} to stream {}", remote_url, local_stream_id);
+        info!(
+            "[RTSP Puller] Starting RTSP Pull from {} to stream {}",
+            remote_url, local_stream_id
+        );
         info!("[RTSP Puller] =========================================");
 
         let mut session = RtspClientSession::new(self.stream_manager.clone(), remote_url);
@@ -44,7 +47,7 @@ impl RtspPuller {
         let sdp_start = response.find("\r\n\r\n").map(|p| p + 4).unwrap_or(0);
         let sdp = &response[sdp_start..];
         let tracks = RtspClientSession::parse_sdp_tracks(sdp);
-        
+
         if tracks.is_empty() {
             warn!("[RTSP Puller] No tracks found in SDP, using default tracks");
         }
@@ -70,8 +73,17 @@ impl RtspPuller {
             tracks.clone()
         };
 
-        info!("[RTSP Puller] [Step 3/4] Creating stream {} with {} tracks", local_stream_id, tracks_to_create.len());
-        self.stream_manager.create_stream(local_stream_id, StreamSourceMode::Pull, StreamProtocol::RTSP, Some(remote_url.to_string()));
+        info!(
+            "[RTSP Puller] [Step 3/4] Creating stream {} with {} tracks",
+            local_stream_id,
+            tracks_to_create.len()
+        );
+        self.stream_manager.create_stream(
+            local_stream_id,
+            StreamSourceMode::Pull,
+            StreamProtocol::RTSP,
+            Some(remote_url.to_string()),
+        );
         let _ = self.stream_manager.set_unpublished(local_stream_id);
         self.stream_manager.ensure_stream_broadcast(local_stream_id);
 
@@ -89,11 +101,18 @@ impl RtspPuller {
                 .set_stream_sps_pps(local_stream_id, sps, pps);
         }
 
-        info!("[RTSP Puller] [Step 3/4] Setting up {} tracks...", tracks_to_create.len());
+        info!(
+            "[RTSP Puller] [Step 3/4] Setting up {} tracks...",
+            tracks_to_create.len()
+        );
         for (idx, _track) in tracks_to_create.iter().enumerate() {
             let response = session.send_setup(&mut writer, &mut reader, idx).await?;
             if !response.starts_with("RTSP/1.0 200 OK") {
-                return Err(anyhow::anyhow!("SETUP failed for track {}: {}", idx, response));
+                return Err(anyhow::anyhow!(
+                    "SETUP failed for track {}: {}",
+                    idx,
+                    response
+                ));
             }
         }
 
@@ -106,7 +125,10 @@ impl RtspPuller {
         let _ = self.stream_manager.set_publishing(local_stream_id);
 
         info!("[RTSP Puller] =========================================");
-        info!("[RTSP Puller] SUCCESS: RTSP Pull started for stream {}", local_stream_id);
+        info!(
+            "[RTSP Puller] SUCCESS: RTSP Pull started for stream {}",
+            local_stream_id
+        );
         info!("[RTSP Puller] Session ID: {:?}", session.session_id());
         info!("[RTSP Puller] Remote URL: {}", remote_url);
         info!("[RTSP Puller] =========================================");
@@ -118,7 +140,10 @@ impl RtspPuller {
         let session_clone = session;
         let remote_url_clone = remote_url.to_string();
 
-        info!("[RTSP Puller] Transport: {}", if use_udp { "UDP" } else { "TCP" });
+        info!(
+            "[RTSP Puller] Transport: {}",
+            if use_udp { "UDP" } else { "TCP" }
+        );
 
         tokio::spawn(async move {
             if use_udp {
@@ -137,22 +162,29 @@ impl RtspPuller {
         Ok(())
     }
 
-    async fn rtp_receive_loop(mut reader: tokio::net::tcp::OwnedReadHalf, manager: Arc<StreamManager>, stream_id: String) {
+    async fn rtp_receive_loop(
+        mut reader: tokio::net::tcp::OwnedReadHalf,
+        manager: Arc<StreamManager>,
+        stream_id: String,
+    ) {
         let mut rtsp_response = String::new();
         let mut frame_count: u64 = 0;
         let mut bytes_received: u64 = 0;
         let mut last_log_time = std::time::Instant::now();
         let mut h264_ingest = H264RtpIngest::new(manager.clone(), stream_id.clone(), "RTSP-Pull");
-        
-        info!("[RTSP Puller] [RTP Loop] Starting RTP receive loop for stream {}", stream_id);
-        
+
+        info!(
+            "[RTSP Puller] [RTP Loop] Starting RTP receive loop for stream {}",
+            stream_id
+        );
+
         loop {
             let mut first_byte = [0u8; 1];
             if let Err(e) = reader.read_exact(&mut first_byte).await {
                 error!("[RTSP Puller] [RTP Loop] Read error: {}", e);
                 break;
             }
-            
+
             if first_byte[0] == 0x24 {
                 let mut header = [0u8; 3];
                 if let Err(e) = reader.read_exact(&mut header).await {
@@ -210,7 +242,7 @@ impl RtspPuller {
                     manager.publish_frame(frame);
                     frame_count += 1;
                 }
-                    
+
                 let elapsed = last_log_time.elapsed();
                 if elapsed >= Duration::from_secs(10) {
                     let fps = frame_count as f64 / elapsed.as_secs_f64();
@@ -222,7 +254,10 @@ impl RtspPuller {
             } else {
                 rtsp_response.push(first_byte[0] as char);
                 if rtsp_response.ends_with("\r\n\r\n") {
-                    info!("[RTSP Puller] [RTP Loop] Received RTSP response: {}", rtsp_response);
+                    info!(
+                        "[RTSP Puller] [RTP Loop] Received RTSP response: {}",
+                        rtsp_response
+                    );
                     rtsp_response.clear();
                 }
             }
@@ -230,8 +265,11 @@ impl RtspPuller {
 
         h264_ingest.flush_remaining();
         let _ = manager.set_unpublished(&stream_id);
-        
-        info!("[RTSP Puller] [RTP Loop] RTP receive loop ended for stream {}", stream_id);
+
+        info!(
+            "[RTSP Puller] [RTP Loop] RTP receive loop ended for stream {}",
+            stream_id
+        );
     }
 
     async fn udp_receive_loop(
@@ -253,7 +291,11 @@ impl RtspPuller {
                 let mut buffer = vec![0u8; 65535];
                 let mut frame_count: u64 = 0;
                 let mut h264_ingest = if track_id == 0 {
-                    Some(H264RtpIngest::new(manager.clone(), sid.clone(), "RTSP-Pull-UDP"))
+                    Some(H264RtpIngest::new(
+                        manager.clone(),
+                        sid.clone(),
+                        "RTSP-Pull-UDP",
+                    ))
                 } else {
                     None
                 };
@@ -297,10 +339,7 @@ impl RtspPuller {
                             }
                         }
                         Err(e) => {
-                            error!(
-                                "[RTSP Puller] [UDP Loop] track={} error: {}",
-                                track_id, e
-                            );
+                            error!("[RTSP Puller] [UDP Loop] track={} error: {}", track_id, e);
                             break;
                         }
                     }
@@ -319,34 +358,47 @@ impl RtspPuller {
         // Keep task alive while UDP receivers run.
         std::future::pending::<()>().await;
     }
-    
-    async fn send_keepalive(mut writer: tokio::net::tcp::OwnedWriteHalf, session: RtspClientSession, remote_url: String) {
-        let session_id = session.session_id().map(|s| s.to_string()).unwrap_or_default();
+
+    async fn send_keepalive(
+        mut writer: tokio::net::tcp::OwnedWriteHalf,
+        session: RtspClientSession,
+        remote_url: String,
+    ) {
+        let session_id = session
+            .session_id()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let mut cseq = 100;
-        
+
         info!("[RTSP Puller] [Keepalive] Starting keepalive loop");
-        
+
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            
+
             let request = RtspRequest::new("GET_PARAMETER", &remote_url)
                 .header("CSeq", &cseq.to_string())
                 .header("Session", &session_id);
-            
+
             if let Err(e) = writer.write_all(request.to_string().as_bytes()).await {
-                error!("[RTSP Puller] [Keepalive] Failed to send GET_PARAMETER: {}", e);
+                error!(
+                    "[RTSP Puller] [Keepalive] Failed to send GET_PARAMETER: {}",
+                    e
+                );
                 break;
             }
-            
+
             if let Err(e) = writer.flush().await {
                 error!("[RTSP Puller] [Keepalive] Failed to flush: {}", e);
                 break;
             }
-            
+
             cseq += 1;
-            debug!("[RTSP Puller] [Keepalive] Sent GET_PARAMETER (CSeq={})", cseq - 1);
+            debug!(
+                "[RTSP Puller] [Keepalive] Sent GET_PARAMETER (CSeq={})",
+                cseq - 1
+            );
         }
-        
+
         info!("[RTSP Puller] [Keepalive] Keepalive loop ended");
     }
 }

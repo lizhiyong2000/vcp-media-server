@@ -114,7 +114,13 @@ pub fn describe_rtp_payload(payload: &[u8]) -> String {
     }
     nalus
         .iter()
-        .map(|n| format!("{}({})", super::h264_util::nalu_type_name(n.nal_type), n.data.len()))
+        .map(|n| {
+            format!(
+                "{}({})",
+                super::h264_util::nalu_type_name(n.nal_type),
+                n.data.len()
+            )
+        })
         .collect::<Vec<_>>()
         .join("+")
 }

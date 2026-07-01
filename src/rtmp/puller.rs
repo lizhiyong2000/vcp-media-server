@@ -8,9 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
-use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode};
 use super::amf0::{self, Amf0Value};
 use super::chunk::{self, ChunkAssembler, ChunkHeader};
+use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode};
 
 #[derive(Debug, Clone)]
 pub struct RtmpUrl {
@@ -476,8 +476,7 @@ fn extract_and_store_sps_pps(data: &[u8], manager: &StreamManager, stream_id: &s
         if offset + 2 > config_data.len() {
             break;
         }
-        let sps_len =
-            ((config_data[offset] as usize) << 8) | config_data[offset + 1] as usize;
+        let sps_len = ((config_data[offset] as usize) << 8) | config_data[offset + 1] as usize;
         offset += 2;
         if offset + sps_len > config_data.len() {
             break;
@@ -493,8 +492,7 @@ fn extract_and_store_sps_pps(data: &[u8], manager: &StreamManager, stream_id: &s
             if offset + 2 > config_data.len() {
                 break;
             }
-            let pps_len =
-                ((config_data[offset] as usize) << 8) | config_data[offset + 1] as usize;
+            let pps_len = ((config_data[offset] as usize) << 8) | config_data[offset + 1] as usize;
             offset += 2;
             if offset + pps_len > config_data.len() {
                 break;

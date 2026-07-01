@@ -1,23 +1,23 @@
 use anyhow::Result;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc::{Sender, Receiver, channel};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::net::SocketAddr;
-use tracing::{info, warn, error, debug};
 use bytes::BytesMut;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tracing::{debug, error, info, warn};
 
-use crate::core::{DispatchPolicy, StreamManager, MediaFrame, CodecType};
-use crate::webrtc::H264RtpIngest;
-use super::{RtspRequest, RtspResponse, RtspSession, TransportMode, RtspServer};
 use super::common::{
-    format_rtsp_message, extract_transport, extract_track_id, is_udp_transport, RtspCommon,
+    extract_track_id, extract_transport, format_rtsp_message, is_udp_transport, RtspCommon,
 };
 use super::play_egress::{
     egress_rtp_packets, is_idr, prime_rtsp_play, recv_coalesced_play_frame, PlayRtpTimeline,
 };
+use super::{RtspRequest, RtspResponse, RtspServer, RtspSession, TransportMode};
 use crate::core::dispatch::DispatchError;
+use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager};
+use crate::webrtc::H264RtpIngest;
 
 pub struct RtspServerSession {
     reader: tokio::net::tcp::OwnedReadHalf,
@@ -53,7 +53,9 @@ impl RtspServerSession {
         manager: Arc<StreamManager>,
         hls_server: Option<Arc<crate::hls::HlsServer>>,
     ) -> Self {
-        let peer_addr = socket.peer_addr().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
+        let peer_addr = socket
+            .peer_addr()
+            .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
         let (reader, writer) = socket.into_split();
         let (write_tx, write_rx) = channel(100);
 
@@ -90,7 +92,12 @@ impl RtspServerSession {
 
         info!(
             "[RTSP] [{}] UDP SETUP track={} client={}-{} server={}-{}",
-            self.peer_addr, track_id, client_rtp_port, client_rtcp_port, server_rtp_port, server_rtcp_port
+            self.peer_addr,
+            track_id,
+            client_rtp_port,
+            client_rtcp_port,
+            server_rtp_port,
+            server_rtcp_port
         );
 
         let rtp_socket = Arc::new(RtspCommon::create_udp_socket(server_rtp_port).await?);
@@ -116,7 +123,11 @@ impl RtspServerSession {
         Ok((server_rtp_port, server_rtcp_port))
     }
 
-    fn start_udp_receiver_for_track(&mut self, track_id: u8, rtp_socket: Arc<tokio::net::UdpSocket>) {
+    fn start_udp_receiver_for_track(
+        &mut self,
+        track_id: u8,
+        rtp_socket: Arc<tokio::net::UdpSocket>,
+    ) {
         if !self.udp_receiver_tracks.insert(track_id) {
             return;
         }
@@ -139,7 +150,11 @@ impl RtspServerSession {
             );
             let mut buffer = vec![0u8; 65535];
             let mut h264_ingest = if track_id == 0 {
-                Some(H264RtpIngest::new(manager.clone(), stream_id.clone(), "RTSP-Push-UDP"))
+                Some(H264RtpIngest::new(
+                    manager.clone(),
+                    stream_id.clone(),
+                    "RTSP-Push-UDP",
+                ))
             } else {
                 None
             };
@@ -157,9 +172,8 @@ impl RtspServerSession {
                             }
                         } else {
                             let marker = (buffer[1] & 0x80) != 0;
-                            let ts = u32::from_be_bytes(
-                                buffer[4..8].try_into().unwrap_or([0; 4]),
-                            ) as u64;
+                            let ts = u32::from_be_bytes(buffer[4..8].try_into().unwrap_or([0; 4]))
+                                as u64;
                             let payload_type = buffer[1] & 0x7F;
                             let codec = if payload_type == 97 {
                                 CodecType::AAC
@@ -235,11 +249,15 @@ impl RtspServerSession {
 
     pub async fn send_response(&self, response: &RtspResponse) -> Result<()> {
         let data = response.to_string().into_bytes();
-        
+
         // Log the response in a human-readable format
         let response_str = response.to_string();
-        debug!("[RTSP] [{}] Sending response:\n{}", self.peer_addr, format_rtsp_message(&response_str));
-        
+        debug!(
+            "[RTSP] [{}] Sending response:\n{}",
+            self.peer_addr,
+            format_rtsp_message(&response_str)
+        );
+
         self.write_tx.send(data).await?;
         Ok(())
     }
@@ -272,7 +290,17 @@ impl RtspServerSession {
             );
         }
         self.abort_rtp_sender();
+        if let (Some(stream_id), Some(publisher_id)) = (
+            self.session.stream_id.as_deref(),
+            self.session.publisher_id.as_deref(),
+        ) {
+            if self.manager.release_publisher(stream_id, publisher_id) {
+                let _ = self.manager.set_unpublished(stream_id);
+            }
+        }
         self.session.playing = false;
+        self.session.publishing = false;
+        self.session.publisher_id = None;
     }
 
     async fn read_loop(&mut self) -> Result<()> {
@@ -377,72 +405,108 @@ impl RtspServerSession {
                 original_nal.push((fu_indicator & 0xE0) | original_nal_type);
                 original_nal.extend_from_slice(&payload[2..]);
 
-                debug!("[RTSP SPS/PPS] Reconstructed NAL unit from FU-A start fragment: {} bytes", original_nal.len());
+                debug!(
+                    "[RTSP SPS/PPS] Reconstructed NAL unit from FU-A start fragment: {} bytes",
+                    original_nal.len()
+                );
 
                 // Check if it's SPS or PPS
                 match original_nal_type {
                     7 if sps.is_none() => {
-                        info!("[RTSP SPS/PPS] Found SPS in FU-A start fragment: {} bytes, NRI={}", 
-                              original_nal.len(), nri);
-                        debug!("[RTSP SPS/PPS] SPS first 16 bytes: {:02X?}", &original_nal[..std::cmp::min(16, original_nal.len())]);
+                        info!(
+                            "[RTSP SPS/PPS] Found SPS in FU-A start fragment: {} bytes, NRI={}",
+                            original_nal.len(),
+                            nri
+                        );
+                        debug!(
+                            "[RTSP SPS/PPS] SPS first 16 bytes: {:02X?}",
+                            &original_nal[..std::cmp::min(16, original_nal.len())]
+                        );
                         sps = Some(original_nal);
-                    },
+                    }
                     8 if pps.is_none() => {
-                        info!("[RTSP SPS/PPS] Found PPS in FU-A start fragment: {} bytes, NRI={}", 
-                              original_nal.len(), nri);
-                        debug!("[RTSP SPS/PPS] PPS first 16 bytes: {:02X?}", &original_nal[..std::cmp::min(16, original_nal.len())]);
+                        info!(
+                            "[RTSP SPS/PPS] Found PPS in FU-A start fragment: {} bytes, NRI={}",
+                            original_nal.len(),
+                            nri
+                        );
+                        debug!(
+                            "[RTSP SPS/PPS] PPS first 16 bytes: {:02X?}",
+                            &original_nal[..std::cmp::min(16, original_nal.len())]
+                        );
                         pps = Some(original_nal);
-                    },
+                    }
                     _ => {
-                        debug!("[RTSP SPS/PPS] FU-A start fragment contains non-SPS/PPS NAL type {}", original_nal_type);
+                        debug!(
+                            "[RTSP SPS/PPS] FU-A start fragment contains non-SPS/PPS NAL type {}",
+                            original_nal_type
+                        );
                     }
                 }
             } else {
-                debug!("[RTSP SPS/PPS] FU-A fragment is not a start fragment (start_bit=0), skipping");
+                debug!(
+                    "[RTSP SPS/PPS] FU-A fragment is not a start fragment (start_bit=0), skipping"
+                );
             }
         }
         // Check for STAP-A aggregation (type 24)
         else if nal_type == 24 && payload.len() >= 4 {
             debug!("[RTSP SPS/PPS] STAP-A aggregation packet detected");
-            
+
             let mut offset = 1; // Skip STAP-A header byte
-            
+
             while offset + 2 <= payload.len() {
                 // Read 2-byte length prefix
                 let nal_length = ((payload[offset] as usize) << 8) | (payload[offset + 1] as usize);
                 offset += 2;
-                
+
                 if offset + nal_length <= payload.len() {
                     let nal_unit = &payload[offset..offset + nal_length];
                     let inner_nal_type = nal_unit[0] & 0x1F;
                     let inner_nri = (nal_unit[0] >> 5) & 0x03;
-                    
-                    debug!("[RTSP SPS/PPS] STAP-A inner NAL: type={}, length={} bytes", inner_nal_type, nal_length);
-                    
+
+                    debug!(
+                        "[RTSP SPS/PPS] STAP-A inner NAL: type={}, length={} bytes",
+                        inner_nal_type, nal_length
+                    );
+
                     match inner_nal_type {
                         7 if sps.is_none() => {
-                            info!("[RTSP SPS/PPS] Found SPS in STAP-A: {} bytes, NRI={}", 
-                                  nal_length, inner_nri);
-                            debug!("[RTSP SPS/PPS] SPS first 16 bytes: {:02X?}", &nal_unit[..std::cmp::min(16, nal_unit.len())]);
+                            info!(
+                                "[RTSP SPS/PPS] Found SPS in STAP-A: {} bytes, NRI={}",
+                                nal_length, inner_nri
+                            );
+                            debug!(
+                                "[RTSP SPS/PPS] SPS first 16 bytes: {:02X?}",
+                                &nal_unit[..std::cmp::min(16, nal_unit.len())]
+                            );
                             sps = Some(nal_unit.to_vec());
-                        },
+                        }
                         8 if pps.is_none() => {
-                            info!("[RTSP SPS/PPS] Found PPS in STAP-A: {} bytes, NRI={}", 
-                                  nal_length, inner_nri);
-                            debug!("[RTSP SPS/PPS] PPS first 16 bytes: {:02X?}", &nal_unit[..std::cmp::min(16, nal_unit.len())]);
+                            info!(
+                                "[RTSP SPS/PPS] Found PPS in STAP-A: {} bytes, NRI={}",
+                                nal_length, inner_nri
+                            );
+                            debug!(
+                                "[RTSP SPS/PPS] PPS first 16 bytes: {:02X?}",
+                                &nal_unit[..std::cmp::min(16, nal_unit.len())]
+                            );
                             pps = Some(nal_unit.to_vec());
-                        },
+                        }
                         _ => {
-                            debug!("[RTSP SPS/PPS] STAP-A inner NAL type {} (not SPS/PPS)", inner_nal_type);
+                            debug!(
+                                "[RTSP SPS/PPS] STAP-A inner NAL type {} (not SPS/PPS)",
+                                inner_nal_type
+                            );
                         }
                     }
-                    
+
                     offset += nal_length;
                 } else {
                     warn!("[RTSP SPS/PPS] STAP-A malformed: insufficient data for NAL unit");
                     break;
                 }
-                
+
                 // Stop early if we have both SPS and PPS
                 if sps.is_some() && pps.is_some() {
                     debug!("[RTSP SPS/PPS] Found both SPS and PPS, stopping STAP-A parsing");
@@ -452,144 +516,198 @@ impl RtspServerSession {
         }
         // Check for IDR frame with embedded SPS/PPS (start code format)
         else if nal_type == 5 && payload.len() >= 4 {
-            info!("[RTSP SPS/PPS] IDR frame detected, checking for embedded SPS/PPS with start codes");
-            
+            info!(
+                "[RTSP SPS/PPS] IDR frame detected, checking for embedded SPS/PPS with start codes"
+            );
+
             // Search for start codes (0x000001 or 0x00000001)
             let mut offset = 0;
             while offset < payload.len() - 4 {
                 // Check for 3-byte start code (0x000001)
-                if payload[offset] == 0x00 && payload[offset + 1] == 0x00 && payload[offset + 2] == 0x01 {
+                if payload[offset] == 0x00
+                    && payload[offset + 1] == 0x00
+                    && payload[offset + 2] == 0x01
+                {
                     let start_code_len = 3;
                     let nal_start = offset + start_code_len;
-                    
+
                     if nal_start < payload.len() {
                         let inner_nal_type = payload[nal_start] & 0x1F;
                         let inner_nri = (payload[nal_start] >> 5) & 0x03;
-                        
+
                         // Find next start code or end of payload
                         let mut next_offset = nal_start + 1;
                         while next_offset < payload.len() - 4 {
                             if payload[next_offset] == 0x00 && payload[next_offset + 1] == 0x00 {
                                 if payload[next_offset + 2] == 0x01 {
                                     break;
-                                } else if payload[next_offset + 2] == 0x00 && payload[next_offset + 3] == 0x01 {
+                                } else if payload[next_offset + 2] == 0x00
+                                    && payload[next_offset + 3] == 0x01
+                                {
                                     next_offset += 1;
                                     break;
                                 }
                             }
                             next_offset += 1;
                         }
-                        
+
                         let nal_unit = &payload[nal_start..next_offset];
-                        
-                        debug!("[RTSP SPS/PPS] Found embedded NAL in IDR: type={}, length={} bytes", inner_nal_type, nal_unit.len());
-                        
+
+                        debug!(
+                            "[RTSP SPS/PPS] Found embedded NAL in IDR: type={}, length={} bytes",
+                            inner_nal_type,
+                            nal_unit.len()
+                        );
+
                         match inner_nal_type {
                             7 if sps.is_none() => {
                                 info!("[RTSP SPS/PPS] Found SPS embedded in IDR frame: {} bytes, NRI={}", 
                                       nal_unit.len(), inner_nri);
-                                debug!("[RTSP SPS/PPS] SPS first 16 bytes: {:02X?}", &nal_unit[..std::cmp::min(16, nal_unit.len())]);
+                                debug!(
+                                    "[RTSP SPS/PPS] SPS first 16 bytes: {:02X?}",
+                                    &nal_unit[..std::cmp::min(16, nal_unit.len())]
+                                );
                                 sps = Some(nal_unit.to_vec());
-                            },
+                            }
                             8 if pps.is_none() => {
                                 info!("[RTSP SPS/PPS] Found PPS embedded in IDR frame: {} bytes, NRI={}", 
                                       nal_unit.len(), inner_nri);
-                                debug!("[RTSP SPS/PPS] PPS first 16 bytes: {:02X?}", &nal_unit[..std::cmp::min(16, nal_unit.len())]);
+                                debug!(
+                                    "[RTSP SPS/PPS] PPS first 16 bytes: {:02X?}",
+                                    &nal_unit[..std::cmp::min(16, nal_unit.len())]
+                                );
                                 pps = Some(nal_unit.to_vec());
-                            },
+                            }
                             _ => {}
                         }
-                        
+
                         offset = next_offset;
                         continue;
                     }
                 }
                 // Check for 4-byte start code (0x00000001)
-                else if payload[offset] == 0x00 && payload[offset + 1] == 0x00 && 
-                        payload[offset + 2] == 0x00 && payload[offset + 3] == 0x01 {
+                else if payload[offset] == 0x00
+                    && payload[offset + 1] == 0x00
+                    && payload[offset + 2] == 0x00
+                    && payload[offset + 3] == 0x01
+                {
                     let start_code_len = 4;
                     let nal_start = offset + start_code_len;
-                    
+
                     if nal_start < payload.len() {
                         let inner_nal_type = payload[nal_start] & 0x1F;
                         let inner_nri = (payload[nal_start] >> 5) & 0x03;
-                        
+
                         let mut next_offset = nal_start + 1;
                         while next_offset < payload.len() - 4 {
                             if payload[next_offset] == 0x00 && payload[next_offset + 1] == 0x00 {
                                 if payload[next_offset + 2] == 0x01 {
                                     break;
-                                } else if payload[next_offset + 2] == 0x00 && payload[next_offset + 3] == 0x01 {
+                                } else if payload[next_offset + 2] == 0x00
+                                    && payload[next_offset + 3] == 0x01
+                                {
                                     next_offset += 1;
                                     break;
                                 }
                             }
                             next_offset += 1;
                         }
-                        
+
                         let nal_unit = &payload[nal_start..next_offset];
-                        
+
                         debug!("[RTSP SPS/PPS] Found embedded NAL in IDR (4-byte start code): type={}, length={} bytes", 
                                inner_nal_type, nal_unit.len());
-                        
+
                         match inner_nal_type {
                             7 if sps.is_none() => {
                                 info!("[RTSP SPS/PPS] Found SPS embedded in IDR frame: {} bytes, NRI={}", 
                                       nal_unit.len(), inner_nri);
                                 sps = Some(nal_unit.to_vec());
-                            },
+                            }
                             8 if pps.is_none() => {
                                 info!("[RTSP SPS/PPS] Found PPS embedded in IDR frame: {} bytes, NRI={}", 
                                       nal_unit.len(), inner_nri);
                                 pps = Some(nal_unit.to_vec());
-                            },
+                            }
                             _ => {}
                         }
-                        
+
                         offset = next_offset;
                         continue;
                     }
                 }
-                
+
                 offset += 1;
             }
         }
         // Single NAL unit (non-FU-A, non-STAP-A, non-IDR with embedded)
         else if payload.len() >= 2 {
-            info!("[RTSP SPS/PPS] Single NAL unit detected: length={} bytes, nal_type={}, NRI={}", 
-                  payload.len(), nal_type, nri);
-            
+            info!(
+                "[RTSP SPS/PPS] Single NAL unit detected: length={} bytes, nal_type={}, NRI={}",
+                payload.len(),
+                nal_type,
+                nri
+            );
+
             match nal_type {
                 7 if sps.is_none() => {
-                    info!("[RTSP SPS/PPS] Found SPS in single NAL unit: {} bytes, NRI={}", 
-                          payload.len(), nri);
-                    debug!("[RTSP SPS/PPS] SPS first 16 bytes: {:02X?}", &payload[..std::cmp::min(16, payload.len())]);
+                    info!(
+                        "[RTSP SPS/PPS] Found SPS in single NAL unit: {} bytes, NRI={}",
+                        payload.len(),
+                        nri
+                    );
+                    debug!(
+                        "[RTSP SPS/PPS] SPS first 16 bytes: {:02X?}",
+                        &payload[..std::cmp::min(16, payload.len())]
+                    );
                     sps = Some(payload.to_vec());
-                },
+                }
                 8 if pps.is_none() => {
-                    info!("[RTSP SPS/PPS] Found PPS in single NAL unit: {} bytes, NRI={}", 
-                          payload.len(), nri);
-                    debug!("[RTSP SPS/PPS] PPS first 16 bytes: {:02X?}", &payload[..std::cmp::min(16, payload.len())]);
+                    info!(
+                        "[RTSP SPS/PPS] Found PPS in single NAL unit: {} bytes, NRI={}",
+                        payload.len(),
+                        nri
+                    );
+                    debug!(
+                        "[RTSP SPS/PPS] PPS first 16 bytes: {:02X?}",
+                        &payload[..std::cmp::min(16, payload.len())]
+                    );
                     pps = Some(payload.to_vec());
-                },
+                }
                 5 => {
-                    info!("[RTSP SPS/PPS] Found IDR frame (nal_type=5), length={} bytes", payload.len());
-                },
+                    info!(
+                        "[RTSP SPS/PPS] Found IDR frame (nal_type=5), length={} bytes",
+                        payload.len()
+                    );
+                }
                 1 => {
-                    debug!("[RTSP SPS/PPS] Found non-IDR frame (nal_type=1), length={} bytes", payload.len());
-                },
+                    debug!(
+                        "[RTSP SPS/PPS] Found non-IDR frame (nal_type=1), length={} bytes",
+                        payload.len()
+                    );
+                }
                 6 => {
-                    debug!("[RTSP SPS/PPS] Found SEI frame (nal_type=6), length={} bytes", payload.len());
-                },
+                    debug!(
+                        "[RTSP SPS/PPS] Found SEI frame (nal_type=6), length={} bytes",
+                        payload.len()
+                    );
+                }
                 _ => {
                     info!("[RTSP SPS/PPS] Found unknown NAL type {} in single NAL unit, length={} bytes", nal_type, payload.len());
                 }
             }
         } else {
-            debug!("[RTSP SPS/PPS] Payload too short ({}) bytes, cannot determine NAL type", payload.len());
+            debug!(
+                "[RTSP SPS/PPS] Payload too short ({}) bytes, cannot determine NAL type",
+                payload.len()
+            );
         }
 
-        debug!("[RTSP SPS/PPS] Extraction result: SPS={}, PPS={}", sps.is_some(), pps.is_some());
+        debug!(
+            "[RTSP SPS/PPS] Extraction result: SPS={}, PPS={}",
+            sps.is_some(),
+            pps.is_some()
+        );
         (sps, pps)
     }
 
@@ -702,7 +820,11 @@ impl RtspServerSession {
         }
     }
 
-    async fn process_request(&mut self, request_data: &BytesMut, request_count: usize) -> Result<()> {
+    async fn process_request(
+        &mut self,
+        request_data: &BytesMut,
+        request_count: usize,
+    ) -> Result<()> {
         let request = String::from_utf8_lossy(request_data).to_string();
 
         let cseq = request
@@ -712,8 +834,15 @@ impl RtspServerSession {
             .map(|s| s.trim())
             .unwrap_or("0");
 
-        debug!("[RTSP] [{}] Request #{}, cseq={}", self.peer_addr, request_count, cseq);
-        debug!("[RTSP] [{}] Received request:\n{}", self.peer_addr, format_rtsp_message(&request));
+        debug!(
+            "[RTSP] [{}] Request #{}, cseq={}",
+            self.peer_addr, request_count, cseq
+        );
+        debug!(
+            "[RTSP] [{}] Received request:\n{}",
+            self.peer_addr,
+            format_rtsp_message(&request)
+        );
 
         let method = request
             .lines()
@@ -759,9 +888,15 @@ impl RtspServerSession {
         )
         .await?;
 
-        info!("[RTSP] [{}] Response #{}, length={}", self.peer_addr, request_count, response.len());
-        
-        let parsed_response = RtspResponse::parse(&response).unwrap_or_else(|| RtspResponse::new(500, "Internal Server Error").with_cseq("0"));
+        info!(
+            "[RTSP] [{}] Response #{}, length={}",
+            self.peer_addr,
+            request_count,
+            response.len()
+        );
+
+        let parsed_response = RtspResponse::parse(&response)
+            .unwrap_or_else(|| RtspResponse::new(500, "Internal Server Error").with_cseq("0"));
         self.send_response(&parsed_response).await?;
 
         if method == "RECORD" && self.session.transport_mode == TransportMode::Udp {
@@ -807,10 +942,14 @@ impl RtspServerSession {
             if let Some(mut reader) =
                 manager.dispatch_subscribe(&stream_id, DispatchPolicy::LiveCoalesce)
             {
-                info!("[RTSP] [{}] Successfully subscribed to stream hub", stream_id);
+                info!(
+                    "[RTSP] [{}] Successfully subscribed to stream hub",
+                    stream_id
+                );
 
                 let mut frame_count: u64 = 0;
-                let mut rtp_seq: std::collections::HashMap<u8, u16> = std::collections::HashMap::new();
+                let mut rtp_seq: std::collections::HashMap<u8, u16> =
+                    std::collections::HashMap::new();
                 let mut timelines: std::collections::HashMap<u8, PlayRtpTimeline> =
                     std::collections::HashMap::new();
                 let mut pending: Option<MediaFrame> =
@@ -827,9 +966,7 @@ impl RtspServerSession {
                         }
                     };
 
-                    if await_video_idr
-                        && matches!(frame.codec, CodecType::H264 | CodecType::H265)
-                    {
+                    if await_video_idr && matches!(frame.codec, CodecType::H264 | CodecType::H265) {
                         if !is_idr(&frame) {
                             continue;
                         }
@@ -924,38 +1061,47 @@ impl RtspServerSession {
     pub fn build_sdp_with_codec_params(&self, stream_id: &str) -> String {
         let sps = self.sps_cache.read();
         let pps = self.pps_cache.read();
-        
-        let mut sdp = format!("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=MediaServer Session: {}\r\nt=0 0\r\n", stream_id);
-        
+
+        let mut sdp = format!(
+            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=MediaServer Session: {}\r\nt=0 0\r\n",
+            stream_id
+        );
+
         // Video track (H264)
         sdp.push_str("m=video 0 RTP/AVP 96\r\n");
         sdp.push_str("c=IN IP4 0.0.0.0\r\n");
         sdp.push_str("a=rtpmap:96 H264/90000\r\n");
         sdp.push_str("a=control:trackID=0\r\n");
-        
+
         if let (Some(sps_data), Some(pps_data)) = (sps.as_ref(), pps.as_ref()) {
             // Base64 encode SPS and PPS
             use base64::Engine;
             let sps_b64 = base64::engine::general_purpose::STANDARD.encode(sps_data);
             let pps_b64 = base64::engine::general_purpose::STANDARD.encode(pps_data);
-            
+
             // Extract profile-level-id from SPS (bytes 1-3)
             let profile_level_id = if sps_data.len() >= 4 {
                 format!("{:02X}{:02X}{:02X}", sps_data[1], sps_data[2], sps_data[3])
             } else {
                 "42E01F".to_string()
             };
-            
-            sdp.push_str(&format!("a=fmtp:96 packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}\r\n", 
-                profile_level_id, sps_b64, pps_b64));
-            
-            info!("[RTSP] Generated dynamic SDP with SPS ({}) and PPS ({})", sps_data.len(), pps_data.len());
+
+            sdp.push_str(&format!(
+                "a=fmtp:96 packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}\r\n",
+                profile_level_id, sps_b64, pps_b64
+            ));
+
+            info!(
+                "[RTSP] Generated dynamic SDP with SPS ({}) and PPS ({})",
+                sps_data.len(),
+                pps_data.len()
+            );
         } else {
             // Fallback to default values
             sdp.push_str("a=fmtp:96 packetization-mode=1;profile-level-id=42E01F;sprop-parameter-sets=Z0LAHukBQBbsAAADAAQAAAMABAAAAwHNgYI=\r\n");
             info!("[RTSP] Using default SDP (SPS/PPS not yet received)");
         }
-        
+
         // Audio track (AAC)
         sdp.push_str("m=audio 0 RTP/AVP 97\r\n");
         sdp.push_str("c=IN IP4 0.0.0.0\r\n");
@@ -963,7 +1109,7 @@ impl RtspServerSession {
         sdp.push_str("a=rtpmap:97 mpeg4-generic/44100/2\r\n");
         sdp.push_str("a=control:trackID=1\r\n");
         sdp.push_str("a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3\r\n");
-        
+
         sdp
     }
 

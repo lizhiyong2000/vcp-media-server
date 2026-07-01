@@ -19,16 +19,19 @@ fn map() -> &'static Mutex<HashMap<String, Entry>> {
 
 /// Register the publish client's signaling channel for a stream.
 pub fn register_publish_signaling(stream_id: &str, tx: mpsc::UnboundedSender<ServerSignal>) {
-    map().lock().insert(
-        stream_id.to_string(),
-        Entry { tx },
+    map().lock().insert(stream_id.to_string(), Entry { tx });
+    info!(
+        "[WebRTC] Registered publish signaling stream='{}'",
+        stream_id
     );
-    info!("[WebRTC] Registered publish signaling stream='{}'", stream_id);
 }
 
 pub fn unregister_publish_signaling(stream_id: &str) {
     if map().lock().remove(stream_id).is_some() {
-        info!("[WebRTC] Unregistered publish signaling stream='{}'", stream_id);
+        info!(
+            "[WebRTC] Unregistered publish signaling stream='{}'",
+            stream_id
+        );
     }
 }
 
@@ -49,7 +52,10 @@ pub fn request_publisher_keyframe(stream_id: &str) -> bool {
         );
         true
     } else {
-        warn!("[WebRTC] Failed to forward need_keyframe stream='{}'", stream_id);
+        warn!(
+            "[WebRTC] Failed to forward need_keyframe stream='{}'",
+            stream_id
+        );
         false
     }
 }

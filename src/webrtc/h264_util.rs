@@ -1,5 +1,4 @@
 /// Annex B H264 helpers shared by WebRTC publish/play paths.
-
 use std::time::Duration;
 
 const RTP_CLOCK_HZ: f64 = 90000.0;
@@ -174,9 +173,9 @@ pub fn is_parameter_set_only(data: &[u8]) -> bool {
     if ranges.is_empty() {
         return false;
     }
-    ranges.iter().all(|(start, _)| {
-        matches!(nalu_type(data, *start), Some(7) | Some(8) | Some(9))
-    })
+    ranges
+        .iter()
+        .all(|(start, _)| matches!(nalu_type(data, *start), Some(7) | Some(8) | Some(9)))
 }
 
 pub fn is_keyframe_annex_b(data: &[u8]) -> bool {
@@ -231,12 +230,7 @@ pub fn describe_annex_b(data: &[u8]) -> String {
         if let Some(t) = first_nalu_type(data) {
             let idx = first_nalu_header_offset(data).unwrap_or(0);
             let header = data.get(idx).copied().unwrap_or(0);
-            format!(
-                "{}(0x{:02x},{}B)",
-                nalu_type_name(t),
-                header,
-                data.len()
-            )
+            format!("{}(0x{:02x},{}B)", nalu_type_name(t), header, data.len())
         } else {
             format!("raw:{}B", data.len())
         }
@@ -276,7 +270,11 @@ mod tests {
     #[test]
     fn stap_a_sps_pps_idr() {
         let mut buf = Vec::new();
-        for (header, body) in [(0x67u8, vec![0x42u8; 10]), (0x68, vec![0xCEu8; 4]), (0x65, vec![0x88u8; 20])] {
+        for (header, body) in [
+            (0x67u8, vec![0x42u8; 10]),
+            (0x68, vec![0xCEu8; 4]),
+            (0x65, vec![0x88u8; 20]),
+        ] {
             buf.extend_from_slice(&[0, 0, 0, 1]);
             buf.push(header);
             buf.extend(body);

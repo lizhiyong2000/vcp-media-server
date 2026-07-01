@@ -123,9 +123,7 @@ impl FrameRing {
     pub fn snap(&self, mode: SnapMode) -> u64 {
         match mode {
             SnapMode::LiveEdge => self.latest_seq(),
-            SnapMode::LatestIdr => self
-                .latest_idr_seq()
-                .unwrap_or_else(|| self.latest_seq()),
+            SnapMode::LatestIdr => self.latest_idr_seq().unwrap_or_else(|| self.latest_seq()),
         }
     }
 

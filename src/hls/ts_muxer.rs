@@ -173,7 +173,13 @@ impl TsMuxer {
         let crc = crc32(&payload[1..]);
         payload.extend_from_slice(&crc.to_be_bytes());
 
-        ts_packet(PMT_PID, true, &payload, &mut self.continuity_counter_pmt, false)
+        ts_packet(
+            PMT_PID,
+            true,
+            &payload,
+            &mut self.continuity_counter_pmt,
+            false,
+        )
     }
 
     /// Generate PAT + PMT as a combined buffer
@@ -227,6 +233,11 @@ impl TsMuxer {
     /// Update PCR clock
     pub fn update_pcr(&mut self, timestamp_ms: u64) {
         self.pcr_clock = timestamp_ms * 27000; // Convert ms to 27MHz
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pcr_clock_27mhz(&self) -> u64 {
+        self.pcr_clock
     }
 }
 
@@ -511,8 +522,8 @@ fn wrap_aac_adts(aac_raw: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::core::{CodecType, MediaFrame};
+    use bytes::Bytes;
 
     #[test]
     fn pes_timestamp_encoding_90khz() {
@@ -561,5 +572,20 @@ mod tests {
         assert!(pkts.len() >= TS_PACKET_SIZE * 2);
         assert_eq!(pkts[3] & 0x0F, 0);
         assert_eq!(pkts[TS_PACKET_SIZE + 3] & 0x0F, 1);
+    }
+
+    #[test]
+    fn reset_for_new_segment_preserves_pcr_timeline() {
+        let mut muxer = TsMuxer::new();
+        muxer.update_pcr(5000);
+        let pcr_before = muxer.pcr_clock_27mhz();
+        muxer.reset_for_new_segment();
+        assert_eq!(
+            muxer.pcr_clock_27mhz(),
+            pcr_before,
+            "PCR must not reset to 0 on segment split (avoids DTS out-of-order)"
+        );
+        muxer.update_pcr(5040);
+        assert_eq!(muxer.pcr_clock_27mhz(), 5040 * 27000);
     }
 }
