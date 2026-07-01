@@ -2,23 +2,27 @@ mod config;
 mod tester;
 mod pusher;
 mod timestamp;
-mod broadcast_edge;
+mod frame_ring;
+mod stream_hub;
+pub mod dispatch;
 pub mod protocol;
 
-pub use broadcast_edge::{drain_broadcast_lag, is_playable_video, recv_coalesced_video, recv_flv_batch};
+pub use frame_ring::{FrameRing, SnapMode, is_playable_video, is_video_keyframe};
+pub use stream_hub::StreamHub;
+pub use dispatch::{DispatchPolicy, DispatchReader, DispatchError, coalesce_flv_batch};
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use parking_lot::RwLock;
 use bytes::Bytes;
-use tokio::sync::broadcast;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, debug};
 use anyhow::Result;
 
 pub use config::{Config, RtmpConfig, RtspConfig, WebrtcConfig, HttpConfig, StreamConfig, TrackConfig};
 pub use tester::StreamTester;
 pub use pusher::*;
 pub use protocol::{ProtocolType, ProtocolInfo, ProtocolRegistry, StreamSink};
-pub use timestamp::{flv_timestamp_ms, media_timestamp_delta_ms};
+pub use timestamp::{flv_timestamp_ms, media_timestamp_delta_ms, FlvPlayTimeline};
 
 pub type StreamId = String;
 pub type TrackId = u8;
@@ -35,11 +39,6 @@ pub struct Stream {
     // Codec parameters extracted from RTP stream
     pub sps: Option<Vec<u8>>,
     pub pps: Option<Vec<u8>>,
-    /// Most recent keyframe (Annex B), for late WebRTC play subscribers.
-    pub last_keyframe: Option<Vec<u8>>,
-    pub last_keyframe_ts: Option<u64>,
-    /// Frames since the last keyframe (inclusive), for late WebRTC play join.
-    pub gop_frames: Vec<MediaFrame>,
 }
 
 impl Stream {
@@ -54,8 +53,8 @@ pub enum StreamStatus {
     Unpublished,
     Publishing,
     Paused,
-    Error(String),
     Stopped,
+    Error(String),
 }
 
 impl StreamStatus {
@@ -354,7 +353,7 @@ pub struct RtpPacket {
 
 pub struct StreamManager {
     streams: RwLock<HashMap<StreamId, Stream>>,
-    channels: RwLock<HashMap<StreamId, broadcast::Sender<MediaFrame>>>,
+    hubs: RwLock<HashMap<StreamId, Arc<StreamHub>>>,
     receivers: RwLock<HashMap<ReceiverId, StreamReceiver>>,
 }
 
@@ -362,7 +361,7 @@ impl StreamManager {
     pub fn new() -> Self {
         Self {
             streams: RwLock::new(HashMap::new()),
-            channels: RwLock::new(HashMap::new()),
+            hubs: RwLock::new(HashMap::new()),
             receivers: RwLock::new(HashMap::new()),
         }
     }
@@ -387,9 +386,6 @@ impl StreamManager {
             pull_url,
             sps: None,
             pps: None,
-            last_keyframe: None,
-            last_keyframe_ts: None,
-            gop_frames: Vec::new(),
         };
 
         // Create broadcast channel for this stream
@@ -458,48 +454,49 @@ impl StreamManager {
         }
     }
 
-    pub fn ensure_stream_broadcast(&self, stream_id: &str) {
-        if self.channels.read().contains_key(stream_id) {
-            debug!("[Core] Broadcast channel already exists for stream '{}'", stream_id);
+    pub fn ensure_stream_hub(&self, stream_id: &str) {
+        if self.hubs.read().contains_key(stream_id) {
+            debug!("[Core] StreamHub already exists for stream '{}'", stream_id);
             return;
         }
-        self.set_stream_broadcast(stream_id);
+        self.set_stream_hub(stream_id);
     }
 
-    pub fn set_stream_broadcast(&self, stream_id: &str) {
-        let mut streams = self.streams.write();
-        if let Some(stream) = streams.get_mut(stream_id) {
-            let replacing = {
-                let channels = self.channels.read();
-                channels.contains_key(stream_id)
-            };
-            if replacing {
-                warn!(
-                    "[Core] Replacing broadcast channel for stream '{}' (existing subscribers will stop receiving)",
-                    stream_id
-                );
-            }
-            let (tx, _rx) = broadcast::channel(2048);
+    /// Back-compat alias.
+    pub fn ensure_stream_broadcast(&self, stream_id: &str) {
+        self.ensure_stream_hub(stream_id);
+    }
 
-            {
-                let mut channels = self.channels.write();
-                channels.insert(stream.id.clone(), tx);
-            }
-            info!("[Core] Broadcast channel ready for stream '{}'", stream_id);
+    pub fn set_stream_hub(&self, stream_id: &str) {
+        let streams = self.streams.read();
+        if !streams.contains_key(stream_id) {
+            return;
         }
+        drop(streams);
+
+        let replacing = self.hubs.read().contains_key(stream_id);
+        if replacing {
+            warn!(
+                "[Core] Replacing StreamHub for stream '{}' (existing subscribers should re-subscribe)",
+                stream_id
+            );
+        }
+        let hub = StreamHub::new(stream_id);
+        self.hubs.write().insert(stream_id.to_string(), hub);
+        info!("[Core] StreamHub ready for stream '{}'", stream_id);
+    }
+
+    /// Back-compat alias.
+    pub fn set_stream_broadcast(&self, stream_id: &str) {
+        self.set_stream_hub(stream_id);
+    }
+
+    pub fn get_hub(&self, stream_id: &str) -> Option<Arc<StreamHub>> {
+        self.hubs.read().get(stream_id).cloned()
     }
 
     pub fn remove_stream(&self, stream_id: &StreamId) -> Option<Stream> {
-        {
-            let mut channels = self.channels.write();
-            channels.remove(stream_id);
-        }
-        
-        // {
-        //     let mut receivers = self._receivers.write();
-        //     receivers.remove(stream_id);
-        // }
-
+        self.hubs.write().remove(stream_id);
         let mut streams = self.streams.write();
         streams.remove(stream_id)
     }
@@ -657,99 +654,54 @@ impl StreamManager {
     }
 
     pub fn get_last_keyframe(&self, stream_id: &str) -> Option<(Vec<u8>, u64)> {
-        self.streams.read().get(stream_id).and_then(|s| {
-            Some((s.last_keyframe.clone()?, s.last_keyframe_ts?))
-        })
+        self.get_hub(stream_id)?.latest_idr_bytes()
     }
 
-    /// Snapshot of frames from the last keyframe onward (for WebRTC play catch-up).
-    pub fn get_gop_frames(&self, stream_id: &str) -> Vec<MediaFrame> {
-        self.streams
-            .read()
-            .get(stream_id)
-            .map(|s| s.gop_frames.clone())
-            .unwrap_or_default()
-    }
-
-    /// Recent GOP tail for play catch-up (from last keyframe, capped).
-    /// Returns empty if the tail is too long — caller waits for a fresh IDR instead.
-    pub fn get_recent_gop_for_play(&self, stream_id: &str, max_frames: usize) -> Vec<MediaFrame> {
-        let gop = self.get_gop_frames(stream_id);
-        if gop.is_empty() || max_frames == 0 {
-            return Vec::new();
+    pub fn dispatch_subscribe(
+        &self,
+        stream_id: &str,
+        policy: DispatchPolicy,
+    ) -> Option<DispatchReader> {
+        if self.get_hub(stream_id).is_none() {
+            self.ensure_stream_hub(stream_id);
         }
-        let start = gop
-            .iter()
-            .rposition(|f| f.is_keyframe)
-            .unwrap_or(0);
-        let tail = &gop[start..];
-        if tail.len() <= max_frames {
-            tail.to_vec()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn update_gop_buffer(stream: &mut Stream, frame: &MediaFrame) {
-        if !matches!(frame.codec, CodecType::H264 | CodecType::H265) || frame.track_id != 0 {
-            return;
-        }
-        if frame.is_keyframe {
-            stream.gop_frames.clear();
-        }
-        stream.gop_frames.push(frame.clone());
-        // Never drop frames in the middle of a GOP — that breaks H264 references.
-        // With periodic IDR from the publisher, each GOP stays small.
+        let hub = self.get_hub(stream_id)?;
+        info!("[Core] dispatch_subscribe: stream_id={} policy={:?}", stream_id, policy);
+        Some(DispatchReader::new(hub, policy))
     }
 
     pub fn publish_frame(&self, frame: MediaFrame) {
         let stream_id = frame.stream_id.clone();
-        debug!("[Core] publish_frame: stream_id={}, track_id={}, timestamp={}, is_keyframe={}, codec={}, data_len={}", 
-              stream_id, frame.track_id, frame.timestamp, frame.is_keyframe, frame.codec as u8, frame.data.len());
+        debug!(
+            "[Core] publish_frame: stream_id={}, track_id={}, timestamp={}, is_keyframe={}, codec={}, data_len={}",
+            stream_id,
+            frame.track_id,
+            frame.timestamp,
+            frame.is_keyframe,
+            frame.codec as u8,
+            frame.data.len()
+        );
 
-        {
-            let mut streams = self.streams.write();
-            if let Some(stream) = streams.get_mut(&stream_id) {
-                if frame.is_keyframe && matches!(frame.codec, CodecType::H264 | CodecType::H265) {
-                    stream.last_keyframe = Some(frame.data.to_vec());
-                    stream.last_keyframe_ts = Some(frame.timestamp);
-                    info!(
-                        "[Core] Keyframe stream='{}' ts={} gop_len={}",
-                        stream_id,
-                        frame.timestamp,
-                        stream.gop_frames.len()
-                    );
-                }
-                Self::update_gop_buffer(stream, &frame);
-            }
+        if frame.is_keyframe && matches!(frame.codec, CodecType::H264 | CodecType::H265) {
+            debug!(
+                "[Core] Keyframe stream='{}' ts={}",
+                stream_id, frame.timestamp
+            );
         }
-        
-        let channels = self.channels.read();
-        let tx_option = channels.get(&stream_id).cloned();
-        
-        if let Some(tx) = tx_option {
-            match tx.send(frame) {
-                Ok(lagged) => {
-                    let subscribers = tx.receiver_count();
-                    if subscribers > 0 {
-                        debug!(
-                            "[Core] publish_frame: stream_id={} subscribers={} lagged={}",
-                            stream_id, subscribers, lagged
-                        );
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "[Core] publish_frame: no active receivers stream_id={} ({})",
-                        stream_id, e
-                    );
-                }
-            }
+
+        if let Some(hub) = self.get_hub(&stream_id) {
+            let seq = hub.publish(frame);
+            debug!("[Core] publish_frame: stream_id={} ring_seq={}", stream_id, seq);
         } else {
-            warn!("[Core] publish_frame: No broadcast channel for stream_id={}", stream_id);
+            self.ensure_stream_hub(&stream_id);
+            if let Some(hub) = self.get_hub(&stream_id) {
+                let seq = hub.publish(frame);
+                debug!("[Core] publish_frame: stream_id={} ring_seq={}", stream_id, seq);
+            } else {
+                warn!("[Core] publish_frame: No StreamHub for stream_id={}", stream_id);
+            }
         }
 
-        // Update stream status - transition to Publishing when receiving frames
         let streams_read = self.streams.read();
         if let Some(stream) = streams_read.get(&stream_id) {
             match stream.status {
@@ -764,30 +716,6 @@ impl StreamManager {
                 _ => {}
             }
         }
-    }
-
-    pub fn subscribe(&self, stream_id: &StreamId) -> Option<broadcast::Receiver<MediaFrame>> {
-        let channels = self.channels.read();
-        if let Some(tx) = channels.get(stream_id) {
-            let receivers_before = tx.receiver_count();
-            let rx = tx.subscribe();
-            let receivers_after = tx.receiver_count();
-            info!("[Core] subscribe: stream_id={}, receivers_before={}, receivers_after={}", 
-                  stream_id, receivers_before, receivers_after);
-            return Some(rx)
-        } else {
-            warn!("[Core] subscribe: No broadcast channel found for stream_id={}", stream_id);
-            // Create broadcast channel for this stream
-            let (tx, rx) = broadcast::channel(2048);
-
-            {
-                let mut channels = self.channels.write();
-                channels.insert(stream_id.to_string(), tx);
-            }
-
-            return Some(rx)
-        }
-
     }
 
     pub fn update_stream_status(&self, stream_id: &StreamId, status: StreamStatus) {

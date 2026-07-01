@@ -217,6 +217,8 @@ mod tests {
             },
         ];
         let stream = manager.create_stream("test", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        manager.set_stream_tracks("test", tracks);
+        let stream = manager.get_stream(&"test".to_string()).unwrap();
         assert_eq!(stream.id, "test");
         assert_eq!(stream.tracks.len(), 1);
         assert_eq!(stream.tracks[0].codec, CodecType::H264);
@@ -297,8 +299,9 @@ mod tests {
         ];
         manager.create_stream("test", StreamSourceMode::Push, StreamProtocol::Unknown, None);
 
-        let rx = manager.subscribe(&"test".to_string());
-        assert!(rx.is_some());
+        manager.ensure_stream_hub("test");
+        let reader = manager.dispatch_subscribe("test", crate::core::DispatchPolicy::SequentialFromIdr);
+        assert!(reader.is_some());
     }
 
     #[test]
@@ -622,37 +625,19 @@ mod tests {
     #[test]
     fn test_stream_frame_distribution() {
         use std::sync::Arc;
-        use tokio::sync::broadcast;
 
         let manager = StreamManager::new();
-        let tracks = vec![
-            Track {
-                id: 0,
-                codec: CodecType::H264,
-                payload_type: 96,
-                clock_rate: 90000,
-                extra_params: HashMap::new(),
-            },
-            Track {
-                id: 1,
-                codec: CodecType::AAC,
-                payload_type: 97,
-                clock_rate: 44100,
-                extra_params: HashMap::new(),
-            },
-        ];
         manager.create_stream("test_stream", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        manager.ensure_stream_hub("test_stream");
 
-        // Subscribe multiple consumers (simulating RTSP, RTMP, WebRTC players)
-        let rtsp_rx = manager.subscribe(&"test_stream".to_string());
-        let rtmp_rx = manager.subscribe(&"test_stream".to_string());
-        let webrtc_rx = manager.subscribe(&"test_stream".to_string());
+        let rtsp = manager.dispatch_subscribe("test_stream", crate::core::DispatchPolicy::SequentialFromIdr);
+        let rtmp = manager.dispatch_subscribe("test_stream", crate::core::DispatchPolicy::LiveCoalesce);
+        let webrtc = manager.dispatch_subscribe("test_stream", crate::core::DispatchPolicy::WebRtcPlay);
 
-        assert!(rtsp_rx.is_some());
-        assert!(rtmp_rx.is_some());
-        assert!(webrtc_rx.is_some());
+        assert!(rtsp.is_some());
+        assert!(rtmp.is_some());
+        assert!(webrtc.is_some());
 
-        // Publish a frame
         let frame = MediaFrame::new(
             "test_stream".to_string(),
             0,
@@ -663,8 +648,8 @@ mod tests {
         );
         manager.publish_frame(frame);
 
-        // All subscribers should receive the frame
-        // Note: In real async test, we'd use tokio::runtime
+        let hub = manager.get_hub("test_stream").unwrap();
+        assert_eq!(hub.latest_seq(), 0);
     }
 
     #[test]
@@ -701,6 +686,8 @@ mod tests {
             },
         ];
         let stream = manager.create_stream("multi_codec", StreamSourceMode::Push, StreamProtocol::Unknown, None);
+        manager.set_stream_tracks("multi_codec", tracks);
+        let stream = manager.get_stream(&"multi_codec".to_string()).unwrap();
         assert_eq!(stream.tracks.len(), 4);
         assert_eq!(stream.tracks[0].codec, CodecType::H264);
         assert_eq!(stream.tracks[1].codec, CodecType::H265);

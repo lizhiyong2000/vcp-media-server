@@ -1,14 +1,12 @@
 /// HTTP-FLV streaming module
 /// Delivers live streams via HTTP with FLV container format using chunked transfer encoding.
-use std::collections::HashMap;
 use std::sync::Arc;
 use bytes::{Bytes, BytesMut, BufMut};
 use parking_lot::RwLock;
-use tokio::sync::broadcast;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 
-use crate::core::{StreamManager, MediaFrame, CodecType, media_timestamp_delta_ms};
+use crate::core::{StreamManager, MediaFrame, CodecType, FlvPlayTimeline, DispatchPolicy, DispatchReader};
 use crate::rtmp::session::{frame_to_rtmp_audio, frame_to_rtmp_video};
 
 /// FLV file header (9 bytes)
@@ -183,10 +181,8 @@ pub struct HttpFlvSession {
     header_sent: bool,
     metadata_sent: bool,
     sequence_header_sent: bool,
-    /// Continuous FLV tag timeline from session start (not publisher absolute clock).
-    flv_out_ms: u64,
-    last_raw_video_ts: Option<u64>,
-    session_audio_frames: u64,
+    /// Monotonic FLV tag timeline (mux order).
+    timeline: FlvPlayTimeline,
 }
 
 impl HttpFlvSession {
@@ -196,33 +192,13 @@ impl HttpFlvSession {
             header_sent: false,
             metadata_sent: false,
             sequence_header_sent: false,
-            flv_out_ms: 0,
-            last_raw_video_ts: None,
-            session_audio_frames: 0,
+            timeline: FlvPlayTimeline::default(),
         }
     }
 
     /// Map publisher timestamps to a continuous session-local FLV timeline.
     fn tag_timestamp_ms(&mut self, frame: &MediaFrame) -> u32 {
-        match frame.codec {
-            CodecType::H264 | CodecType::H265 => {
-                if let Some(last) = self.last_raw_video_ts {
-                    if frame.timestamp > last {
-                        let delta = media_timestamp_delta_ms(last, frame.timestamp);
-                        if delta > 0 && delta < 2000 {
-                            self.flv_out_ms += delta;
-                        }
-                    }
-                }
-                self.last_raw_video_ts = Some(frame.timestamp);
-            }
-            CodecType::AAC => {
-                self.flv_out_ms = self.session_audio_frames * 1024 * 1000 / 44100;
-                self.session_audio_frames += 1;
-            }
-            _ => {}
-        }
-        (self.flv_out_ms & 0xFFFF_FFFF) as u32
+        self.timeline.map(frame)
     }
 
     /// Generate the initial HTTP response headers for FLV streaming
@@ -318,8 +294,13 @@ impl HttpFlvServer {
         Some((session, stream))
     }
 
-    /// Subscribe to a stream's broadcast channel
-    pub fn subscribe(&self, stream_id: &str) -> Option<broadcast::Receiver<MediaFrame>> {
-        self.stream_manager.subscribe(&stream_id.to_string())
+    /// Subscribe to a stream via FrameDispatcher
+    pub fn dispatch_subscribe(
+        &self,
+        stream_id: &str,
+        policy: DispatchPolicy,
+    ) -> Option<DispatchReader> {
+        self.stream_manager
+            .dispatch_subscribe(&stream_id.to_string(), policy)
     }
 }

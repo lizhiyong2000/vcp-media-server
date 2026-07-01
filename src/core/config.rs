@@ -92,8 +92,8 @@ impl Default for Config {
             http: HttpConfig { port: 8081 },
             hls: Some(HlsConfig {
                 enabled: true,
-                segment_duration: Some(4.0),
-                max_segments: Some(10),
+                segment_duration: Some(1.0),
+                max_segments: Some(1),
                 output_dir: Some("./hls".to_string()),
             }),
             http_flv: Some(HttpFlvConfig { enabled: true }),

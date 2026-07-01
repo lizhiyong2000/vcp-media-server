@@ -8,16 +8,16 @@ use std::net::SocketAddr;
 use tracing::{info, warn, error, debug};
 use bytes::BytesMut;
 
-use crate::core::{StreamManager, MediaFrame, CodecType};
+use crate::core::{DispatchPolicy, StreamManager, MediaFrame, CodecType};
 use crate::webrtc::H264RtpIngest;
 use super::{RtspRequest, RtspResponse, RtspSession, TransportMode, RtspServer};
 use super::common::{
     format_rtsp_message, extract_transport, extract_track_id, is_udp_transport, RtspCommon,
 };
 use super::play_egress::{
-    egress_rtp_packets, flush_stale_rx, prime_rtsp_play_rx, recv_coalesced_play_frame,
-    PlayRtpTimeline,
+    egress_rtp_packets, is_idr, prime_rtsp_play, recv_coalesced_play_frame, PlayRtpTimeline,
 };
+use crate::core::dispatch::DispatchError;
 
 pub struct RtspServerSession {
     reader: tokio::net::tcp::OwnedReadHalf,
@@ -803,40 +803,38 @@ impl RtspServerSession {
                 stream_id, use_udp, rtp_ssrc
             );
 
-            manager.ensure_stream_broadcast(&stream_id);
-            if let Some(mut rx) = manager.subscribe(&stream_id) {
-                info!("[RTSP] [{}] Successfully subscribed to stream channel", stream_id);
+            manager.ensure_stream_hub(&stream_id);
+            if let Some(mut reader) =
+                manager.dispatch_subscribe(&stream_id, DispatchPolicy::LiveCoalesce)
+            {
+                info!("[RTSP] [{}] Successfully subscribed to stream hub", stream_id);
 
                 let mut frame_count: u64 = 0;
                 let mut rtp_seq: std::collections::HashMap<u8, u16> = std::collections::HashMap::new();
                 let mut timelines: std::collections::HashMap<u8, PlayRtpTimeline> =
                     std::collections::HashMap::new();
                 let mut pending: Option<MediaFrame> =
-                    prime_rtsp_play_rx(&mut rx, &manager, &stream_id).await;
+                    prime_rtsp_play(&mut reader, &manager, &stream_id).await;
+                let mut await_video_idr = pending.is_none();
 
                 'rtp: loop {
                     let frame = if let Some(f) = pending.take() {
                         f
                     } else {
-                        match recv_coalesced_play_frame(&mut rx).await {
+                        match recv_coalesced_play_frame(&mut reader).await {
                             Ok(f) => f,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                info!(
-                                    "[RTSP] [{}] PLAY lagged {} frames — jump to live",
-                                    stream_id, n
-                                );
-                                flush_stale_rx(&mut rx, &manager, &stream_id);
-                                timelines.clear();
-                                if let Some(idr) =
-                                    prime_rtsp_play_rx(&mut rx, &manager, &stream_id).await
-                                {
-                                    pending = Some(idr);
-                                }
-                                continue;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break 'rtp,
+                            Err(DispatchError::Closed) => break 'rtp,
                         }
                     };
+
+                    if await_video_idr
+                        && matches!(frame.codec, CodecType::H264 | CodecType::H265)
+                    {
+                        if !is_idr(&frame) {
+                            continue;
+                        }
+                        await_video_idr = false;
+                    }
 
                     frame_count += 1;
                     let seq = rtp_seq.entry(frame.track_id).or_insert(0);

@@ -12,8 +12,8 @@ port = 8081
 
 [hls]
 enabled = true
-segment_duration = 2
-max_segments = 10
+segment_duration = 1
+max_segments = 1
 output_dir = "./hls"
 
 [http_flv]

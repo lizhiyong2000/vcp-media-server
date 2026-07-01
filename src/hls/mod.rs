@@ -6,19 +6,28 @@ pub mod ts_muxer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use parking_lot::RwLock;
 use tokio::fs;
 use tracing::{info, warn, error, debug};
 use anyhow::Result;
 
-use crate::core::{StreamManager, MediaFrame, CodecType, drain_broadcast_lag};
+use crate::core::{StreamManager, MediaFrame, CodecType, DispatchPolicy};
+use crate::core::dispatch::DispatchError;
 use crate::webrtc::{annex_b_with_config, request_publisher_keyframe, h264_util::is_keyframe_annex_b};
 use self::m3u8::M3u8Generator;
 use self::ts_muxer::TsMuxer;
 
+/// First live segment: commit on keyframe after this many seconds (wall clock).
+const FIRST_SEGMENT_WALL_SECS: f64 = 0.35;
+/// Minimum completed segment media duration for EXTINF.
+const MIN_SEGMENT_DURATION: f64 = 0.25;
+/// Split when mux or publisher span reaches this fraction of target (25fps GOP ≈ 960ms).
+const SPLIT_THRESHOLD_RATIO: f64 = 0.85;
 /// PAT/PMT only; segments smaller than this are not committed.
 const MIN_SEGMENT_BYTES: usize = 512;
+/// Fallback video step when publisher timestamps stall or jump backward (25 fps).
+const MIN_VIDEO_MUX_STEP_MS: u64 = 40;
 
 fn is_hls_video_keyframe(frame: &MediaFrame) -> bool {
     matches!(frame.codec, CodecType::H264 | CodecType::H265)
@@ -38,8 +47,8 @@ impl Default for HlsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            segment_duration: 2.0,
-            max_segments: 10,
+            segment_duration: 1.0,
+            max_segments: 1,
             output_dir: "./hls".to_string(),
         }
     }
@@ -60,14 +69,32 @@ struct HlsSession {
     active: bool,
     /// Drop video until the first keyframe (late HLS join)
     primed: bool,
-    /// Session-wide video mux timeline (ms), never reset at segment splits
-    session_video_mux_ms: u64,
-    /// Last raw RTMP video timestamp used for delta accumulation
-    last_raw_video_ts: Option<u64>,
     /// Session-wide AAC frame count for continuous audio PTS
     session_audio_frames: u64,
     /// Last raw video timestamp for segment duration (ms)
     last_video_timestamp: u64,
+    /// Session-continuous video mux timeline (ms) in TS — matches ffmpeg HLS first_timestamp.
+    session_video_mux_ms: u64,
+    /// Session-continuous AAC frame index
+    session_audio_mux_frames: u64,
+    /// Last publisher video timestamp (session-wide)
+    session_last_raw_video: u64,
+    /// Session mux ms when the open segment started
+    segment_open_mux_ms: u64,
+    /// Session mux ms after the last frame in the open segment
+    segment_last_mux_ms: u64,
+    /// Wall-clock anchor for the segment currently being muxed
+    segment_wall_start: Option<Instant>,
+    /// Session mux ms when the open segment started (for EXTINF at split).
+    segment_open_mux_ms_at_split: u64,
+    /// Last video keyframe mux ms in the open segment (for proactive IDR request).
+    segment_last_idr_mux_ms: u64,
+    /// Wall-clock anchor for session mux PTS (matches PDT; avoids publisher ts drift).
+    wall_anchor: Option<Instant>,
+    /// PDT epoch: first segment start maps to mux ms 0.
+    session_pdt_anchor: Option<SystemTime>,
+    /// Emit #EXT-X-DISCONTINUITY on the next committed segment (lag snap)
+    pending_discontinuity: bool,
 }
 
 /// A completed TS segment ready to write to disk.
@@ -76,6 +103,8 @@ struct CompletedSegment {
     filename: String,
     duration: f64,
     seq: u64,
+    pdt: SystemTime,
+    discontinuity: bool,
 }
 
 impl HlsSession {
@@ -97,48 +126,121 @@ impl HlsSession {
             output_dir,
             active: true,
             primed: false,
-            session_video_mux_ms: 0,
-            last_raw_video_ts: None,
             session_audio_frames: 0,
             last_video_timestamp: 0,
+            session_video_mux_ms: 0,
+            session_audio_mux_frames: 0,
+            session_last_raw_video: 0,
+            segment_open_mux_ms: 0,
+            segment_last_mux_ms: 0,
+            segment_open_mux_ms_at_split: 0,
+            segment_last_idr_mux_ms: 0,
+            segment_wall_start: None,
+            wall_anchor: None,
+            session_pdt_anchor: None,
+            pending_discontinuity: false,
         })
     }
 
-    /// Discard partial segment after falling behind; wait for next IDR to re-prime.
+    /// Discard partial segment after falling behind; keep timeline + CC continuous.
     fn recover_from_lag(&mut self) {
         self.segment_buffer.clear();
         self.segment_duration_acc = 0.0;
         self.last_video_timestamp = 0;
-        self.primed = false;
-        self.begin_new_segment();
+        self.segment_open_mux_ms = self.session_video_mux_ms;
+        self.segment_last_mux_ms = self.session_video_mux_ms;
+        self.segment_open_mux_ms_at_split = self.session_video_mux_ms;
+        self.segment_last_idr_mux_ms = 0;
+        self.segment_wall_start = None;
+        self.pending_discontinuity = true;
     }
 
-    /// Reset muxer and per-segment bookkeeping for a new TS file.
+    fn segment_mux_secs(&self) -> f64 {
+        self.segment_last_mux_ms
+            .saturating_sub(self.segment_open_mux_ms_at_split.max(self.segment_open_mux_ms))
+            as f64
+            / 1000.0
+    }
+
+    /// Closed segment EXTINF from mux PTS span (must match TS payload).
+    fn closed_segment_secs(&self) -> f64 {
+        let span_ms = self
+            .segment_last_mux_ms
+            .saturating_sub(self.segment_open_mux_ms_at_split);
+        (span_ms as f64 / 1000.0).max(MIN_SEGMENT_DURATION)
+    }
+
+    /// New TS file; session PTS/CC continue (ffmpeg treats segments as one timeline).
     fn begin_new_segment(&mut self) {
         self.segment_duration_acc = 0.0;
+        self.last_video_timestamp = 0;
+        self.segment_open_mux_ms = self.session_video_mux_ms;
+        self.segment_open_mux_ms_at_split = self.session_video_mux_ms;
+        self.segment_last_idr_mux_ms = 0;
+        self.segment_wall_start = None;
         self.muxer.reset_for_new_segment();
     }
 
+    /// PDT = live edge (wall now − duration); pairs with accurate EXTINF + session PTS.
+    fn live_pdt(duration: f64) -> SystemTime {
+        SystemTime::now()
+            .checked_sub(Duration::from_secs_f64(duration.max(0.0)))
+            .unwrap_or_else(SystemTime::now)
+    }
+
+    fn ensure_wall_timeline(&mut self) {
+        if self.wall_anchor.is_none() {
+            self.wall_anchor = Some(Instant::now());
+            self.session_pdt_anchor = Some(SystemTime::now());
+        }
+    }
+
+    fn segment_wall_secs(&self) -> f64 {
+        self.segment_wall_start
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
     fn mux_timestamp_ms(&mut self, frame: &MediaFrame) -> u64 {
+        self.ensure_wall_timeline();
         match frame.codec {
             CodecType::AAC => {
-                let pts = self.session_audio_frames * 1024 * 1000 / 44100;
-                self.session_audio_frames += 1;
-                pts
+                let pts = self.session_audio_mux_frames * 1024 * 1000 / 44100;
+                self.session_audio_mux_frames += 1;
+                // Keep audio from running ahead of video.
+                pts.min(self.session_video_mux_ms.saturating_add(100))
             }
             CodecType::H264 | CodecType::H265 => {
-                if let Some(last) = self.last_raw_video_ts {
-                    if frame.timestamp > last {
-                        let delta_ms = crate::core::media_timestamp_delta_ms(last, frame.timestamp);
-                        if delta_ms > 0 && delta_ms < 2000 {
-                            self.session_video_mux_ms += delta_ms;
-                        }
+                let step = if self.session_last_raw_video > 0
+                    && frame.timestamp > self.session_last_raw_video
+                {
+                    let delta = crate::core::media_timestamp_delta_ms(
+                        self.session_last_raw_video,
+                        frame.timestamp,
+                    );
+                    if delta > 0 && delta < 500 {
+                        delta
+                    } else {
+                        MIN_VIDEO_MUX_STEP_MS
                     }
-                }
-                self.last_raw_video_ts = Some(frame.timestamp);
+                } else if self.session_video_mux_ms == 0 {
+                    0
+                } else {
+                    MIN_VIDEO_MUX_STEP_MS
+                };
+                self.session_last_raw_video = frame.timestamp;
+                self.session_video_mux_ms = if self.session_video_mux_ms == 0 && step == 0 {
+                    0
+                } else {
+                    self.session_video_mux_ms.saturating_add(if step == 0 {
+                        MIN_VIDEO_MUX_STEP_MS
+                    } else {
+                        step
+                    })
+                };
                 self.session_video_mux_ms
             }
-            _ => frame.timestamp,
+            _ => 0,
         }
     }
 
@@ -169,6 +271,9 @@ impl HlsSession {
         if frame.codec == CodecType::AAC && frame.data.len() < 8 {
             return Ok(None);
         }
+        if frame.codec == CodecType::AAC {
+            self.session_audio_frames += 1;
+        }
 
         if !self.primed {
             if !is_hls_video_keyframe(frame) {
@@ -180,6 +285,9 @@ impl HlsSession {
 
         // Initialize segment with PAT/PMT
         if self.segment_buffer.is_empty() {
+            self.segment_wall_start = Some(Instant::now());
+            self.segment_open_mux_ms = self.session_video_mux_ms;
+            self.segment_open_mux_ms_at_split = self.session_video_mux_ms;
             let has_audio =
                 self.session_audio_frames > 0 || frame.codec == CodecType::AAC;
             let pat_pmt = self.muxer.generate_pat_pmt(true, has_audio);
@@ -198,41 +306,98 @@ impl HlsSession {
             self.last_video_timestamp = frame.timestamp;
         }
 
-        // First segment uses a shorter threshold for faster startup
+        let mux_secs = self.segment_mux_secs();
+
+        // First segment commits quickly; later segments use configured target duration.
         let split_threshold = if self.playlist.segment_count() == 0 {
-            (self.playlist.target_duration() * 0.5).clamp(1.0, 2.0)
+            FIRST_SEGMENT_WALL_SECS
         } else {
             self.playlist.target_duration()
         };
 
+        // Ask publisher for IDR before we hit the segment cap (RTSP push may ignore).
+        if matches!(frame.codec, CodecType::H264 | CodecType::H265)
+            && !is_hls_video_keyframe(frame)
+            && mux_secs >= split_threshold * 0.85
+            && self.segment_last_idr_mux_ms <= self.segment_open_mux_ms_at_split
+            && self.segment_buffer.len() > MIN_SEGMENT_BYTES
+        {
+            request_publisher_keyframe(&self.stream_id);
+        }
+
+        let ready_by_time = mux_secs >= split_threshold * SPLIT_THRESHOLD_RATIO
+            || self.segment_duration_acc >= split_threshold * SPLIT_THRESHOLD_RATIO;
+        let force_on_long_gop = is_hls_video_keyframe(frame)
+            && (mux_secs >= split_threshold * 1.5
+                || self.segment_duration_acc >= split_threshold * 1.5)
+            && self.segment_buffer.len() > MIN_SEGMENT_BYTES;
+
+        let has_muxed_media =
+            self.segment_last_mux_ms > self.segment_open_mux_ms_at_split;
+
         let should_split = is_hls_video_keyframe(frame)
-            && (self.segment_duration_acc >= split_threshold
+            && has_muxed_media
+            && (ready_by_time
+                || force_on_long_gop
                 || (self.playlist.segment_count() == 0
-                    && self.segment_buffer.len() > 8 * 1024));
+                    && mux_secs >= FIRST_SEGMENT_WALL_SECS));
 
         let mut completed: Option<CompletedSegment> = None;
 
         if should_split && self.segment_buffer.len() > MIN_SEGMENT_BYTES {
             let seq = self.playlist.next_sequence();
-            let filename = M3u8Generator::slot_filename(seq, self.playlist.max_segments());
-            let duration = self.segment_duration_acc.max(0.1);
+            let filename = M3u8Generator::segment_filename(seq);
+            let duration = self.closed_segment_secs();
+            let discontinuity = self.pending_discontinuity;
+            self.pending_discontinuity = false;
+            let pdt = Self::live_pdt(duration);
             let data = std::mem::take(&mut self.segment_buffer);
+
+            if duration > self.playlist.target_duration() * 2.0 {
+                warn!(
+                    "[HLS] [{}] segment seq={} duration {:.2}s (target {:.1}s) — check encoder GOP",
+                    self.stream_id, seq, duration, self.playlist.target_duration()
+                );
+            } else {
+                info!(
+                    "[HLS] [{}] segment seq={} duration {:.2}s ({} bytes)",
+                    self.stream_id, seq, duration, data.len()
+                );
+            }
 
             completed = Some(CompletedSegment {
                 data,
                 filename,
                 duration,
                 seq,
+                pdt,
+                discontinuity,
             });
 
-            // Start new segment (continuous timestamps, fresh TS continuity counters)
+            // New segment starts with the keyframe below; PAT/PMT (+ discontinuity if lag snap).
             self.begin_new_segment();
+            if discontinuity {
+                self.muxer.mark_segment_discontinuity();
+            }
             let has_audio = self.session_audio_frames > 0;
             let pat_pmt = self.muxer.generate_pat_pmt(true, has_audio);
             self.segment_buffer.extend(pat_pmt);
+            self.segment_wall_start = Some(Instant::now());
+            // Prime PCR to the keyframe PTS before the first PES (avoids DTS 0 at segment open).
+            let mux_frame = self.prepare_frame_for_mux(frame);
+            self.segment_last_mux_ms = mux_frame.timestamp;
+            self.segment_last_idr_mux_ms = mux_frame.timestamp;
+            self.muxer.update_pcr(mux_frame.timestamp);
+            let ts_data = self.muxer.frame_to_ts(&mux_frame);
+            self.segment_buffer.extend(ts_data);
+            return Ok(completed);
         }
 
         let mux_frame = self.prepare_frame_for_mux(frame);
+        self.segment_last_mux_ms = mux_frame.timestamp;
+        if is_hls_video_keyframe(frame) {
+            self.segment_last_idr_mux_ms = mux_frame.timestamp;
+        }
         self.muxer.update_pcr(mux_frame.timestamp);
         let ts_data = self.muxer.frame_to_ts(&mux_frame);
         self.segment_buffer.extend(ts_data);
@@ -333,7 +498,7 @@ impl HlsServer {
 
     /// Empty live playlist while waiting for the first segment.
     pub fn empty_playlist(&self) -> String {
-        let target = self.config.segment_duration.ceil() as u64;
+        let target = self.config.segment_duration.ceil().max(1.0) as u64;
         format!(
             "#EXTM3U\r\n#EXT-X-VERSION:3\r\n#EXT-X-TARGETDURATION:{target}\r\n#EXT-X-MEDIA-SEQUENCE:0\r\n"
         )
@@ -356,11 +521,14 @@ impl HlsServer {
         }
 
         // Subscribe to stream frames
-        self.stream_manager.ensure_stream_broadcast(stream_id);
-        let rx = match self.stream_manager.subscribe(&stream_id.to_string()) {
-            Some(rx) => rx,
+        self.stream_manager.ensure_stream_hub(stream_id);
+        let mut reader = match self
+            .stream_manager
+            .dispatch_subscribe(stream_id, DispatchPolicy::SequentialFromIdr)
+        {
+            Some(r) => r,
             None => {
-                warn!("[HLS] No broadcast channel found for stream {}", stream_id);
+                warn!("[HLS] No StreamHub for stream {}", stream_id);
                 return Ok(());
             }
         };
@@ -374,19 +542,23 @@ impl HlsServer {
             info!("[HLS] [{}] HLS frame processing loop started", stream_id_owned);
             let mut frame_count: u64 = 0;
 
-            let mut rx = rx;
-            let dropped = drain_broadcast_lag(&mut rx);
-            if dropped > 0 {
-                info!(
-                    "[HLS] [{}] Flushed {} stale frames before live edge",
-                    stream_id_owned, dropped
-                );
-            }
+            reader.finish_prime();
             request_publisher_keyframe(&stream_id_owned);
 
             loop {
-                match rx.recv().await {
-                    Ok(mut frame) => {
+                let frames = match reader.recv_batch().await {
+                    Ok(f) if !f.is_empty() => f,
+                    Ok(_) => continue,
+                    Err(DispatchError::Closed) => break,
+                };
+
+                if reader.take_muxer_resync() {
+                    if let Some(session) = sessions_clone.read().get(&stream_id_owned) {
+                        session.write().recover_from_lag();
+                    }
+                }
+
+                for mut frame in frames {
                         if matches!(frame.codec, CodecType::Opus | CodecType::G711) {
                             continue;
                         }
@@ -423,6 +595,8 @@ impl HlsServer {
                                         seg.filename,
                                         seg.duration,
                                         seg.seq,
+                                        seg.pdt,
+                                        seg.discontinuity,
                                         sess.output_dir.clone(),
                                     )),
                                     Ok(None) => None,
@@ -438,7 +612,9 @@ impl HlsServer {
                         };
 
                         // Write segment to disk outside of lock
-                        if let Some((data, filename, duration, seq, output_dir)) = segment_to_write {
+                        if let Some((data, filename, duration, seq, pdt, discontinuity, output_dir)) =
+                            segment_to_write
+                        {
                             let filepath = output_dir.join(&filename);
                             let tmp_path = output_dir.join(format!("{}.part", filename));
                             let write_ok = if let Err(e) = fs::write(&tmp_path, &data).await {
@@ -459,20 +635,25 @@ impl HlsServer {
                                     "[HLS] [{}] Committed segment {} ({:.2}s, {} bytes)",
                                     stream_id_owned, filename, duration, data.len()
                                 );
-                                let playlist_content = {
+                                let playlist_update = {
                                     let sessions = sessions_clone.read();
                                     sessions.get(&stream_id_owned).map(|s| {
                                         let mut sess = s.write();
-                                        sess.playlist.add_segment(duration, seq);
-                                        sess.get_playlist()
+                                        sess.playlist
+                                            .add_segment(duration, seq, pdt, discontinuity);
+                                        let prune = seq.saturating_sub(
+                                            sess.playlist.max_segments() as u64 + 2,
+                                        );
+                                        (sess.get_playlist(), prune)
                                     })
                                 };
-                                if let Some(content) = playlist_content {
+                                if let Some((content, prune_before)) = playlist_update {
                                     let m3u8_path = output_dir.join("live.m3u8");
                                     let tmp = output_dir.join("live.m3u8.part");
                                     if fs::write(&tmp, &content).await.is_ok() {
                                         let _ = fs::rename(&tmp, &m3u8_path).await;
                                     }
+                                    prune_old_segments(&output_dir, prune_before).await;
                                 }
                             }
                         }
@@ -480,26 +661,10 @@ impl HlsServer {
                         if frame_count % 100 == 0 {
                             debug!("[HLS] [{}] Processed {} frames", stream_id_owned, frame_count);
                         }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(
-                            "[HLS] [{}] Lagged {} frames — jump to live edge",
-                            stream_id_owned, n
-                        );
-                        drain_broadcast_lag(&mut rx);
-                        let sessions = sessions_clone.read();
-                        if let Some(session) = sessions.get(&stream_id_owned) {
-                            session.write().recover_from_lag();
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        info!("[HLS] [{}] Broadcast channel closed", stream_id_owned);
-                        break;
-                    }
                 }
             }
 
-            info!("[HLS] [{}] HLS frame processing loop stopped after {} frames", 
+            info!("[HLS] [{}] HLS frame processing loop stopped after {} frames",
                   stream_id_owned, frame_count);
 
             let mut sessions = sessions_clone.write();
@@ -581,5 +746,28 @@ impl HlsServer {
     /// Get the output directory for HLS files
     pub fn output_dir(&self) -> &str {
         &self.config.output_dir
+    }
+}
+
+/// Remove segment files older than the sliding playlist window.
+async fn prune_old_segments(output_dir: &Path, prune_before_seq: u64) {
+    if prune_before_seq == 0 {
+        return;
+    }
+    let Ok(mut entries) = fs::read_dir(output_dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(seq) = name
+            .strip_prefix("segment_")
+            .and_then(|s| s.strip_suffix(".ts"))
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if seq < prune_before_seq {
+            let _ = fs::remove_file(entry.path()).await;
+        }
     }
 }

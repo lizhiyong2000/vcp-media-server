@@ -64,6 +64,7 @@
 2. **`MediaFrame` 作为跨模块帧契约**，扩展编解码参数集（VPS 等）而非引入第二套帧类型。
 3. **`StreamSink` / `StreamSource` trait**（`src/core/protocol.rs`）已定义但未落地，可作为统一接入/分发抽象的目标接口。
 4. **HTTP API 作为控制面扩展点**，录制/转码/GB28181 会话管理均由此暴露。
+5. **媒体 Hub 演进**详见 [ring-buffer-dispatcher.md](./ring-buffer-dispatcher.md)（FrameRing + FrameDispatcher 替代 broadcast + GOP 缓存）。
 
 ---
 

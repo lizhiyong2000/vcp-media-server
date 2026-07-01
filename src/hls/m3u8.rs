@@ -1,5 +1,7 @@
 /// M3U8 playlist generator for HLS
 use std::collections::VecDeque;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use tracing::debug;
 
 /// A single segment in the playlist
@@ -11,6 +13,10 @@ pub struct Segment {
     pub duration: f64,
     /// File name (e.g., "segment_0.ts")
     pub filename: String,
+    /// Media start time: live_edge - duration (pairs with segment-local TS PTS)
+    pub program_date_time: SystemTime,
+    /// Whether this segment starts after a timestamp discontinuity
+    pub discontinuity: bool,
 }
 
 /// M3U8 playlist generator
@@ -25,6 +31,8 @@ pub struct M3u8Generator {
     segments: VecDeque<Segment>,
     /// Next segment sequence number
     next_sequence: u64,
+    /// Count of media discontinuities before the first segment in the playlist
+    discontinuity_sequence: u64,
     /// Whether the stream has ended
     ended: bool,
 }
@@ -33,10 +41,11 @@ impl M3u8Generator {
     pub fn new(target_duration: f64, max_segments: usize) -> Self {
         Self {
             target_duration,
-            max_segments,
+            max_segments: max_segments.max(1),
             media_sequence: 0,
             segments: VecDeque::new(),
             next_sequence: 0,
+            discontinuity_sequence: 0,
             ended: false,
         }
     }
@@ -46,18 +55,30 @@ impl M3u8Generator {
         self.target_duration
     }
 
-    /// Add a committed segment to the playlist (slot-based filename, overwrites on disk).
-    pub fn add_segment(&mut self, duration: f64, sequence: u64) {
-        let filename = Self::slot_filename(sequence, self.max_segments);
+    /// Add a committed segment. `program_date_time` must match the session mux timeline
+    /// (chained across segments); set `discontinuity` only after a timestamp reset (lag snap).
+    pub fn add_segment(
+        &mut self,
+        duration: f64,
+        sequence: u64,
+        program_date_time: SystemTime,
+        discontinuity: bool,
+    ) {
+        let filename = Self::segment_filename(sequence);
 
         let segment = Segment {
             sequence,
             duration,
             filename,
+            program_date_time,
+            discontinuity,
         };
 
         self.segments.push_back(segment);
         self.next_sequence = sequence + 1;
+        if discontinuity {
+            self.discontinuity_sequence += 1;
+        }
 
         while self.segments.len() > self.max_segments {
             if self.segments.pop_front().is_some() {
@@ -66,26 +87,68 @@ impl M3u8Generator {
         }
 
         debug!(
-            "[HLS] Added segment seq={}, slot={}, duration={:.2}s, media_seq={}, window={}",
-            sequence,
-            sequence % self.max_segments as u64,
-            duration,
-            self.media_sequence,
-            self.segments.len()
+            "[HLS] Added segment seq={}, duration={:.2}s, media_seq={}, window={}",
+            sequence, duration, self.media_sequence, self.segments.len()
         );
     }
 
-    /// Generate the M3U8 playlist content
+    fn playlist_target_duration(&self) -> u64 {
+        let observed = self
+            .segments
+            .iter()
+            .map(|s| s.duration)
+            .fold(self.target_duration, f64::max);
+        observed.ceil().max(1.0) as u64
+    }
+
+    fn format_program_date_time(t: SystemTime) -> String {
+        let dur = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+        let total_ms = dur.as_millis();
+        let secs = (total_ms / 1000) as i64;
+        let ms = (total_ms % 1000) as u32;
+        time::OffsetDateTime::from_unix_timestamp(secs)
+            .map(|dt| {
+                format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                    dt.year(),
+                    dt.month() as u8,
+                    dt.day(),
+                    dt.hour(),
+                    dt.minute(),
+                    dt.second(),
+                    ms
+                )
+            })
+            .unwrap_or_else(|_| "1970-01-01T00:00:00.000Z".to_string())
+    }
+
+    /// Generate the M3U8 playlist content (live sliding window).
     pub fn generate(&self) -> String {
         let mut output = String::new();
 
         output.push_str("#EXTM3U\r\n");
         output.push_str("#EXT-X-VERSION:3\r\n");
         output.push_str("#EXT-X-INDEPENDENT-SEGMENTS\r\n");
-        output.push_str(&format!("#EXT-X-TARGETDURATION:{}\r\n", self.target_duration.ceil() as u64));
+        output.push_str(&format!(
+            "#EXT-X-TARGETDURATION:{}\r\n",
+            self.playlist_target_duration()
+        ));
         output.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\r\n", self.media_sequence));
+        if self.discontinuity_sequence > 0 {
+            output.push_str(&format!(
+                "#EXT-X-DISCONTINUITY-SEQUENCE:{}\r\n",
+                self.discontinuity_sequence
+            ));
+        }
 
         for segment in &self.segments {
+            if segment.discontinuity {
+                output.push_str("#EXT-X-DISCONTINUITY\r\n");
+            }
+            output.push_str(&format!(
+                "#EXT-X-PROGRAM-DATE-TIME:{}\r\n",
+                Self::format_program_date_time(segment.program_date_time)
+            ));
             output.push_str(&format!("#EXTINF:{:.3},\r\n", segment.duration));
             output.push_str(&segment.filename);
             output.push_str("\r\n");
@@ -118,10 +181,14 @@ impl M3u8Generator {
         self.next_sequence
     }
 
-    /// Slot-based segment filename (fixed pool, overwritten each lap).
+    /// Unique segment filename (avoids HTTP cache collisions on live rewrite).
+    pub fn segment_filename(sequence: u64) -> String {
+        format!("segment_{sequence}.ts")
+    }
+
+    /// Slot-based segment filename (legacy).
     pub fn slot_filename(sequence: u64, max_segments: usize) -> String {
-        let slots = max_segments.max(1) as u64;
-        format!("segment_{}.ts", sequence % slots)
+        Self::segment_filename(sequence)
     }
 
     pub fn max_segments(&self) -> usize {

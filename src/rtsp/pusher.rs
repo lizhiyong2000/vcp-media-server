@@ -172,7 +172,7 @@ impl RtspPusher {
         
         info!("[RTSP Pusher] [RTP Loop] Starting RTP send loop for stream {}", stream_id);
         
-        let mut receiver = match manager.subscribe(&stream_id) {
+        let mut reader = match manager.dispatch_subscribe(&stream_id, crate::core::DispatchPolicy::SequentialFromIdr) {
             Some(r) => r,
             None => {
                 error!("[RTSP Pusher] [RTP Loop] Failed to subscribe to stream {}", stream_id);
@@ -201,7 +201,13 @@ impl RtspPusher {
             Ok(())
         }
         
-        while let Ok(frame) = receiver.recv().await {
+        loop {
+            let frames = match reader.recv_batch().await {
+                Ok(f) if !f.is_empty() => f,
+                Ok(_) => continue,
+                Err(crate::core::dispatch::DispatchError::Closed) => break,
+            };
+            for frame in frames {
             frame_count += 1;
             
             if *paused.read() {
@@ -347,6 +353,7 @@ impl RtspPusher {
             }
             
             buffer.clear();
+            }
         }
         
         info!("[RTSP Pusher] [RTP Loop] RTP send loop ended for stream {}", stream_id);

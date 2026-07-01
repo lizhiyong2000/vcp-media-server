@@ -14,7 +14,8 @@ use tokio::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn, error, debug};
 
-use crate::core::{StreamManager, CodecType, MediaFrame, StreamSourceMode, StreamProtocol, StreamStatus, drain_broadcast_lag, recv_flv_batch, default_live_tracks};
+use crate::core::{StreamManager, CodecType, MediaFrame, StreamSourceMode, StreamProtocol, StreamStatus, default_live_tracks, DispatchPolicy};
+use crate::core::dispatch::DispatchError;
 use session::{RtmpSession, SessionState};
 use chunk::RtmpMessage;
 
@@ -601,16 +602,13 @@ impl RtmpServer {
                     if let Some(handle) = conn.play_abort.take() {
                         handle.abort();
                     }
-                    if let Some(mut rx) = conn.stream_manager.subscribe(&play_stream_id) {
+                    if let Some(mut reader) = conn.stream_manager.dispatch_subscribe(
+                        &play_stream_id,
+                        DispatchPolicy::LiveCoalesce,
+                    ) {
                         info!("[RTMP] [{}] Subscribed to stream '{}'", peer_addr, play_stream_id);
 
-                        let dropped = drain_broadcast_lag(&mut rx);
-                        if dropped > 0 {
-                            info!(
-                                "[RTMP] [{}] Flushed {} stale frames before live edge",
-                                peer_addr, dropped
-                            );
-                        }
+                        reader.snap_to_live_edge();
 
                         // Send Stream Begin
                         let mut w = conn.writer.lock().await;
@@ -643,8 +641,8 @@ impl RtmpServer {
                         let peer_log = peer_addr.to_string();
                         let manager_clone = conn.stream_manager.clone();
                         let handle = tokio::spawn(async move {
-                            let mut pending = crate::rtsp::play_egress::prime_rtsp_play_rx(
-                                &mut rx,
+                            let mut pending = crate::rtsp::play_egress::prime_rtsp_play(
+                                &mut reader,
                                 &manager_clone,
                                 &stream_id_clone,
                             )
@@ -656,17 +654,10 @@ impl RtmpServer {
                                 let frames = if let Some(frame) = pending.take() {
                                     vec![frame]
                                 } else {
-                                    match recv_flv_batch(&mut rx).await {
-                                        Ok(frames) => frames,
-                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                            info!(
-                                                "[RTMP] [{}] Play lagged {} frames — jump to live edge",
-                                                peer_log, n
-                                            );
-                                            drain_broadcast_lag(&mut rx);
-                                            continue;
-                                        }
-                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                    match reader.recv_batch().await {
+                                        Ok(frames) if !frames.is_empty() => frames,
+                                        Ok(_) => continue,
+                                        Err(DispatchError::Closed) => break,
                                     }
                                 };
                                 for frame in frames {

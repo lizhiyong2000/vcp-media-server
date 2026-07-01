@@ -6,7 +6,8 @@ use tokio::time::{sleep, Duration, Instant};
 use tracing::{info, warn, error};
 use serde_json::json;
 
-use crate::core::{StreamManager, Track, CodecType, StreamSourceMode, StreamProtocol, drain_broadcast_lag, recv_flv_batch};
+use crate::core::{DispatchPolicy, DispatchReader, StreamManager, Track, CodecType, StreamSourceMode, StreamProtocol};
+use crate::core::dispatch::DispatchError;
 use crate::rtsp::{RtspPuller, RtspPusher};
 use crate::rtmp::RtmpPuller;
 use crate::hls::HlsServer;
@@ -111,16 +112,16 @@ impl HttpServer {
                     let _ = hls.ensure_stream(stream_id, false).await;
                     request_publisher_keyframe(stream_id);
 
-                    let deadline = Instant::now() + Duration::from_secs(8);
+                    let deadline = Instant::now() + Duration::from_secs(3);
                     let mut playlist = hls.get_playlist(stream_id);
                     while playlist.is_none() && Instant::now() < deadline {
                         request_publisher_keyframe(stream_id);
-                        sleep(Duration::from_millis(100)).await;
+                        sleep(Duration::from_millis(50)).await;
                         playlist = hls.get_playlist(stream_id);
                     }
                     let playlist = playlist.unwrap_or_else(|| hls.empty_playlist());
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: close\r\n\r\n{}",
                         playlist.len(), playlist
                     );
                     socket.write_all(response.as_bytes()).await?;
@@ -143,7 +144,7 @@ impl HttpServer {
                         if let Some(seg_path) = hls.get_segment_path(stream_id, filename) {
                             if let Ok(data) = tokio::fs::read(&seg_path).await {
                                 let response = format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+                                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache, no-store\r\nConnection: close\r\n\r\n",
                                     data.len()
                                 );
                                 socket.write_all(response.as_bytes()).await?;
@@ -179,9 +180,10 @@ impl HttpServer {
                     let stream_id = path.trim_start_matches("/flv/").trim_end_matches('/');
                     if let Some((mut session, mut stream)) = flv.create_session(stream_id) {
                         let stream_id_owned = stream_id.to_string();
-                        flv.stream_manager().ensure_stream_broadcast(stream_id);
-                        let mut rx = match flv.subscribe(stream_id) {
-                            Some(rx) => rx,
+                        let manager = flv.stream_manager();
+                        manager.ensure_stream_hub(stream_id);
+                        let mut reader = match manager.dispatch_subscribe(stream_id, DispatchPolicy::LiveCoalesce) {
+                            Some(r) => r,
                             None => {
                                 let response = Self::http_response(404, "Not Found", "Stream not found");
                                 socket.write_all(response.as_bytes()).await?;
@@ -189,10 +191,6 @@ impl HttpServer {
                                 return Ok(());
                             }
                         };
-                        let dropped = drain_broadcast_lag(&mut rx);
-                        if dropped > 0 {
-                            info!("[HTTP-FLV] [{}] flushed {} stale frames before live edge", stream_id, dropped);
-                        }
 
                         // Wait for SPS/PPS before responding so players can probe codecs
                         let deadline = Instant::now() + Duration::from_secs(5);
@@ -207,21 +205,8 @@ impl HttpServer {
                                 socket.flush().await?;
                                 return Ok(());
                             }
-                            tokio::select! {
-                                _ = sleep(Duration::from_millis(50)) => {}
-                                result = rx.recv() => {
-                                    match result {
-                                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                            let response = Self::http_response(404, "Not Found", "Stream ended");
-                                            socket.write_all(response.as_bytes()).await?;
-                                            socket.flush().await?;
-                                            return Ok(());
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(s) = flv.stream_manager().get_stream(&stream_id_owned) {
+                            sleep(Duration::from_millis(50)).await;
+                            if let Some(s) = manager.get_stream(&stream_id_owned) {
                                 stream = s;
                             }
                         }
@@ -235,9 +220,8 @@ impl HttpServer {
                             socket.write_all(&chunk).await?;
                         }
 
-                        let manager = flv.stream_manager();
-                        let mut pending_idr = crate::rtsp::play_egress::prime_rtsp_play_rx(
-                            &mut rx,
+                        let mut pending_idr = crate::rtsp::play_egress::prime_rtsp_play(
+                            &mut reader,
                             manager,
                             &stream_id_owned,
                         )
@@ -248,17 +232,10 @@ impl HttpServer {
                             let frames = if let Some(frame) = pending_idr.take() {
                                 vec![frame]
                             } else {
-                                match recv_flv_batch(&mut rx).await {
-                                    Ok(frames) => frames,
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                        info!(
-                                            "[HTTP-FLV] [{}] lagged {} frames — jump to live edge",
-                                            stream_id_owned, n
-                                        );
-                                        drain_broadcast_lag(&mut rx);
-                                        continue;
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                match reader.recv_batch().await {
+                                    Ok(frames) if !frames.is_empty() => frames,
+                                    Ok(_) => continue,
+                                    Err(DispatchError::Closed) => break,
                                 }
                             };
                             for frame in frames {

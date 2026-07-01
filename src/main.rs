@@ -146,8 +146,8 @@ async fn main() -> Result<()> {
     // Initialize HLS server
     let hls_config = config.hls.as_ref().map(|h| HlsModuleConfig {
         enabled: h.enabled,
-        segment_duration: h.segment_duration.unwrap_or(2.0),
-        max_segments: h.max_segments.unwrap_or(10),
+        segment_duration: h.segment_duration.unwrap_or(1.0),
+        max_segments: h.max_segments.unwrap_or(1),
         output_dir: h.output_dir.clone().unwrap_or("./hls".to_string()),
     }).unwrap_or_default();
 
