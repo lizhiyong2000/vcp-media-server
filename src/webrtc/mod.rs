@@ -29,6 +29,7 @@ use crate::core::StreamManager;
 use crate::hls::HlsServer;
 use peer::create_api;
 use player::{cancel_play_relay, signal_play_relay_stop, start_play};
+use play_relay::stop_play_relays_for_stream;
 use publish_signaling::{register_publish_signaling, unregister_publish_signaling};
 use publisher::{add_ice_candidate, start_publish};
 use signaling::{ClientSignal, ServerSignal};
@@ -197,8 +198,19 @@ async fn cleanup_publish_session(
         if manager.release_publisher(stream_id, publisher_id) {
             let _ = manager.set_unpublished(stream_id);
         }
+    } else {
+        let _ = manager.set_unpublished(stream_id);
     }
+    end_publish_media(manager, stream_id);
     info!("[WebRTC] Publish session cleaned up stream='{}'", stream_id);
+}
+
+/// Drop buffered frames and stop play relays when a publisher session ends.
+pub(super) fn end_publish_media(manager: &StreamManager, stream_id: &str) {
+    // release_publisher already clears the ring; reset again for track-end paths
+    // that skip release (e.g. abrupt WebRTC disconnect).
+    manager.reset_stream_media(stream_id);
+    stop_play_relays_for_stream(stream_id);
 }
 
 /// Close peer connection in the background so WebSocket signaling never blocks on DTLS teardown.
@@ -457,6 +469,14 @@ where
             let publisher_id = state.publisher_id.take();
             cleanup_publish_session(manager, &stream_id, publisher_id.as_deref(), pc).await;
             state.publish_stream_id = None;
+            if state.play_pc.is_some()
+                && matches!(
+                    state.stream_id.as_deref(),
+                    Some(sid) if sid == stream_id.as_str()
+                )
+            {
+                stop_play_session(state).await;
+            }
             if state.play_pc.is_none() {
                 state.stream_id = None;
             }

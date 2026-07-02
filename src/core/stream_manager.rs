@@ -236,6 +236,7 @@ impl StreamManager {
 
         match hub.acquire_publisher(publisher_id) {
             Ok(()) => {
+                self.reset_stream_media(stream_id);
                 info!(
                     "[Core] Publisher {} acquired stream {}",
                     publisher_id, stream_id
@@ -262,6 +263,7 @@ impl StreamManager {
             .unwrap_or(false);
 
         if released {
+            self.reset_stream_media(stream_id);
             info!(
                 "[Core] Publisher {} released stream {}",
                 publisher_id, stream_id
@@ -416,6 +418,19 @@ impl StreamManager {
 
     pub fn get_last_keyframe(&self, stream_id: &str) -> Option<(Vec<u8>, u64)> {
         self.get_hub(stream_id)?.latest_idr_bytes()
+    }
+
+    /// Clear the frame ring and cached SPS/PPS after a publisher session ends.
+    pub fn reset_stream_media(&self, stream_id: &str) {
+        let Some(hub) = self.get_hub(stream_id) else {
+            return;
+        };
+        hub.reset();
+        hub.update_stream(|stream| {
+            stream.sps = None;
+            stream.pps = None;
+        });
+        info!("[Core] Reset stream media ring for '{}'", stream_id);
     }
 
     pub fn dispatch_subscribe(
@@ -714,6 +729,44 @@ mod tests {
         assert!(manager
             .dispatch_subscribe("s", DispatchPolicy::SequentialFromIdr)
             .is_none());
+    }
+
+    #[test]
+    fn reset_stream_media_clears_ring_and_codec_config() {
+        let manager = StreamManager::new();
+        create_test_stream(&manager, "s");
+        manager.set_stream_sps_pps("s", vec![0x67], vec![0x68]);
+        manager.publish_frame(h264_frame("s", 1000, true));
+
+        manager.reset_stream_media("s");
+
+        assert!(manager.get_last_keyframe("s").is_none());
+        let stream = manager.get_stream(&"s".to_string()).unwrap();
+        assert!(stream.sps.is_none());
+        assert!(stream.pps.is_none());
+    }
+
+    #[test]
+    fn release_and_acquire_publisher_reset_stream_media() {
+        let manager = StreamManager::new();
+        create_test_stream(&manager, "s");
+        manager.set_stream_sps_pps("s", vec![0x67], vec![0x68]);
+        manager
+            .acquire_publisher("s", "pub-a")
+            .expect("first publisher");
+        manager.publish_frame(h264_frame("s", 1000, true));
+        assert!(manager.get_last_keyframe("s").is_some());
+
+        assert!(manager.release_publisher("s", "pub-a"));
+        assert!(manager.get_last_keyframe("s").is_none());
+
+        manager
+            .acquire_publisher("s", "pub-b")
+            .expect("second publisher");
+        assert!(manager.get_last_keyframe("s").is_none());
+        let stream = manager.get_stream(&"s".to_string()).unwrap();
+        assert!(stream.sps.is_none());
+        assert!(stream.pps.is_none());
     }
 
     #[test]

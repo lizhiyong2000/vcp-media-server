@@ -76,6 +76,7 @@
     let publishVideoSenderRef = null;
     let publishVideoTrackRef = null;
     let keyframeRequestChain = Promise.resolve();
+    let playGeneration = 0;
 
     function publishVideoSender() {
       if (publishVideoSenderRef) return publishVideoSenderRef;
@@ -207,6 +208,68 @@
       }
     }
 
+    function resetPublishState(reason, notifyServer = false) {
+      const streamId = $('streamId').value.trim();
+      stopPublishKeyframeInterval();
+      keyframeMethod = null;
+      publishVideoSenderRef = null;
+      publishVideoTrackRef = null;
+      keyframeRequestChain = Promise.resolve();
+      if (negotiatingPc === publishPc) negotiatingPc = null;
+      if (activePc === publishPc) activePc = null;
+      if (publishPc) {
+        try { publishPc.close(); } catch (_) {}
+        publishPc = null;
+      }
+      if (localStream) {
+        localStream.getTracks().forEach((t) => t.stop());
+        localStream = null;
+      }
+      $('localVideo').srcObject = null;
+      $('btnPublish').disabled = !(ws && ws.readyState === WebSocket.OPEN);
+      $('btnStopPublish').disabled = true;
+      if (notifyServer && streamId) wsSend({ type: 'stop_publish', stream_id: streamId });
+      if (reason) log(reason);
+    }
+
+    function isPublishFailure(message) {
+      return /publish rejected|publish failed|推流/i.test(message || '')
+        || negotiatingPc === publishPc;
+    }
+
+    function clearRemoteVideo() {
+      const video = $('remoteVideo');
+      const stream = video.srcObject;
+      if (stream && typeof stream.getTracks === 'function') {
+        stream.getTracks().forEach((track) => {
+          try { track.stop(); } catch (_) {}
+          try { stream.removeTrack(track); } catch (_) {}
+        });
+      }
+      try { video.pause(); } catch (_) {}
+      video.removeAttribute('src');
+      video.srcObject = null;
+      video.load();
+    }
+
+    function resetPlayState(reason, notifyServer = false) {
+      const streamId = $('streamId').value.trim();
+      playGeneration += 1;
+      pendingServerIce.length = 0;
+      if (negotiatingPc === playPc) negotiatingPc = null;
+      if (activePc === playPc) activePc = null;
+      if (notifyServer && streamId) wsSend({ type: 'stop_play', stream_id: streamId });
+      if (playPc) {
+        try { playPc.ontrack = null; } catch (_) {}
+        try { playPc.close(); } catch (_) {}
+        playPc = null;
+      }
+      clearRemoteVideo();
+      $('btnPlay').disabled = !(ws && ws.readyState === WebSocket.OPEN);
+      $('btnStopPlay').disabled = true;
+      if (reason) log(reason);
+    }
+
     function wsSend(obj) {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         log('WebSocket 未连接');
@@ -305,16 +368,27 @@
         if (msg.type === 'answer') {
           const pc = negotiatingPc;
           if (!pc) return;
-          await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-          negotiatingPc = null;
-          log('收到 answer');
-          await flushPendingServerIce();
+          try {
+            await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+            negotiatingPc = null;
+            log('收到 answer');
+            await flushPendingServerIce();
+          } catch (e) {
+            if (pc === publishPc) {
+              resetPublishState('推流失败: 设置远端 answer 失败 ' + e);
+            } else {
+              resetPlayState('播放失败: 设置远端 answer 失败 ' + e);
+            }
+          }
         } else if (msg.type === 'ice') {
           await addServerIceCandidate(msg);
         } else if (msg.type === 'need_keyframe') {
           enqueueKeyframeRequest('Server-need-keyframe');
         } else if (msg.type === 'error') {
           log('服务器错误: ' + msg.message);
+          if (isPublishFailure(msg.message)) {
+            resetPublishState('推流失败: ' + msg.message);
+          }
         }
       };
     };
@@ -366,36 +440,24 @@
         $('btnPublish').disabled = true;
         $('btnStopPublish').disabled = false;
       } catch (e) {
-        log('推流失败: ' + e);
+        resetPublishState('推流失败: ' + e);
       }
     };
 
     $('btnStopPublish').onclick = () => {
       const streamId = $('streamId').value.trim();
-      stopPublishKeyframeInterval();
-      keyframeMethod = null;
-      publishVideoSenderRef = null;
-      publishVideoTrackRef = null;
-      keyframeRequestChain = Promise.resolve();
-      if (negotiatingPc === publishPc) negotiatingPc = null;
-      if (activePc === publishPc) activePc = null;
-      if (publishPc) { publishPc.close(); publishPc = null; }
-      if (localStream) {
-        localStream.getTracks().forEach((t) => t.stop());
-        localStream = null;
-      }
-      if (streamId) wsSend({ type: 'stop_publish', stream_id: streamId });
-      $('localVideo').srcObject = null;
-      $('btnPublish').disabled = false;
-      $('btnStopPublish').disabled = true;
-      log('推流已停止');
+      resetPublishState('推流已停止', !!streamId);
+      if (playPc) resetPlayState('推流已停止，同步停止播放', false);
     };
 
     $('btnPlay').onclick = async () => {
       const streamId = $('streamId').value.trim();
       if (!streamId) return log('请填写 stream_id');
       try {
+        resetPlayState(null, false);
+        const generation = playGeneration;
         playPc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        const thisPc = playPc;
         wireIce(playPc, 'play');
         const playTr = playPc.addTransceiver('video', { direction: 'recvonly' });
         const h264Prefs = h264CodecPreferences();
@@ -406,10 +468,19 @@
         const remoteStream = new MediaStream();
         $('remoteVideo').srcObject = remoteStream;
         playPc.ontrack = (ev) => {
+          if (generation !== playGeneration || thisPc !== playPc) {
+            log('忽略旧播放连接的远端 track: ' + ev.track.kind);
+            try { ev.track.stop(); } catch (_) {}
+            return;
+          }
           log('收到远端 track: ' + ev.track.kind + ' id=' + ev.track.id + ' readyState=' + ev.track.readyState);
           remoteStream.addTrack(ev.track);
+          ev.track.onended = () => log('track ended: ' + ev.track.kind);
           ev.track.onmute = () => log('track muted: ' + ev.track.kind);
-          ev.track.onunmute = () => log('track unmuted: ' + ev.track.kind);
+          ev.track.onunmute = () => {
+            log('track unmuted: ' + ev.track.kind);
+            $('remoteVideo').play().catch((e) => log('video.play(): ' + e));
+          };
           $('remoteVideo').play().catch((e) => log('video.play(): ' + e));
         };
         const offer = await playPc.createOffer();
@@ -421,20 +492,13 @@
         $('btnPlay').disabled = true;
         $('btnStopPlay').disabled = false;
       } catch (e) {
-        log('播放失败: ' + e);
+        resetPlayState('播放失败: ' + e);
       }
     };
 
     $('btnStopPlay').onclick = () => {
       const streamId = $('streamId').value.trim();
-      if (negotiatingPc === playPc) negotiatingPc = null;
-      if (activePc === playPc) activePc = null;
-      if (streamId) wsSend({ type: 'stop_play', stream_id: streamId });
-      if (playPc) { playPc.close(); playPc = null; }
-      $('remoteVideo').srcObject = null;
-      $('btnPlay').disabled = false;
-      $('btnStopPlay').disabled = true;
-      log('播放已停止');
+      resetPlayState('播放已停止', !!streamId);
     };
   </script>
 </body>

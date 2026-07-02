@@ -46,7 +46,10 @@ pub async fn start_publish(
         StreamProtocol::WebRTC,
         None,
     );
-    manager.acquire_publisher(&stream_id, &publisher_id)?;
+    if let Err(e) = manager.acquire_publisher(&stream_id, &publisher_id) {
+        close_failed_publish_pc(&pc, &stream_id).await;
+        return Err(e);
+    }
     manager.set_stream_tracks(&stream_id, default_live_tracks());
     let _ = manager.set_unpublished(&stream_id);
     manager.ensure_stream_broadcast(&stream_id);
@@ -90,12 +93,12 @@ pub async fn start_publish(
     let offer = match RTCSessionDescription::offer(offer_sdp) {
         Ok(offer) => offer,
         Err(e) => {
-            manager.release_publisher(&stream_id, &publisher_id);
+            cleanup_failed_publish_setup(&pc, &manager, &stream_id, &publisher_id).await;
             return Err(e.into());
         }
     };
     if let Err(e) = pc.set_remote_description(offer).await {
-        manager.release_publisher(&stream_id, &publisher_id);
+        cleanup_failed_publish_setup(&pc, &manager, &stream_id, &publisher_id).await;
         return Err(e.into());
     }
     info!("[WebRTC] Publish set remote offer stream='{}'", stream_id);
@@ -103,12 +106,12 @@ pub async fn start_publish(
     let answer = match pc.create_answer(None).await {
         Ok(answer) => answer,
         Err(e) => {
-            manager.release_publisher(&stream_id, &publisher_id);
+            cleanup_failed_publish_setup(&pc, &manager, &stream_id, &publisher_id).await;
             return Err(e.into());
         }
     };
     if let Err(e) = pc.set_local_description(answer.clone()).await {
-        manager.release_publisher(&stream_id, &publisher_id);
+        cleanup_failed_publish_setup(&pc, &manager, &stream_id, &publisher_id).await;
         return Err(e.into());
     }
     info!(
@@ -124,6 +127,25 @@ pub async fn start_publish(
         answer_sdp: answer.sdp,
         pc,
     })
+}
+
+async fn cleanup_failed_publish_setup(
+    pc: &Arc<RTCPeerConnection>,
+    manager: &StreamManager,
+    stream_id: &str,
+    publisher_id: &str,
+) {
+    manager.release_publisher(stream_id, publisher_id);
+    close_failed_publish_pc(pc, stream_id).await;
+}
+
+async fn close_failed_publish_pc(pc: &Arc<RTCPeerConnection>, stream_id: &str) {
+    if let Err(e) = pc.close().await {
+        warn!(
+            "[WebRTC] Failed to close rejected publish peer connection stream='{}': {}",
+            stream_id, e
+        );
+    }
 }
 
 async fn read_track_to_stream(
@@ -247,6 +269,7 @@ async fn read_h264_track(
     }
 
     let _ = manager.set_unpublished(&stream_id);
+    super::end_publish_media(&manager, &stream_id);
     info!(
         "[WebRTC] Publish track ended stream='{}' access_units={} depacketize_fail={} empty={}",
         stream_id, access_units, depacketize_fail, empty_nalu

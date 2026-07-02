@@ -91,3 +91,24 @@ pub fn unregister_play_relay(relay_id: &str) {
         info!("[WebRTC] Unregistered play relay id='{}'", relay_id);
     }
 }
+
+/// Stop all play relays for a stream (e.g. when the publisher disconnects).
+pub fn stop_play_relays_for_stream(stream_id: &str) -> usize {
+    let relay_ids: Vec<String> = relays()
+        .lock()
+        .iter()
+        .filter(|(_, ctrl)| ctrl.stream_id == stream_id)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let count = relay_ids.len();
+    for id in relay_ids {
+        signal_play_relay_stop(&id);
+    }
+    if count > 0 {
+        info!(
+            "[WebRTC] Signalled stop for {} play relay(s) on stream='{}'",
+            count, stream_id
+        );
+    }
+    count
+}
