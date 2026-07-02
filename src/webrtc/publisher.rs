@@ -5,9 +5,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::rtp::codecs::h264::H264Packet;
 use webrtc::rtp::packet::Packet;
-use webrtc::rtp::packetizer::Depacketizer;
 use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::track::track_remote::TrackRemote;
 
@@ -16,7 +14,8 @@ use super::peer::{new_peer_connection, wire_pc_debug};
 use super::publish_signaling::{latest_keyframe_request_age_ms, register_publish_pli};
 use super::rtp_h264::{
     self, annex_b_from_rtp_payload, describe_rtp_payload, extract_sps_pps_from_nalus, hex_prefix,
-    is_idr_rtp_payload, parse_rtp_h264,
+    is_fu_a_continuation, is_idr_rtp_payload, parse_rtp_h264, H264DepacketizeError,
+    H264RtpDepacketizer,
 };
 use super::sdp_h264::parse_sprop_parameter_sets;
 use super::signaling::ServerSignal;
@@ -253,12 +252,13 @@ async fn read_h264_track(
     stream_id: String,
     track: Arc<TrackRemote>,
 ) -> Result<()> {
-    let mut depacketizer = H264Packet::default();
+    let mut depacketizer = H264RtpDepacketizer::default();
     let mut access_units: u64 = 0;
     let mut depacketize_fail: u64 = 0;
     let mut empty_nalu: u64 = 0;
     let mut batch = AccessUnitBatch::default();
     let mut last_pkt_ts: Option<u32> = None;
+    let mut expected_seq: Option<u16> = None;
 
     while let Ok((pkt, _attrs)) = track.read_rtp().await {
         if access_units == 0 && batch.parts.is_empty() {
@@ -275,6 +275,29 @@ async fn read_h264_track(
         }
 
         let pkt_ts = pkt.header.timestamp;
+        let expected = expected_seq;
+        let seq_gap = expected
+            .map(|expected| pkt.header.sequence_number != expected)
+            .unwrap_or(false);
+        expected_seq = Some(pkt.header.sequence_number.wrapping_add(1));
+        if seq_gap {
+            warn!(
+                "[WebRTC] RTP sequence gap stream='{}' expected={:?} got={} ts={} payload={}B [{}]",
+                stream_id,
+                expected,
+                pkt.header.sequence_number,
+                pkt.header.timestamp,
+                pkt.payload.len(),
+                describe_rtp_payload(&pkt.payload)
+            );
+            depacketizer.reset();
+            batch.parts.clear();
+            batch.is_keyframe = false;
+            if is_fu_a_continuation(&pkt.payload) {
+                continue;
+            }
+        }
+
         if let Some(prev_ts) = last_pkt_ts {
             let backward = prev_ts.wrapping_sub(pkt_ts);
             // replaceTrack / encoder restart often resets the RTP clock backward.
@@ -283,7 +306,7 @@ async fn read_h264_track(
                     "[WebRTC] RTP timestamp reset stream='{}' {} -> {}, flush depacketizer",
                     stream_id, prev_ts, pkt_ts
                 );
-                depacketizer = H264Packet::default();
+                depacketizer.reset();
                 if !batch.parts.is_empty() {
                     access_units += publish_access_unit(&manager, &stream_id, &mut batch);
                 }
@@ -293,7 +316,7 @@ async fn read_h264_track(
 
         let marker = pkt.header.marker;
         match h264_rtp_to_frame(&mut depacketizer, &pkt, &stream_id, &manager) {
-            Some(frame) => {
+            Ok(Some(frame)) => {
                 if is_parameter_set_only(&frame.data) {
                     continue;
                 }
@@ -311,23 +334,26 @@ async fn read_h264_track(
                     access_units += publish_access_unit(&manager, &stream_id, &mut batch);
                 }
             }
-            None => {
+            Ok(None) => {
                 if pkt.payload.is_empty() {
                     empty_nalu += 1;
-                } else {
-                    depacketize_fail += 1;
-                    if depacketize_fail <= 10 || depacketize_fail % 100 == 0 {
-                        warn!(
-                            "[WebRTC] depacketize skip stream='{}' fail={} pt={} payload={}B marker={} hex={} [{}]",
-                            stream_id,
-                            depacketize_fail,
-                            pkt.header.payload_type,
-                            pkt.payload.len(),
-                            pkt.header.marker,
-                            hex_prefix(&pkt.payload, 12),
-                            describe_rtp_payload(&pkt.payload)
-                        );
-                    }
+                }
+            }
+            Err(err) => {
+                depacketize_fail += 1;
+                if depacketize_fail <= 10 || depacketize_fail % 100 == 0 {
+                    warn!(
+                        "[WebRTC] depacketize skip stream='{}' fail={} err={:?} pt={} seq={} payload={}B marker={} hex={} [{}]",
+                        stream_id,
+                        depacketize_fail,
+                        err,
+                        pkt.header.payload_type,
+                        pkt.header.sequence_number,
+                        pkt.payload.len(),
+                        pkt.header.marker,
+                        hex_prefix(&pkt.payload, 12),
+                        describe_rtp_payload(&pkt.payload)
+                    );
                 }
             }
         }
@@ -468,11 +494,11 @@ fn store_nalu_config_from_rtp(manager: &StreamManager, stream_id: &str, payload:
 }
 
 fn h264_rtp_to_frame(
-    depacketizer: &mut H264Packet,
+    depacketizer: &mut H264RtpDepacketizer,
     pkt: &Packet,
     stream_id: &str,
     manager: &StreamManager,
-) -> Option<MediaFrame> {
+) -> Result<Option<MediaFrame>, H264DepacketizeError> {
     let payload = &pkt.payload;
 
     // Always extract SPS/PPS from RTP layer (STAP-A etc.)
@@ -482,13 +508,12 @@ fn h264_rtp_to_frame(
     let is_keyframe_rtp = rtp_h264::contains_idr(&rtp_nalus) || is_idr_rtp_payload(payload);
 
     // Depacketize for complete Annex B (handles FU-A reassembly)
-    let depayload = Bytes::copy_from_slice(payload);
-    let annex_b = match depacketizer.depacketize(&depayload) {
-        Ok(nalu) if !nalu.is_empty() => nalu,
-        Ok(_) => return None,
-        Err(_) => {
+    let annex_b = match depacketizer.push(payload) {
+        Ok(Some(nalu)) => nalu,
+        Ok(None) => return Ok(None),
+        Err(err) => {
             // Fallback: single-NALU / STAP-A without FU-A
-            return annex_b_from_rtp_payload(payload).map(|annex_b| {
+            return Ok(annex_b_from_rtp_payload(payload).map(|annex_b| {
                 let is_keyframe = is_keyframe_rtp || is_keyframe_annex_b(&annex_b);
                 MediaFrame::new(
                     stream_id.to_string(),
@@ -499,13 +524,14 @@ fn h264_rtp_to_frame(
                     CodecType::H264,
                 )
                 .with_clock_rate(VIDEO_RTP_CLOCK_RATE)
-            });
+            }))
+            .and_then(|frame| frame.map(Some).ok_or(err));
         }
     };
 
     let is_keyframe = is_keyframe_rtp || is_keyframe_annex_b(&annex_b);
 
-    Some(
+    Ok(Some(
         MediaFrame::new(
             stream_id.to_string(),
             0,
@@ -515,7 +541,7 @@ fn h264_rtp_to_frame(
             CodecType::H264,
         )
         .with_clock_rate(VIDEO_RTP_CLOCK_RATE),
-    )
+    ))
 }
 
 pub fn wire_ice_candidates(

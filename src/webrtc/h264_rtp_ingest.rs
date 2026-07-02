@@ -3,9 +3,7 @@
 use bytes::Bytes;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
-use webrtc::rtp::codecs::h264::H264Packet;
 use webrtc::rtp::packet::Packet;
-use webrtc::rtp::packetizer::Depacketizer;
 
 use crate::core::{CodecType, MediaFrame, StreamManager, VIDEO_RTP_CLOCK_RATE};
 
@@ -15,14 +13,14 @@ use super::h264_util::{
 use super::publish_signaling::latest_keyframe_request_age_ms;
 use super::rtp_h264::{
     self, annex_b_from_rtp_payload, describe_rtp_payload, extract_sps_pps_from_nalus,
-    is_idr_rtp_payload, parse_rtp_h264,
+    is_fu_a_continuation, is_idr_rtp_payload, parse_rtp_h264, H264RtpDepacketizer,
 };
 
 /// Stateful H264 RTP → Annex B access-unit publisher.
 pub struct H264RtpIngest {
     stream_id: String,
     manager: Arc<StreamManager>,
-    depacketizer: H264Packet,
+    depacketizer: H264RtpDepacketizer,
     batch: AccessUnitBatch,
     expected_seq: Option<u16>,
     units: u64,
@@ -41,7 +39,7 @@ impl H264RtpIngest {
         Self {
             stream_id,
             manager,
-            depacketizer: H264Packet::default(),
+            depacketizer: H264RtpDepacketizer::default(),
             batch: AccessUnitBatch::default(),
             expected_seq: None,
             units: 0,
@@ -213,7 +211,7 @@ impl H264RtpIngest {
     }
 
     fn discard_partial_access_unit(&mut self) {
-        self.depacketizer = H264Packet::default();
+        self.depacketizer.reset();
         self.batch.parts.clear();
         self.batch.is_keyframe = false;
     }
@@ -263,14 +261,6 @@ fn rtp_h264_packet_info(rtp: &[u8]) -> Option<RtpH264PacketInfo<'_>> {
     })
 }
 
-fn is_fu_a_continuation(payload: &[u8]) -> bool {
-    if payload.len() < 2 || (payload[0] & 0x1F) != 28 {
-        return false;
-    }
-    let start = (payload[1] & 0x80) != 0;
-    !start
-}
-
 fn store_nalu_config_from_rtp(manager: &StreamManager, stream_id: &str, payload: &[u8]) {
     let nalus = parse_rtp_h264(payload);
     let (sps, pps) = extract_sps_pps_from_nalus(&nalus);
@@ -300,7 +290,7 @@ fn store_nalu_config_from_rtp(manager: &StreamManager, stream_id: &str, payload:
 }
 
 fn h264_rtp_to_annex_b(
-    depacketizer: &mut H264Packet,
+    depacketizer: &mut H264RtpDepacketizer,
     pkt: &Packet,
     stream_id: &str,
     manager: &StreamManager,
@@ -311,10 +301,9 @@ fn h264_rtp_to_annex_b(
     let rtp_nalus = parse_rtp_h264(payload);
     let is_keyframe_rtp = rtp_h264::contains_idr(&rtp_nalus) || is_idr_rtp_payload(payload);
 
-    let depayload = Bytes::copy_from_slice(payload);
-    let annex_b = match depacketizer.depacketize(&depayload) {
-        Ok(nalu) if !nalu.is_empty() => nalu,
-        Ok(_) => return None,
+    let annex_b = match depacketizer.push(payload) {
+        Ok(Some(nalu)) => nalu,
+        Ok(None) => return None,
         Err(_) => {
             return annex_b_from_rtp_payload(payload).map(|annex_b| {
                 let is_keyframe = is_keyframe_rtp || is_keyframe_annex_b(&annex_b);

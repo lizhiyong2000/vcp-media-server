@@ -11,6 +11,74 @@ pub struct ParsedNalu {
     pub data: Vec<u8>, // raw NALU including 1-byte header
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H264DepacketizeError {
+    ShortPacket,
+    StapASizeLargerThanBuffer,
+    MissingFuStart,
+    UnsupportedNaluType(u8),
+}
+
+#[derive(Debug, Default)]
+pub struct H264RtpDepacketizer {
+    fu_buffer: Option<BytesMut>,
+}
+
+impl H264RtpDepacketizer {
+    pub fn push(&mut self, payload: &[u8]) -> Result<Option<Bytes>, H264DepacketizeError> {
+        if payload.is_empty() {
+            return Ok(None);
+        }
+        let nal_type = payload[0] & 0x1F;
+        match nal_type {
+            1..=23 => Ok(Some(nalus_to_annex_b(&[ParsedNalu {
+                nal_type,
+                data: payload.to_vec(),
+            }]))),
+            STAP_A => {
+                let nalus = parse_stap_a_checked(payload)?;
+                Ok(Some(nalus_to_annex_b(&nalus)))
+            }
+            FU_A => self.push_fu_a(payload),
+            _ => Err(H264DepacketizeError::UnsupportedNaluType(nal_type)),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.fu_buffer = None;
+    }
+
+    fn push_fu_a(&mut self, payload: &[u8]) -> Result<Option<Bytes>, H264DepacketizeError> {
+        if payload.len() < 2 {
+            self.reset();
+            return Err(H264DepacketizeError::ShortPacket);
+        }
+
+        let fu_indicator = payload[0];
+        let fu_header = payload[1];
+        let start = (fu_header & 0x80) != 0;
+        let end = (fu_header & 0x40) != 0;
+        let fragmented_nal_type = fu_header & 0x1F;
+
+        if start {
+            let mut buffer = BytesMut::new();
+            buffer.extend_from_slice(&[0, 0, 0, 1]);
+            buffer.extend_from_slice(&[(fu_indicator & 0xE0) | fragmented_nal_type]);
+            buffer.extend_from_slice(&payload[2..]);
+            self.fu_buffer = Some(buffer);
+        } else if self.fu_buffer.is_none() {
+            return Err(H264DepacketizeError::MissingFuStart);
+        } else if let Some(buffer) = &mut self.fu_buffer {
+            buffer.extend_from_slice(&payload[2..]);
+        }
+
+        if end {
+            return Ok(self.fu_buffer.take().map(|buffer| buffer.freeze()));
+        }
+        Ok(None)
+    }
+}
+
 /// Parse one RTP H264 payload into NALUs (complete only).
 pub fn parse_rtp_h264(payload: &[u8]) -> Vec<ParsedNalu> {
     if payload.is_empty() {
@@ -33,13 +101,17 @@ pub fn parse_rtp_h264(payload: &[u8]) -> Vec<ParsedNalu> {
 }
 
 fn parse_stap_a(payload: &[u8]) -> Vec<ParsedNalu> {
+    parse_stap_a_checked(payload).unwrap_or_default()
+}
+
+fn parse_stap_a_checked(payload: &[u8]) -> Result<Vec<ParsedNalu>, H264DepacketizeError> {
     let mut out = Vec::new();
     let mut i = 1; // skip STAP-A header
     while i + 2 <= payload.len() {
         let nalu_len = ((payload[i] as usize) << 8) | payload[i + 1] as usize;
         i += 2;
         if nalu_len == 0 || i + nalu_len > payload.len() {
-            break;
+            return Err(H264DepacketizeError::StapASizeLargerThanBuffer);
         }
         let nalu = &payload[i..i + nalu_len];
         if !nalu.is_empty() {
@@ -50,7 +122,7 @@ fn parse_stap_a(payload: &[u8]) -> Vec<ParsedNalu> {
         }
         i += nalu_len;
     }
-    out
+    Ok(out)
 }
 
 pub fn nalus_to_annex_b(nalus: &[ParsedNalu]) -> Bytes {
@@ -125,6 +197,14 @@ pub fn describe_rtp_payload(payload: &[u8]) -> String {
         .join("+")
 }
 
+pub fn is_fu_a_continuation(payload: &[u8]) -> bool {
+    if payload.len() < 2 || (payload[0] & 0x1F) != FU_A {
+        return false;
+    }
+    let start = (payload[1] & 0x80) != 0;
+    !start
+}
+
 pub fn hex_prefix(payload: &[u8], n: usize) -> String {
     payload
         .iter()
@@ -162,5 +242,29 @@ mod tests {
         let nalus = parse_rtp_h264(&payload);
         assert_eq!(nalus.len(), 1);
         assert_eq!(nalus[0].nal_type, 1);
+    }
+
+    #[test]
+    fn fu_a_middle_packets_are_pending_until_end() {
+        let mut depacketizer = H264RtpDepacketizer::default();
+
+        assert_eq!(depacketizer.push(&[0x7c, 0x85, 0x88]).unwrap(), None);
+        assert_eq!(depacketizer.push(&[0x7c, 0x05, 0x99]).unwrap(), None);
+        let annex_b = depacketizer
+            .push(&[0x7c, 0x45, 0xaa])
+            .unwrap()
+            .expect("end fragment should complete NAL");
+
+        assert_eq!(&annex_b[..], &[0, 0, 0, 1, 0x65, 0x88, 0x99, 0xaa]);
+    }
+
+    #[test]
+    fn fu_a_continuation_without_start_is_rejected() {
+        let mut depacketizer = H264RtpDepacketizer::default();
+
+        assert_eq!(
+            depacketizer.push(&[0x7c, 0x05, 0x99]),
+            Err(H264DepacketizeError::MissingFuStart)
+        );
     }
 }
