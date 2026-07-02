@@ -7,11 +7,12 @@ use webrtc::rtp::codecs::h264::H264Packet;
 use webrtc::rtp::packet::Packet;
 use webrtc::rtp::packetizer::Depacketizer;
 
-use crate::core::{CodecType, MediaFrame, StreamManager};
+use crate::core::{CodecType, MediaFrame, StreamManager, VIDEO_RTP_CLOCK_RATE};
 
 use super::h264_util::{
     contains_vcl_nalu, describe_annex_b, is_keyframe_annex_b, is_parameter_set_only,
 };
+use super::publish_signaling::latest_keyframe_request_age_ms;
 use super::rtp_h264::{
     self, annex_b_from_rtp_payload, describe_rtp_payload, extract_sps_pps_from_nalus,
     is_idr_rtp_payload, parse_rtp_h264,
@@ -113,6 +114,11 @@ impl H264RtpIngest {
         }
         let is_keyframe = self.batch.is_keyframe || is_keyframe_annex_b(&combined);
         let desc = describe_annex_b(&combined);
+        let keyframe_request = if is_keyframe {
+            latest_keyframe_request_age_ms(&self.stream_id)
+        } else {
+            None
+        };
         if !contains_vcl_nalu(&combined) {
             self.batch.parts.clear();
             self.batch.is_keyframe = false;
@@ -120,16 +126,12 @@ impl H264RtpIngest {
         }
         self.units += 1;
         let n = self.units;
+        let size = combined.len();
 
         if n == 1 {
             info!(
                 "[{}] First access unit stream='{}' size={} keyframe={} ts={} [{}]",
-                self.label,
-                self.stream_id,
-                combined.len(),
-                is_keyframe,
-                self.batch.timestamp,
-                desc
+                self.label, self.stream_id, size, is_keyframe, self.batch.timestamp, desc
             );
         } else if n <= 5 || is_keyframe || n % 100 == 0 {
             info!(
@@ -150,8 +152,35 @@ impl H264RtpIngest {
             Bytes::from(combined),
             is_keyframe,
             CodecType::H264,
-        );
+        )
+        .with_clock_rate(VIDEO_RTP_CLOCK_RATE);
         self.manager.publish_frame(frame);
+        if is_keyframe {
+            let ring_seq = self
+                .manager
+                .get_hub(&self.stream_id)
+                .map(|hub| hub.latest_seq());
+            match keyframe_request {
+                Some((request_id, age_ms)) => info!(
+                    "[{}] Published keyframe response stream='{}' request_id={} request_age_ms={} ring_seq={:?} rtp_ts={} size={}",
+                    self.label,
+                    self.stream_id,
+                    request_id,
+                    age_ms,
+                    ring_seq,
+                    self.batch.timestamp,
+                    size
+                ),
+                None => info!(
+                    "[{}] Published keyframe stream='{}' request_id=none ring_seq={:?} rtp_ts={} size={}",
+                    self.label,
+                    self.stream_id,
+                    ring_seq,
+                    self.batch.timestamp,
+                    size
+                ),
+            }
+        }
 
         self.batch.parts.clear();
         self.batch.is_keyframe = false;
@@ -297,19 +326,23 @@ fn h264_rtp_to_annex_b(
                     is_keyframe,
                     CodecType::H264,
                 )
+                .with_clock_rate(VIDEO_RTP_CLOCK_RATE)
             });
         }
     };
 
     let is_keyframe = is_keyframe_rtp || is_keyframe_annex_b(&annex_b);
-    Some(MediaFrame::new(
-        stream_id.to_string(),
-        0,
-        pkt.header.timestamp as u64,
-        annex_b,
-        is_keyframe,
-        CodecType::H264,
-    ))
+    Some(
+        MediaFrame::new(
+            stream_id.to_string(),
+            0,
+            pkt.header.timestamp as u64,
+            annex_b,
+            is_keyframe,
+            CodecType::H264,
+        )
+        .with_clock_rate(VIDEO_RTP_CLOCK_RATE),
+    )
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@ pub struct StoredFrame {
     pub stream_id: StreamId,
     pub track_id: TrackId,
     pub timestamp: u64,
+    pub clock_rate: Option<u32>,
     pub codec: CodecType,
     pub is_keyframe: bool,
     pub data: Bytes,
@@ -37,6 +38,7 @@ impl StoredFrame {
             self.is_keyframe,
             self.codec,
         )
+        .with_optional_clock_rate(self.clock_rate)
     }
 }
 
@@ -80,6 +82,7 @@ impl FrameRing {
             stream_id: frame.stream_id,
             track_id: frame.track_id,
             timestamp: frame.timestamp,
+            clock_rate: frame.clock_rate,
             codec: frame.codec,
             is_keyframe: frame.is_keyframe,
             data: frame.data,

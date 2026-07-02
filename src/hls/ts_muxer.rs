@@ -216,6 +216,7 @@ impl TsMuxer {
             frame.is_keyframe,
             frame.codec,
         );
+        let frame_for_pes = frame_for_pes.with_optional_clock_rate(frame.clock_rate);
         let pes = build_pes(&frame_for_pes, is_video);
 
         let cc = if is_video {

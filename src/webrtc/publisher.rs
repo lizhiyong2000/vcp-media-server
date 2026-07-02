@@ -13,14 +13,17 @@ use webrtc::track::track_remote::TrackRemote;
 
 use super::h264_util::{describe_annex_b, is_keyframe_annex_b, is_parameter_set_only};
 use super::peer::{new_peer_connection, wire_pc_debug};
-use super::publish_signaling::register_publish_pli;
+use super::publish_signaling::{latest_keyframe_request_age_ms, register_publish_pli};
 use super::rtp_h264::{
     self, annex_b_from_rtp_payload, describe_rtp_payload, extract_sps_pps_from_nalus, hex_prefix,
     is_idr_rtp_payload, parse_rtp_h264,
 };
 use super::sdp_h264::parse_sprop_parameter_sets;
 use super::signaling::ServerSignal;
-use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track};
+use crate::core::{
+    CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track,
+    VIDEO_RTP_CLOCK_RATE,
+};
 use webrtc::api::API;
 
 pub struct PublishSession {
@@ -365,17 +368,19 @@ fn publish_access_unit(
     }
     let is_keyframe = batch.is_keyframe || is_keyframe_annex_b(&combined);
     let desc = describe_annex_b(&combined);
+    let size = combined.len();
+    let keyframe_request = if is_keyframe {
+        latest_keyframe_request_age_ms(stream_id)
+    } else {
+        None
+    };
     static UNITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = UNITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
     if n == 1 {
         info!(
             "[WebRTC] First published access unit stream='{}' size={} keyframe={} ts={} [{}]",
-            stream_id,
-            combined.len(),
-            is_keyframe,
-            batch.timestamp,
-            desc
+            stream_id, size, is_keyframe, batch.timestamp, desc
         );
     } else if n <= 5 || is_keyframe {
         info!(
@@ -393,8 +398,22 @@ fn publish_access_unit(
         Bytes::from(combined),
         is_keyframe,
         CodecType::H264,
-    );
+    )
+    .with_clock_rate(VIDEO_RTP_CLOCK_RATE);
     manager.publish_frame(frame);
+    if is_keyframe {
+        let ring_seq = manager.get_hub(stream_id).map(|hub| hub.latest_seq());
+        match keyframe_request {
+            Some((request_id, age_ms)) => info!(
+                "[WebRTC] Published keyframe response stream='{}' request_id={} request_age_ms={} ring_seq={:?} rtp_ts={} size={}",
+                stream_id, request_id, age_ms, ring_seq, batch.timestamp, size
+            ),
+            None => info!(
+                "[WebRTC] Published keyframe stream='{}' request_id=none ring_seq={:?} rtp_ts={} size={}",
+                stream_id, ring_seq, batch.timestamp, size
+            ),
+        }
+    }
 
     batch.parts.clear();
     batch.is_keyframe = false;
@@ -407,6 +426,7 @@ async fn read_audio_track(
     track: Arc<TrackRemote>,
 ) -> Result<()> {
     let mut frames: u64 = 0;
+    let clock_rate = track.codec().capability.clock_rate;
     while let Ok((pkt, _)) = track.read_rtp().await {
         if pkt.payload.is_empty() {
             continue;
@@ -419,7 +439,8 @@ async fn read_audio_track(
             Bytes::copy_from_slice(&pkt.payload),
             false,
             CodecType::Opus,
-        );
+        )
+        .with_clock_rate(clock_rate);
         manager.publish_frame(frame);
     }
     Ok(())
@@ -477,20 +498,24 @@ fn h264_rtp_to_frame(
                     is_keyframe,
                     CodecType::H264,
                 )
+                .with_clock_rate(VIDEO_RTP_CLOCK_RATE)
             });
         }
     };
 
     let is_keyframe = is_keyframe_rtp || is_keyframe_annex_b(&annex_b);
 
-    Some(MediaFrame::new(
-        stream_id.to_string(),
-        0,
-        pkt.header.timestamp as u64,
-        annex_b,
-        is_keyframe,
-        CodecType::H264,
-    ))
+    Some(
+        MediaFrame::new(
+            stream_id.to_string(),
+            0,
+            pkt.header.timestamp as u64,
+            annex_b,
+            is_keyframe,
+            CodecType::H264,
+        )
+        .with_clock_rate(VIDEO_RTP_CLOCK_RATE),
+    )
 }
 
 pub fn wire_ice_candidates(

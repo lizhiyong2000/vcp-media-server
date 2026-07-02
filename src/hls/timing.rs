@@ -2,7 +2,9 @@
 
 use std::time::{Duration, SystemTime};
 
-use crate::core::media_timestamp_delta_ms;
+use crate::core::{
+    media_timestamp_delta_ms_with_clock, MILLISECOND_CLOCK_RATE, VIDEO_RTP_CLOCK_RATE,
+};
 
 /// Split when mux or publisher span reaches this fraction of target (25fps GOP ≈ 960ms).
 pub const SPLIT_THRESHOLD_RATIO: f64 = 0.85;
@@ -59,9 +61,14 @@ pub fn advance_video_mux_ms(
     session_last_raw_video: u64,
     session_video_mux_ms: u64,
     frame_timestamp: u64,
+    clock_rate: Option<u32>,
 ) -> (u64, u64) {
     let step = if session_last_raw_video > 0 && frame_timestamp > session_last_raw_video {
-        let delta = media_timestamp_delta_ms(session_last_raw_video, frame_timestamp);
+        let delta = media_timestamp_delta_ms_with_clock(
+            session_last_raw_video,
+            frame_timestamp,
+            clock_rate,
+        );
         if delta > 0 && delta < 500 {
             delta
         } else {
@@ -173,7 +180,8 @@ mod tests {
 
         for i in 0..25u64 {
             let ts = base + i * 3600;
-            let (new_raw, new_mux) = advance_video_mux_ms(last_raw, mux_ms, ts);
+            let (new_raw, new_mux) =
+                advance_video_mux_ms(last_raw, mux_ms, ts, Some(VIDEO_RTP_CLOCK_RATE));
             last_raw = new_raw;
             mux_ms = new_mux;
         }
@@ -186,14 +194,16 @@ mod tests {
 
     #[test]
     fn mux_timeline_uses_publisher_delta_not_wall_jump() {
-        let (_, mux0) = advance_video_mux_ms(0, 0, 1_000_000);
+        let (_, mux0) = advance_video_mux_ms(0, 0, 1_000_000, Some(MILLISECOND_CLOCK_RATE));
         assert_eq!(mux0, 0);
 
-        let (_, mux1) = advance_video_mux_ms(1_000_000, mux0, 1_000_040);
+        let (_, mux1) =
+            advance_video_mux_ms(1_000_000, mux0, 1_000_040, Some(MILLISECOND_CLOCK_RATE));
         assert_eq!(mux1, 40);
 
         // Stall then single frame — only one step, not wall elapsed.
-        let (_, mux2) = advance_video_mux_ms(1_000_040, mux1, 1_000_040);
+        let (_, mux2) =
+            advance_video_mux_ms(1_000_040, mux1, 1_000_040, Some(MILLISECOND_CLOCK_RATE));
         assert_eq!(mux2, 80);
     }
 

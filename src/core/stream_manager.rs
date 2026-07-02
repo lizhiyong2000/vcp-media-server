@@ -416,7 +416,7 @@ impl StreamManager {
         }
     }
 
-    pub fn get_last_keyframe(&self, stream_id: &str) -> Option<(Vec<u8>, u64)> {
+    pub fn get_last_keyframe(&self, stream_id: &str) -> Option<(Vec<u8>, u64, Option<u32>)> {
         self.get_hub(stream_id)?.latest_idr_bytes()
     }
 
@@ -680,7 +680,7 @@ mod tests {
         );
         assert_eq!(
             manager.get_last_keyframe("s"),
-            Some((vec![0, 0, 0, 1, 0x65], 1000))
+            Some((vec![0, 0, 0, 1, 0x65], 1000, None))
         );
 
         manager.set_unpublished("s").unwrap();

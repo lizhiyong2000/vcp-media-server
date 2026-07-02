@@ -16,7 +16,7 @@ use super::play_egress::{
 };
 use super::{RtspRequest, RtspResponse, RtspServer, RtspSession, TransportMode};
 use crate::core::dispatch::DispatchError;
-use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager};
+use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager, AAC_DEFAULT_CLOCK_RATE};
 use crate::webrtc::H264RtpIngest;
 
 pub struct RtspServerSession {
@@ -142,6 +142,7 @@ impl RtspServerSession {
 
         let manager = Arc::clone(&self.manager);
         let peer_addr = self.peer_addr;
+        let session_tracks = self.session.tracks.clone();
 
         tokio::spawn(async move {
             info!(
@@ -175,6 +176,13 @@ impl RtspServerSession {
                             let ts = u32::from_be_bytes(buffer[4..8].try_into().unwrap_or([0; 4]))
                                 as u64;
                             let payload_type = buffer[1] & 0x7F;
+                            let clock_rate = session_tracks
+                                .iter()
+                                .find(|track| {
+                                    track.id == track_id || track.payload_type == payload_type
+                                })
+                                .map(|track| track.clock_rate)
+                                .unwrap_or(AAC_DEFAULT_CLOCK_RATE);
                             let codec = if payload_type == 97 {
                                 CodecType::AAC
                             } else {
@@ -191,6 +199,7 @@ impl RtspServerSession {
                                 stream_id: stream_id.clone(),
                                 track_id,
                                 timestamp: ts,
+                                clock_rate: Some(clock_rate),
                                 data: aac_data.into(),
                                 is_keyframe: marker,
                                 codec,
@@ -771,6 +780,13 @@ impl RtspServerSession {
 
             // Audio / other tracks: pass through as before
             let payload_type = rtp_payload[1] & 0x7F;
+            let clock_rate = self
+                .session
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id || track.payload_type == payload_type)
+                .map(|track| track.clock_rate)
+                .unwrap_or(AAC_DEFAULT_CLOCK_RATE);
             let codec = if payload_type == 97 {
                 CodecType::AAC
             } else {
@@ -793,6 +809,7 @@ impl RtspServerSession {
                 stream_id: stream_id.clone(),
                 track_id: track_id as u8,
                 timestamp: rtp_timestamp as u64,
+                clock_rate: Some(clock_rate),
                 data: aac_data.into(),
                 is_keyframe: marker,
                 codec,

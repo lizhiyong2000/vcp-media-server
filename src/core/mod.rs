@@ -22,7 +22,11 @@ pub use config::{
 pub use protocol::{ProtocolInfo, ProtocolRegistry, ProtocolType, StreamSink};
 pub use pusher::*;
 pub use tester::StreamTester;
-pub use timestamp::{flv_timestamp_ms, media_timestamp_delta_ms, FlvPlayTimeline};
+pub use timestamp::{
+    flv_timestamp_ms, media_frame_timestamp_delta_ms, media_timestamp_delta_ms,
+    media_timestamp_delta_ms_with_clock, FlvPlayTimeline, AAC_DEFAULT_CLOCK_RATE,
+    MILLISECOND_CLOCK_RATE, VIDEO_RTP_CLOCK_RATE,
+};
 
 pub type StreamId = String;
 pub type TrackId = u8;
@@ -324,6 +328,7 @@ pub struct MediaFrame {
     pub stream_id: StreamId,
     pub track_id: TrackId,
     pub timestamp: u64,
+    pub clock_rate: Option<u32>,
     pub data: Bytes,
     pub is_keyframe: bool,
     pub codec: CodecType,
@@ -343,11 +348,22 @@ impl MediaFrame {
             stream_id,
             track_id,
             timestamp,
+            clock_rate: None,
             data,
             is_keyframe,
             codec,
             rtp_data: None,
         }
+    }
+
+    pub fn with_clock_rate(mut self, clock_rate: u32) -> Self {
+        self.clock_rate = Some(clock_rate);
+        self
+    }
+
+    pub fn with_optional_clock_rate(mut self, clock_rate: Option<u32>) -> Self {
+        self.clock_rate = clock_rate;
+        self
     }
 
     pub fn with_rtp_data(mut self, rtp_data: Bytes) -> Self {

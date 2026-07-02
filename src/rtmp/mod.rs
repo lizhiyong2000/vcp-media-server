@@ -18,11 +18,24 @@ use tracing::{debug, error, info, warn};
 use crate::core::dispatch::DispatchError;
 use crate::core::{
     default_live_tracks, CodecType, DispatchPolicy, MediaFrame, StreamManager, StreamProtocol,
-    StreamSourceMode, StreamStatus,
+    StreamSourceMode, StreamStatus, MILLISECOND_CLOCK_RATE,
 };
 use crate::webrtc::{annex_b_with_config, request_publisher_keyframe};
 use chunk::RtmpMessage;
 use session::{RtmpSession, SessionState};
+
+const RTMP_PRIME_MAX_FRAME_LAG: u64 = 30;
+const RTMP_PRIME_MAX_MEDIA_LAG_MS: u64 = 1_000;
+const RTMP_PLAY_MAX_SEND_LEAD_MS: u64 = 200;
+
+fn rtmp_play_pacing_delay_ms(rtmp_ts: u32, elapsed_ms: u64, max_lead_ms: u64) -> Option<u64> {
+    let lead_ms = (rtmp_ts as u64).saturating_sub(elapsed_ms);
+    if lead_ms > max_lead_ms {
+        Some(lead_ms - max_lead_ms)
+    } else {
+        None
+    }
+}
 
 /// 将 RTMP 消息类型 ID 转为可读名称
 fn msg_type_name(t: u8) -> &'static str {
@@ -89,6 +102,7 @@ fn prepend_rtmp_video_config(
         frame.is_keyframe,
         frame.codec,
     )
+    .with_optional_clock_rate(frame.clock_rate)
 }
 
 fn stream_has_codec(stream: &crate::core::Stream, codec: CodecType) -> bool {
@@ -538,7 +552,8 @@ impl RtmpServer {
                                     Bytes::from(annex_b),
                                     is_keyframe,
                                     CodecType::H264,
-                                );
+                                )
+                                .with_clock_rate(MILLISECOND_CLOCK_RATE);
                                 conn.stream_manager.publish_frame(frame);
                             }
                         }
@@ -609,7 +624,8 @@ impl RtmpServer {
                         Bytes::copy_from_slice(audio_data),
                         false,
                         CodecType::AAC,
-                    );
+                    )
+                    .with_clock_rate(MILLISECOND_CLOCK_RATE);
                     conn.stream_manager.publish_frame(frame);
                 }
             }
@@ -985,37 +1001,73 @@ impl RtmpServer {
                             .prime_from_idr(&conn.stream_manager, &play_stream_id)
                             .await;
                         if pending.is_some() {
+                            let pending_ts = pending.as_ref().map(|frame| frame.timestamp);
                             let live_lag =
                                 reader.hub().latest_seq().saturating_sub(reader.cursor());
+                            let media_lag_ms = reader.cursor_media_lag_ms();
+                            let frame_lag_ok = live_lag <= RTMP_PRIME_MAX_FRAME_LAG;
+                            let media_lag_ok = media_lag_ms
+                                .map(|lag| lag <= RTMP_PRIME_MAX_MEDIA_LAG_MS)
+                                .unwrap_or(true);
                             info!(
-                                "[RTMP] [{}] PLAY prime got IDR after={}ms cursor={} live_lag={}",
+                                "[RTMP] [{}] PLAY prime media-lag decision after={}ms stream='{}' pending_ts={:?} cursor={} latest_seq={} latest_idr={:?} live_lag={} media_lag_ms={:?} frame_threshold={} media_threshold_ms={} frame_lag_ok={} media_lag_ok={}",
                                 peer_addr,
                                 play_started_at.elapsed().as_millis(),
+                                play_stream_id,
+                                pending_ts,
                                 reader.cursor(),
-                                live_lag
+                                reader.hub().latest_seq(),
+                                reader.hub().latest_idr_seq(),
+                                live_lag,
+                                media_lag_ms,
+                                RTMP_PRIME_MAX_FRAME_LAG,
+                                RTMP_PRIME_MAX_MEDIA_LAG_MS,
+                                frame_lag_ok,
+                                media_lag_ok
                             );
-                            if live_lag > 30 {
+                            if !frame_lag_ok || !media_lag_ok {
                                 info!(
-                                    "[RTMP] [{}] primed IDR is stale by {} frames; wait for fresh live IDR",
-                                    peer_addr, live_lag
+                                    "[RTMP] [{}] PLAY prime rejected IDR stream='{}' reason_frame_lag={} reason_media_lag={} live_lag={} media_lag_ms={:?}; snap live and wait for fresh IDR",
+                                    peer_addr,
+                                    play_stream_id,
+                                    !frame_lag_ok,
+                                    !media_lag_ok,
+                                    live_lag,
+                                    media_lag_ms
                                 );
                                 pending = None;
                                 reader.snap_to_live_edge();
                                 let requested = request_publisher_keyframe(&play_stream_id);
                                 info!(
-                                    "[RTMP] [{}] requested fresh keyframe after stale prime: {}",
-                                    peer_addr, requested
+                                    "[RTMP] [{}] PLAY after stale prime snap cursor={} latest_seq={} requested_fresh_keyframe={}",
+                                    peer_addr,
+                                    reader.cursor(),
+                                    reader.hub().latest_seq(),
+                                    requested
                                 );
                             } else {
+                                info!(
+                                    "[RTMP] [{}] PLAY prime accepted IDR stream='{}' cursor={} next_cursor={} live_lag={} media_lag_ms={:?}; start sequential send from primed GOP",
+                                    peer_addr,
+                                    play_stream_id,
+                                    reader.cursor(),
+                                    reader.cursor().saturating_add(1),
+                                    live_lag,
+                                    media_lag_ms
+                                );
                                 reader.advance_cursor();
                             }
                         } else {
                             reader.snap_to_live_edge();
                             let requested = request_publisher_keyframe(&play_stream_id);
                             info!(
-                                "[RTMP] [{}] PLAY prime no IDR after={}ms; snapped live and requested_keyframe={}",
+                                "[RTMP] [{}] PLAY prime no IDR after={}ms stream='{}' cursor={} latest_seq={} latest_idr={:?} requested_keyframe={}",
                                 peer_addr,
                                 play_started_at.elapsed().as_millis(),
+                                play_stream_id,
+                                reader.cursor(),
+                                reader.hub().latest_seq(),
+                                reader.hub().latest_idr_seq(),
                                 requested
                             );
                         }
@@ -1023,13 +1075,16 @@ impl RtmpServer {
                             let mut video_streaming = false;
                             let mut frames_sent = 0u64;
                             let mut clock = session::RtmpPlayClock::default();
+                            let send_started_at = Instant::now();
                             let mut last_keyframe_request = Instant::now();
                             loop {
-                                let frames = if let Some(frame) = pending.take() {
-                                    vec![frame]
+                                let (frames, frame_source) = if let Some(frame) = pending.take() {
+                                    (vec![frame], "pending_prime")
                                 } else {
                                     match reader.recv_batch().await {
-                                        Ok(frames) if !frames.is_empty() => frames,
+                                        Ok(frames) if !frames.is_empty() => {
+                                            (frames, "dispatch_batch")
+                                        }
                                         Ok(_) => continue,
                                         Err(DispatchError::Closed) => break,
                                     }
@@ -1054,21 +1109,33 @@ impl RtmpServer {
                                                 let requested =
                                                     request_publisher_keyframe(&stream_id_for_play);
                                                 info!(
-                                                    "[RTMP] [{}] waiting for first IDR; dropped non-IDR ts={} requested_keyframe={}",
-                                                    peer_log, frame.timestamp, requested
+                                                    "[RTMP] [{}] waiting for first IDR; dropped non-IDR stream='{}' source={} ts={} cursor={} latest_seq={} live_lag={} media_lag_ms={:?} requested_keyframe={}",
+                                                    peer_log,
+                                                    stream_id_for_play,
+                                                    frame_source,
+                                                    frame.timestamp,
+                                                    reader.cursor(),
+                                                    reader.hub().latest_seq(),
+                                                    reader.hub().latest_seq().saturating_sub(reader.cursor()),
+                                                    reader.cursor_media_lag_ms(),
+                                                    requested
                                                 );
                                                 last_keyframe_request = Instant::now();
                                             }
                                             continue;
                                         }
                                         info!(
-                                            "[RTMP] [{}] accepted first video IDR after={}ms stream='{}' raw_ts={} size={} pending_prime={}",
+                                            "[RTMP] [{}] accepted first video IDR after={}ms stream='{}' raw_ts={} size={} source={} cursor={} latest_seq={} live_lag={} media_lag_ms={:?}",
                                             peer_log,
                                             play_started_at.elapsed().as_millis(),
                                             stream_id_for_play,
                                             frame.timestamp,
                                             frame.data.len(),
-                                            frames_sent == 0
+                                            frame_source,
+                                            reader.cursor(),
+                                            reader.hub().latest_seq(),
+                                            reader.hub().latest_seq().saturating_sub(reader.cursor()),
+                                            reader.cursor_media_lag_ms()
                                         );
                                         video_streaming = true;
                                     }
@@ -1077,14 +1144,19 @@ impl RtmpServer {
                                     }
                                     if frames_sent == 0 {
                                         info!(
-                                            "[RTMP] [{}] >>> PREPARE first frame after={}ms: stream='{}' codec={:?} keyframe={} raw_ts={} size={}",
+                                            "[RTMP] [{}] >>> PREPARE first frame after={}ms: stream='{}' source={} codec={:?} keyframe={} raw_ts={} size={} cursor={} latest_seq={} live_lag={} media_lag_ms={:?}",
                                             peer_log,
                                             play_started_at.elapsed().as_millis(),
                                             stream_id_for_play,
+                                            frame_source,
                                             frame.codec,
                                             frame.is_keyframe,
                                             frame.timestamp,
-                                            frame.data.len()
+                                            frame.data.len(),
+                                            reader.cursor(),
+                                            reader.hub().latest_seq(),
+                                            reader.hub().latest_seq().saturating_sub(reader.cursor()),
+                                            reader.cursor_media_lag_ms()
                                         );
                                     }
                                     let data = match frame.codec {
@@ -1110,6 +1182,28 @@ impl RtmpServer {
                                         _ => (0x08u8, chunk::CSID_AUDIO),
                                     };
                                     let rtmp_ts = clock.map(&frame);
+                                    let send_elapsed_ms =
+                                        send_started_at.elapsed().as_millis() as u64;
+                                    if let Some(delay_ms) = rtmp_play_pacing_delay_ms(
+                                        rtmp_ts,
+                                        send_elapsed_ms,
+                                        RTMP_PLAY_MAX_SEND_LEAD_MS,
+                                    ) {
+                                        if frames_sent == 0 || delay_ms >= 100 {
+                                            info!(
+                                                "[RTMP] [{}] pacing play send stream='{}' rtmp_ts={} elapsed_ms={} delay_ms={} max_lead_ms={} cursor={} latest_seq={}",
+                                                peer_log,
+                                                stream_id_for_play,
+                                                rtmp_ts,
+                                                send_elapsed_ms,
+                                                delay_ms,
+                                                RTMP_PLAY_MAX_SEND_LEAD_MS,
+                                                reader.cursor(),
+                                                reader.hub().latest_seq()
+                                            );
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    }
                                     let rtmp_msg = chunk::encode_message(
                                         msg_type,
                                         rtmp_ts,
@@ -1125,23 +1219,39 @@ impl RtmpServer {
                                     }
                                     if frames_sent == 0 {
                                         info!(
-                                            "[RTMP] [{}] >>> SENT first frame after={}ms: stream='{}' codec={:?} keyframe={} raw_ts={} rtmp_ts={} payload_bytes={} message_bytes={}",
+                                            "[RTMP] [{}] >>> SENT first frame after={}ms: stream='{}' source={} codec={:?} keyframe={} raw_ts={} rtmp_ts={} send_elapsed_ms={} payload_bytes={} message_bytes={} cursor={} latest_seq={} live_lag={} media_lag_ms={:?}",
                                             peer_log,
                                             play_started_at.elapsed().as_millis(),
                                             stream_id_for_play,
+                                            frame_source,
                                             frame.codec,
                                             frame.is_keyframe,
                                             frame.timestamp,
                                             rtmp_ts,
+                                            send_started_at.elapsed().as_millis(),
                                             data.len(),
-                                            rtmp_msg.len()
+                                            rtmp_msg.len(),
+                                            reader.cursor(),
+                                            reader.hub().latest_seq(),
+                                            reader.hub().latest_seq().saturating_sub(reader.cursor()),
+                                            reader.cursor_media_lag_ms()
                                         );
                                     }
                                     frames_sent += 1;
                                     if frames_sent % 100 == 0 {
+                                        let elapsed_ms =
+                                            send_started_at.elapsed().as_millis() as u64;
+                                        let send_lead_ms =
+                                            (rtmp_ts as u64).saturating_sub(elapsed_ms);
                                         info!(
-                                            "[RTMP] >>> SEND {} frames to player (codec={:?} rtmp_ts={})",
-                                            frames_sent, frame.codec, rtmp_ts
+                                            "[RTMP] >>> SEND {} frames to player (codec={:?} rtmp_ts={} elapsed_ms={} send_lead_ms={} cursor={} latest_seq={})",
+                                            frames_sent,
+                                            frame.codec,
+                                            rtmp_ts,
+                                            elapsed_ms,
+                                            send_lead_ms,
+                                            reader.cursor(),
+                                            reader.hub().latest_seq()
                                         );
                                     }
                                 }
@@ -1434,5 +1544,13 @@ mod tests {
         assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x65]));
         assert_eq!(prepared.timestamp, frame.timestamp);
         assert!(prepared.is_keyframe);
+    }
+
+    #[test]
+    fn rtmp_play_pacing_limits_future_media_lead() {
+        assert_eq!(rtmp_play_pacing_delay_ms(1_000, 1_000, 200), None);
+        assert_eq!(rtmp_play_pacing_delay_ms(1_200, 1_000, 200), None);
+        assert_eq!(rtmp_play_pacing_delay_ms(1_500, 1_000, 200), Some(300));
+        assert_eq!(rtmp_play_pacing_delay_ms(900, 1_000, 200), None);
     }
 }

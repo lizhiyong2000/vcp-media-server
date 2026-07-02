@@ -9,11 +9,22 @@ use tracing::{debug, error, info, warn};
 use super::client_session::RtspClientSession;
 use super::common::RtspCommon;
 use super::RtspRequest;
-use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track};
+use crate::core::{
+    CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track,
+    AAC_DEFAULT_CLOCK_RATE,
+};
 use crate::webrtc::H264RtpIngest;
 
 pub struct RtspPuller {
     stream_manager: Arc<StreamManager>,
+}
+
+fn rtsp_clock_rate_for_track(tracks: &[Track], track_id: u8, payload_type: u8) -> u32 {
+    tracks
+        .iter()
+        .find(|track| track.id == track_id || track.payload_type == payload_type)
+        .map(|track| track.clock_rate)
+        .unwrap_or(AAC_DEFAULT_CLOCK_RATE)
 }
 
 impl RtspPuller {
@@ -139,6 +150,7 @@ impl RtspPuller {
         let udp_sockets = session.udp_track_sockets();
         let session_clone = session;
         let remote_url_clone = remote_url.to_string();
+        let receive_tracks = tracks_to_create.clone();
 
         info!(
             "[RTSP Puller] Transport: {}",
@@ -148,12 +160,12 @@ impl RtspPuller {
         tokio::spawn(async move {
             if use_udp {
                 tokio::select! {
-                    _ = Self::udp_receive_loop(udp_sockets, manager_clone.clone(), stream_id_clone.clone()) => (),
+                    _ = Self::udp_receive_loop(udp_sockets, manager_clone.clone(), stream_id_clone.clone(), receive_tracks.clone()) => (),
                     _ = Self::send_keepalive(writer, session_clone, remote_url_clone) => (),
                 }
             } else {
                 tokio::select! {
-                    _ = Self::rtp_receive_loop(reader, manager_clone.clone(), stream_id_clone.clone()) => (),
+                    _ = Self::rtp_receive_loop(reader, manager_clone.clone(), stream_id_clone.clone(), receive_tracks.clone()) => (),
                     _ = Self::send_keepalive(writer, session_clone, remote_url_clone) => (),
                 }
             }
@@ -166,6 +178,7 @@ impl RtspPuller {
         mut reader: tokio::net::tcp::OwnedReadHalf,
         manager: Arc<StreamManager>,
         stream_id: String,
+        tracks: Vec<Track>,
     ) {
         let mut rtsp_response = String::new();
         let mut frame_count: u64 = 0;
@@ -214,6 +227,7 @@ impl RtspPuller {
                         rtp_payload[4..8].try_into().unwrap_or([0; 4]),
                     ));
                     let payload_type = rtp_payload[1] & 0x7F;
+                    let clock_rate = rtsp_clock_rate_for_track(&tracks, track_id, payload_type);
                     let codec = if payload_type == 97 {
                         CodecType::AAC
                     } else {
@@ -234,6 +248,7 @@ impl RtspPuller {
                         stream_id: stream_id.clone(),
                         track_id,
                         timestamp: ts,
+                        clock_rate: Some(clock_rate),
                         data: aac_data.into(),
                         is_keyframe: marker,
                         codec,
@@ -276,6 +291,7 @@ impl RtspPuller {
         tracks: Vec<(usize, Arc<UdpSocket>)>,
         manager: Arc<StreamManager>,
         stream_id: String,
+        sdp_tracks: Vec<Track>,
     ) {
         info!(
             "[RTSP Puller] [UDP Loop] Starting for stream {} ({} tracks)",
@@ -286,6 +302,7 @@ impl RtspPuller {
         for (track_id, socket) in tracks {
             let manager = Arc::clone(&manager);
             let sid = stream_id.clone();
+            let sdp_tracks = sdp_tracks.clone();
 
             tokio::spawn(async move {
                 let mut buffer = vec![0u8; 65535];
@@ -318,6 +335,12 @@ impl RtspPuller {
                                 let ts = u64::from(u32::from_be_bytes(
                                     buffer[4..8].try_into().unwrap_or([0; 4]),
                                 ));
+                                let payload_type = buffer[1] & 0x7F;
+                                let clock_rate = rtsp_clock_rate_for_track(
+                                    &sdp_tracks,
+                                    track_id as u8,
+                                    payload_type,
+                                );
                                 let media = crate::webrtc::rtp_h264_media_payload(&buffer[..len])
                                     .map(|(p, _, _)| p)
                                     .unwrap_or(&buffer[12..len]);
@@ -329,6 +352,7 @@ impl RtspPuller {
                                     stream_id: sid.clone(),
                                     track_id: track_id as u8,
                                     timestamp: ts,
+                                    clock_rate: Some(clock_rate),
                                     data: aac_data.into(),
                                     is_keyframe: marker,
                                     codec: CodecType::AAC,

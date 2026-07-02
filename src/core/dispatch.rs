@@ -7,6 +7,7 @@ use tracing::info;
 
 use super::frame_ring::{is_playable_video, is_video_keyframe, SnapMode};
 use super::stream_hub::StreamHub;
+use super::timestamp::media_frame_timestamp_delta_ms;
 use super::{CodecType, MediaFrame, StreamManager};
 use crate::webrtc::{h264_util::is_keyframe_annex_b, request_publisher_keyframe};
 
@@ -16,6 +17,8 @@ const MAX_SEQUENTIAL_BATCH: u64 = 96;
 const WEBRTC_LAG_SNAP_THRESHOLD: u64 = 45;
 /// Reuse an existing IDR only when it is close to live edge; otherwise wait for a fresh one.
 const PRIME_EXISTING_IDR_MAX_LAG: u64 = 30;
+/// Low-latency live playback should not replay an old GOP even if the frame count is small.
+const PRIME_EXISTING_IDR_MAX_MEDIA_LAG_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchPolicy {
@@ -91,6 +94,35 @@ impl DispatchReader {
         self.cursor = self.hub.snap(SnapMode::LatestIdr);
     }
 
+    pub fn cursor_media_lag_ms(&self) -> Option<u64> {
+        self.media_lag_from_seq_ms(self.cursor)
+    }
+
+    fn idr_is_close_to_live(&self, idr_seq: u64) -> (bool, u64, Option<u64>) {
+        let frame_lag = self.hub.latest_seq().saturating_sub(idr_seq);
+        let media_lag_ms = self.media_lag_from_seq_ms(idr_seq);
+        let close = frame_lag <= PRIME_EXISTING_IDR_MAX_LAG
+            && media_lag_ms
+                .map(|lag| lag <= PRIME_EXISTING_IDR_MAX_MEDIA_LAG_MS)
+                .unwrap_or(true);
+        (close, frame_lag, media_lag_ms)
+    }
+
+    fn media_lag_from_seq_ms(&self, from_seq: u64) -> Option<u64> {
+        let latest = self.hub.latest_seq();
+        if from_seq > latest {
+            return Some(0);
+        }
+        let from_frame = self.hub.get(from_seq)?;
+        let latest_video = self
+            .hub
+            .frames_from(from_seq, latest)
+            .into_iter()
+            .rev()
+            .find(is_playable_video)?;
+        Some(media_frame_timestamp_delta_ms(&from_frame, &latest_video))
+    }
+
     /// Wait for IDR, then position cursor at latest IDR seq.
     pub async fn prime_from_idr(
         &mut self,
@@ -115,31 +147,32 @@ impl DispatchReader {
         while Instant::now() < deadline {
             if let Some(idr_seq) = self.hub.latest_idr_seq() {
                 let fresh_after_request = idr_seq > baseline_latest;
-                let close_to_live =
-                    baseline_latest.saturating_sub(idr_seq) <= PRIME_EXISTING_IDR_MAX_LAG;
+                let (close_to_live, live_lag, media_lag_ms) = self.idr_is_close_to_live(idr_seq);
                 if fresh_after_request || close_to_live {
                     if let Some(idr) = self.hub.get(idr_seq).filter(is_playable_idr) {
                         self.cursor = idr_seq;
                         self.primed = true;
                         info!(
-                            "[Dispatch] [{}] prime_from_idr hit IDR after={}ms ts={} seq={} fresh={} live_lag={} latest_seq={}",
+                            "[Dispatch] [{}] prime_from_idr hit IDR after={}ms ts={} seq={} fresh={} live_lag={} media_lag_ms={:?} latest_seq={}",
                             stream_id,
                             started_at.elapsed().as_millis(),
                             idr.timestamp,
                             self.cursor,
                             fresh_after_request,
-                            self.hub.latest_seq().saturating_sub(idr_seq),
+                            live_lag,
+                            media_lag_ms,
                             self.hub.latest_seq()
                         );
                         return Some(idr);
                     }
                 } else {
                     info!(
-                        "[Dispatch] [{}] prime_from_idr waiting fresh IDR after={}ms latest_idr_seq={} lag_from_baseline={} baseline_latest={}",
+                        "[Dispatch] [{}] prime_from_idr waiting fresh IDR after={}ms latest_idr_seq={} live_lag={} media_lag_ms={:?} baseline_latest={}",
                         stream_id,
                         started_at.elapsed().as_millis(),
                         idr_seq,
-                        baseline_latest.saturating_sub(idr_seq),
+                        live_lag,
+                        media_lag_ms,
                         baseline_latest
                     );
                 }
@@ -155,43 +188,64 @@ impl DispatchReader {
         }
 
         if let Some(idr_seq) = self.hub.latest_idr_seq() {
-            if let Some(idr) = self.hub.get(idr_seq).filter(is_playable_idr) {
-                self.cursor = idr_seq;
-                self.primed = true;
+            let fresh_after_request = idr_seq > baseline_latest;
+            let (close_to_live, live_lag, media_lag_ms) = self.idr_is_close_to_live(idr_seq);
+            if fresh_after_request || close_to_live {
+                if let Some(idr) = self.hub.get(idr_seq).filter(is_playable_idr) {
+                    self.cursor = idr_seq;
+                    self.primed = true;
+                    info!(
+                        "[Dispatch] [{}] prime_from_idr fallback IDR after={}ms ts={} seq={} fresh={} live_lag={} media_lag_ms={:?} latest_seq={}",
+                        stream_id,
+                        started_at.elapsed().as_millis(),
+                        idr.timestamp,
+                        self.cursor,
+                        fresh_after_request,
+                        live_lag,
+                        media_lag_ms,
+                        self.hub.latest_seq()
+                    );
+                    return Some(idr);
+                }
+            } else {
                 info!(
-                    "[Dispatch] [{}] prime_from_idr fallback IDR after={}ms ts={} seq={} live_lag={} latest_seq={}",
+                    "[Dispatch] [{}] prime_from_idr reject stale fallback IDR after={}ms seq={} live_lag={} media_lag_ms={:?} latest_seq={}",
                     stream_id,
                     started_at.elapsed().as_millis(),
-                    idr.timestamp,
-                    self.cursor,
-                    self.hub.latest_seq().saturating_sub(idr_seq),
+                    idr_seq,
+                    live_lag,
+                    media_lag_ms,
                     self.hub.latest_seq()
                 );
-                return Some(idr);
             }
         }
 
         // Merge SPS/PPS from stream metadata when ring IDR lacks config
-        if let Some((data, ts)) = manager.get_last_keyframe(stream_id) {
-            self.cursor = self.hub.snap(SnapMode::LatestIdr);
-            self.primed = true;
-            info!(
-                "[Dispatch] [{}] prime_from_idr metadata fallback after={}ms ts={} cursor={} latest_seq={} latest_idr={:?}",
-                stream_id,
-                started_at.elapsed().as_millis(),
-                ts,
-                self.cursor,
-                self.hub.latest_seq(),
-                self.hub.latest_idr_seq()
-            );
-            return Some(MediaFrame::new(
-                stream_id.to_string(),
-                0,
-                ts,
-                bytes::Bytes::from(data),
-                true,
-                CodecType::H264,
-            ));
+        if self.hub.is_empty() {
+            if let Some((data, ts, clock_rate)) = manager.get_last_keyframe(stream_id) {
+                self.cursor = self.hub.snap(SnapMode::LatestIdr);
+                self.primed = true;
+                info!(
+                    "[Dispatch] [{}] prime_from_idr metadata fallback after={}ms ts={} cursor={} latest_seq={} latest_idr={:?}",
+                    stream_id,
+                    started_at.elapsed().as_millis(),
+                    ts,
+                    self.cursor,
+                    self.hub.latest_seq(),
+                    self.hub.latest_idr_seq()
+                );
+                return Some(
+                    MediaFrame::new(
+                        stream_id.to_string(),
+                        0,
+                        ts,
+                        bytes::Bytes::from(data),
+                        true,
+                        CodecType::H264,
+                    )
+                    .with_optional_clock_rate(clock_rate),
+                );
+            }
         }
         info!(
             "[Dispatch] [{}] prime_from_idr failed after={}ms latest_seq={} latest_idr={:?}",
@@ -585,6 +639,77 @@ mod tests {
             reader.cursor(),
             41,
             "cursor should start at the fresh IDR seq"
+        );
+    }
+
+    #[tokio::test]
+    async fn prime_from_idr_rejects_stale_fallback_without_fresh_idr() {
+        let hub = StreamHub::new("s");
+        let base = 2_648_000_000u64;
+        hub.publish(MediaFrame::new(
+            "s".into(),
+            0,
+            base,
+            annex_b_idr(),
+            true,
+            CodecType::H264,
+        ));
+        for i in 1..=PRIME_EXISTING_IDR_MAX_LAG + 10 {
+            hub.publish(MediaFrame::new(
+                "s".into(),
+                0,
+                base + i * 3600,
+                annex_b_p(),
+                false,
+                CodecType::H264,
+            ));
+        }
+
+        let manager = StreamManager::new();
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::LiveSequential);
+        let idr = reader.prime_from_idr(&manager, "s").await;
+
+        assert!(
+            idr.is_none(),
+            "stale IDR fallback should be rejected to avoid replaying historical GOP"
+        );
+        assert_eq!(
+            reader.cursor(),
+            hub.latest_seq().saturating_add(1),
+            "failed prime should leave live reader at its subscribed live edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn prime_from_idr_rejects_small_frame_lag_when_media_time_is_stale() {
+        let hub = StreamHub::new("s");
+        let base = 2_648_000_000u64;
+        hub.publish(MediaFrame::new(
+            "s".into(),
+            0,
+            base,
+            annex_b_idr(),
+            true,
+            CodecType::H264,
+        ));
+        for i in 1..=PRIME_EXISTING_IDR_MAX_LAG {
+            hub.publish(MediaFrame::new(
+                "s".into(),
+                0,
+                base + i * 18_000,
+                annex_b_p(),
+                false,
+                CodecType::H264,
+            ));
+        }
+
+        let manager = StreamManager::new();
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::LiveSequential);
+        let idr = reader.prime_from_idr(&manager, "s").await;
+
+        assert!(
+            idr.is_none(),
+            "30 frames can still be about 6s at 5fps and must not be reused for RTMP startup"
         );
     }
 

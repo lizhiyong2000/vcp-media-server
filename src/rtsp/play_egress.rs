@@ -93,6 +93,7 @@ fn prepare_h264_play_frame(
         true,
         frame.codec,
     )
+    .with_optional_clock_rate(frame.clock_rate)
 }
 
 /// Jump to live edge and wait for a fresh IDR (do not replay ring history).

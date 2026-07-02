@@ -260,16 +260,17 @@ impl HttpFlvSession {
         data
     }
 
-    /// Convert a media frame to FLV tag
-    pub fn frame_to_flv(&mut self, frame: &MediaFrame) -> Vec<u8> {
+    /// Convert a media frame to FLV tag and return the session-local tag timestamp.
+    pub fn frame_to_flv_with_timestamp(&mut self, frame: &MediaFrame) -> (Vec<u8>, u32) {
         let timestamp = self.tag_timestamp_ms(frame);
-        match frame.codec {
+        let data = match frame.codec {
             CodecType::H264 | CodecType::H265 => frame_to_flv_video(frame, timestamp),
             CodecType::AAC | CodecType::Opus | CodecType::G711 => {
                 frame_to_flv_audio(frame, timestamp)
             }
             _ => Vec::new(),
-        }
+        };
+        (data, timestamp)
     }
 }
 

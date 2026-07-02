@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use self::m3u8::M3u8Generator;
 use self::ts_muxer::TsMuxer;
 use crate::core::dispatch::DispatchError;
-use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager};
+use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager, MILLISECOND_CLOCK_RATE};
 use crate::webrtc::{
     annex_b_with_config, h264_util::is_keyframe_annex_b, request_publisher_keyframe,
 };
@@ -33,16 +33,8 @@ fn is_hls_video_keyframe(frame: &MediaFrame) -> bool {
         && (frame.is_keyframe || is_keyframe_annex_b(&frame.data))
 }
 
-fn audio_timestamp_delta_ms(prev: u64, curr: u64) -> u64 {
-    if curr <= prev {
-        return 0;
-    }
-    let delta = curr - prev;
-    if delta > 2000 {
-        delta.saturating_mul(1000) / 44100
-    } else {
-        delta
-    }
+fn audio_timestamp_delta_ms(prev: u64, curr: u64, clock_rate: Option<u32>) -> u64 {
+    crate::core::media_timestamp_delta_ms_with_clock(prev, curr, clock_rate)
 }
 
 /// HLS configuration
@@ -214,7 +206,8 @@ impl HlsSession {
                 let prev_mux = self.session_audio_mux_ms;
                 let pts = match prev_raw {
                     Some(last_raw) if frame.timestamp > last_raw => {
-                        let delta = audio_timestamp_delta_ms(last_raw, frame.timestamp);
+                        let delta =
+                            audio_timestamp_delta_ms(last_raw, frame.timestamp, frame.clock_rate);
                         if delta > 0 && delta < 2000 {
                             prev_mux.saturating_add(delta)
                         } else {
@@ -254,6 +247,7 @@ impl HlsSession {
                     self.session_last_raw_video,
                     self.session_video_mux_ms,
                     frame.timestamp,
+                    frame.clock_rate,
                 );
                 self.session_last_raw_video = last_raw;
                 self.session_video_mux_ms = mux_ms;
@@ -285,6 +279,7 @@ impl HlsSession {
             frame.is_keyframe,
             frame.codec,
         )
+        .with_clock_rate(MILLISECOND_CLOCK_RATE)
     }
 
     /// Process an incoming media frame; returns a completed segment when splitting.
@@ -347,9 +342,10 @@ impl HlsSession {
         if matches!(frame.codec, CodecType::H264 | CodecType::H265) {
             let mut video_delta_ms = 0;
             if self.last_video_timestamp > 0 && frame.timestamp > self.last_video_timestamp {
-                let delta_ms = crate::core::media_timestamp_delta_ms(
+                let delta_ms = crate::core::media_timestamp_delta_ms_with_clock(
                     self.last_video_timestamp,
                     frame.timestamp,
+                    frame.clock_rate,
                 );
                 if delta_ms > 0 && delta_ms < 2000 {
                     self.segment_duration_acc += delta_ms as f64 / 1000.0;
@@ -704,6 +700,7 @@ impl HlsServer {
                         if let Some(stream) = stream_manager.get_stream(&stream_id_owned) {
                             if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
                                 let data = annex_b_with_config(sps, pps, &frame.data);
+                                let clock_rate = frame.clock_rate;
                                 frame = MediaFrame::new(
                                     frame.stream_id,
                                     frame.track_id,
@@ -711,7 +708,8 @@ impl HlsServer {
                                     bytes::Bytes::from(data),
                                     frame.is_keyframe,
                                     frame.codec,
-                                );
+                                )
+                                .with_optional_clock_rate(clock_rate);
                             }
                         }
                     }

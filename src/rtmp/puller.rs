@@ -10,7 +10,9 @@ use tracing::{debug, error, info, warn};
 
 use super::amf0::{self, Amf0Value};
 use super::chunk::{self, ChunkAssembler, ChunkHeader};
-use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode};
+use crate::core::{
+    CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, MILLISECOND_CLOCK_RATE,
+};
 
 #[derive(Debug, Clone)]
 pub struct RtmpUrl {
@@ -551,14 +553,17 @@ fn video_payload_to_frame(data: &[u8], stream_id: &str, timestamp: u32) -> Optio
         return None;
     }
 
-    Some(MediaFrame::new(
-        stream_id.to_string(),
-        0,
-        timestamp as u64,
-        Bytes::from(annex_b),
-        is_keyframe,
-        CodecType::H264,
-    ))
+    Some(
+        MediaFrame::new(
+            stream_id.to_string(),
+            0,
+            timestamp as u64,
+            Bytes::from(annex_b),
+            is_keyframe,
+            CodecType::H264,
+        )
+        .with_clock_rate(MILLISECOND_CLOCK_RATE),
+    )
 }
 
 fn audio_payload_to_frame(data: &[u8], stream_id: &str, timestamp: u32) -> Option<MediaFrame> {
@@ -581,14 +586,17 @@ fn audio_payload_to_frame(data: &[u8], stream_id: &str, timestamp: u32) -> Optio
         return None;
     }
 
-    Some(MediaFrame::new(
-        stream_id.to_string(),
-        1,
-        timestamp as u64,
-        Bytes::copy_from_slice(audio_data),
-        false,
-        CodecType::AAC,
-    ))
+    Some(
+        MediaFrame::new(
+            stream_id.to_string(),
+            1,
+            timestamp as u64,
+            Bytes::copy_from_slice(audio_data),
+            false,
+            CodecType::AAC,
+        )
+        .with_clock_rate(MILLISECOND_CLOCK_RATE),
+    )
 }
 
 #[cfg(test)]

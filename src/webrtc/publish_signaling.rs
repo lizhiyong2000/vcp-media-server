@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use webrtc::peer_connection::RTCPeerConnection;
@@ -14,6 +15,13 @@ use super::signaling::ServerSignal;
 struct Entry {
     tx: Option<mpsc::UnboundedSender<ServerSignal>>,
     pli_tx: Option<mpsc::UnboundedSender<u64>>,
+    last_request: Option<KeyframeRequestRecord>,
+}
+
+#[derive(Clone, Copy)]
+struct KeyframeRequestRecord {
+    id: u64,
+    at: Instant,
 }
 
 fn map() -> &'static Mutex<HashMap<String, Entry>> {
@@ -27,6 +35,7 @@ pub fn register_publish_signaling(stream_id: &str, tx: mpsc::UnboundedSender<Ser
     let entry = map.entry(stream_id.to_string()).or_insert_with(|| Entry {
         tx: None,
         pli_tx: None,
+        last_request: None,
     });
     entry.tx = Some(tx);
     info!(
@@ -42,6 +51,7 @@ pub fn register_publish_pli(stream_id: &str, pc: Arc<RTCPeerConnection>, media_s
         let entry = map.entry(stream_id.to_string()).or_insert_with(|| Entry {
             tx: None,
             pli_tx: None,
+            last_request: None,
         });
         entry.pli_tx = Some(tx);
     }
@@ -92,12 +102,22 @@ pub fn unregister_publish_signaling(stream_id: &str) {
 pub fn request_publisher_keyframe(stream_id: &str) -> bool {
     static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
     let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    let (tx, pli_tx) = map()
-        .lock()
-        .get(stream_id)
-        .map(|e| (e.tx.clone(), e.pli_tx.clone()))
-        .unwrap_or((None, None));
-    let mut requested = false;
+    let started_at = Instant::now();
+    let (tx, pli_tx) = {
+        let mut map = map().lock();
+        let entry = map.entry(stream_id.to_string()).or_insert_with(|| Entry {
+            tx: None,
+            pli_tx: None,
+            last_request: None,
+        });
+        entry.last_request = Some(KeyframeRequestRecord {
+            id: request_id,
+            at: Instant::now(),
+        });
+        (entry.tx.clone(), entry.pli_tx.clone())
+    };
+    let mut pli_queued = false;
+    let mut signaling_sent = false;
 
     info!(
         "[WebRTC] keyframe_request id={} start stream='{}' has_pli={} has_signaling={}",
@@ -113,7 +133,7 @@ pub fn request_publisher_keyframe(stream_id: &str) -> bool {
                 "[WebRTC] keyframe_request id={} queued RTCP PLI stream='{}'",
                 request_id, stream_id
             );
-            requested = true;
+            pli_queued = true;
         } else {
             warn!(
                 "[WebRTC] keyframe_request id={} failed to queue RTCP PLI stream='{}'",
@@ -127,19 +147,46 @@ pub fn request_publisher_keyframe(stream_id: &str) -> bool {
             "[WebRTC] keyframe_request id={} no publish signaling for stream='{}' — is the publisher page connected?",
             request_id, stream_id
         );
-        return requested;
+        info!(
+            "[WebRTC] keyframe_request id={} done stream='{}' requested={} pli_queued={} signaling_sent={} elapsed_ms={}",
+            request_id,
+            stream_id,
+            pli_queued,
+            pli_queued,
+            signaling_sent,
+            started_at.elapsed().as_millis()
+        );
+        return pli_queued;
     };
     if tx.send(ServerSignal::NeedKeyframe).is_ok() {
         info!(
             "[WebRTC] keyframe_request id={} forwarded need_keyframe to publisher stream='{}'",
             request_id, stream_id
         );
-        true
+        signaling_sent = true;
     } else {
         warn!(
             "[WebRTC] keyframe_request id={} failed to forward need_keyframe stream='{}'",
             request_id, stream_id
         );
-        requested
     }
+    let requested = pli_queued || signaling_sent;
+    info!(
+        "[WebRTC] keyframe_request id={} done stream='{}' requested={} pli_queued={} signaling_sent={} elapsed_ms={}",
+        request_id,
+        stream_id,
+        requested,
+        pli_queued,
+        signaling_sent,
+        started_at.elapsed().as_millis()
+    );
+    requested
+}
+
+pub fn latest_keyframe_request_age_ms(stream_id: &str) -> Option<(u64, u128)> {
+    map()
+        .lock()
+        .get(stream_id)
+        .and_then(|entry| entry.last_request)
+        .map(|record| (record.id, record.at.elapsed().as_millis()))
 }

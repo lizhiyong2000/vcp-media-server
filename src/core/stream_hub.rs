@@ -163,11 +163,11 @@ impl StreamHub {
         self.ring.read().latest_idr_seq()
     }
 
-    pub fn latest_idr_bytes(&self) -> Option<(Vec<u8>, u64)> {
+    pub fn latest_idr_bytes(&self) -> Option<(Vec<u8>, u64, Option<u32>)> {
         self.ring
             .read()
             .latest_idr_frame()
-            .map(|f| (f.data.to_vec(), f.timestamp))
+            .map(|f| (f.data.to_vec(), f.timestamp, f.clock_rate))
     }
 
     pub fn frames_from(&self, from_seq: u64, to_seq: u64) -> Vec<MediaFrame> {
@@ -360,7 +360,10 @@ mod tests {
         assert_eq!(hub.snap(SnapMode::LatestIdr), 0);
         assert_eq!(hub.get(0).expect("frame").timestamp, 1000);
         assert_eq!(hub.get_stored(0).expect("stored").seq, 0);
-        assert_eq!(hub.latest_idr_bytes(), Some((vec![0, 0, 0, 1, 0x65], 1000)));
+        assert_eq!(
+            hub.latest_idr_bytes(),
+            Some((vec![0, 0, 0, 1, 0x65], 1000, None))
+        );
     }
 
     #[tokio::test]
