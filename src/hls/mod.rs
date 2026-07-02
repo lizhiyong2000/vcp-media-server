@@ -374,7 +374,7 @@ impl HlsSession {
         // Ask publisher for IDR before we hit the segment cap (RTSP push may ignore).
         if matches!(frame.codec, CodecType::H264 | CodecType::H265)
             && !is_hls_video_keyframe(frame)
-            && mux_secs >= split_threshold * 0.85
+            && mux_secs >= split_threshold * 0.5
             && self.segment_last_idr_mux_ms <= self.segment_open_mux_ms_at_split
             && self.segment_buffer.len() > MIN_SEGMENT_BYTES
         {
@@ -664,6 +664,8 @@ impl HlsServer {
             }
         };
 
+        const HLS_MUX_LAG_SNAP_THRESHOLD: u64 = 30;
+
         let stream_id_owned = stream_id.to_string();
         let sessions_clone = self.sessions.clone();
         let stream_manager = self.stream_manager.clone();
@@ -680,11 +682,33 @@ impl HlsServer {
             request_publisher_keyframe(&stream_id_owned);
 
             loop {
+                let lag = reader
+                    .hub()
+                    .latest_seq()
+                    .saturating_sub(reader.cursor());
+                if lag > HLS_MUX_LAG_SNAP_THRESHOLD {
+                    info!(
+                        "[HLS] [{}] mux lag {} frames — snap to live IDR",
+                        stream_id_owned, lag
+                    );
+                    request_publisher_keyframe(&stream_id_owned);
+                    reader.snap_to_latest_idr();
+                    if let Some(session) = sessions_clone.read().get(&stream_id_owned) {
+                        session.write().recover_from_lag();
+                    }
+                }
+
                 let frames = match reader.recv_batch().await {
                     Ok(f) if !f.is_empty() => f,
                     Ok(_) => continue,
                     Err(DispatchError::Closed) => break,
                 };
+
+                if reader.take_live_snap() {
+                    if let Some(session) = sessions_clone.read().get(&stream_id_owned) {
+                        session.write().recover_from_lag();
+                    }
+                }
 
                 if reader.take_muxer_resync() {
                     if let Some(session) = sessions_clone.read().get(&stream_id_owned) {

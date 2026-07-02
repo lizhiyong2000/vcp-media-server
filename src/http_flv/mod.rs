@@ -216,6 +216,7 @@ impl HttpFlvSession {
         headers.push_str("Connection: close\r\n");
         headers.push_str("Access-Control-Allow-Origin: *\r\n");
         headers.push_str("Cache-Control: no-cache\r\n");
+        headers.push_str("X-Accel-Buffering: no\r\n");
         headers.push_str("\r\n");
         headers
     }
@@ -263,6 +264,23 @@ impl HttpFlvSession {
     /// Convert a media frame to FLV tag and return the session-local tag timestamp.
     pub fn frame_to_flv_with_timestamp(&mut self, frame: &MediaFrame) -> (Vec<u8>, u32) {
         let timestamp = self.tag_timestamp_ms(frame);
+        let data = match frame.codec {
+            CodecType::H264 | CodecType::H265 => frame_to_flv_video(frame, timestamp),
+            CodecType::AAC | CodecType::Opus | CodecType::G711 => {
+                frame_to_flv_audio(frame, timestamp)
+            }
+            _ => Vec::new(),
+        };
+        (data, timestamp)
+    }
+
+    /// Convert a media frame using wall-clock tag timestamps for low-latency live play.
+    pub fn frame_to_flv_with_wallclock(
+        &mut self,
+        frame: &MediaFrame,
+        timeline: &mut crate::core::WallclockMsTimeline,
+    ) -> (Vec<u8>, u32) {
+        let timestamp = timeline.map_ms();
         let data = match frame.codec {
             CodecType::H264 | CodecType::H265 => frame_to_flv_video(frame, timestamp),
             CodecType::AAC | CodecType::Opus | CodecType::G711 => {

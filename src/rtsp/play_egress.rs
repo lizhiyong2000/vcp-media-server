@@ -2,22 +2,16 @@
 
 use std::time::{Duration, Instant};
 
-use tracing::info;
-
 use crate::core::{
-    dispatch::{DispatchError, DispatchReader},
+    dispatch::DispatchReader,
+    is_idr_frame, prime_live_play,
     CodecType, MediaFrame, StreamManager,
 };
-use crate::webrtc::h264_util::{
-    contains_idr_nalu, contains_sps_or_pps_nalu, ensure_annex_b, is_parameter_set_only,
-};
-use crate::webrtc::{annex_b_with_config, request_publisher_keyframe};
 
 use super::common::{wrap_mpeg4_generic_aac_hbr, RtspCommon};
 
 const RTP_CLOCK_HZ: u32 = 90_000;
 const AAC_CLOCK_HZ: u32 = 44_100;
-const LIVE_IDR_WAIT: Duration = Duration::from_millis(800);
 
 /// Wall-clock RTP timeline for live PLAY (avoids player buffering on publisher ts jumps).
 pub struct PlayRtpTimeline {
@@ -55,45 +49,11 @@ impl PlayRtpTimeline {
 }
 
 fn prepend_h264_config(manager: &StreamManager, stream_id: &str, frame: &MediaFrame) -> Vec<u8> {
-    let au = ensure_annex_b(&frame.data);
-    if !(frame.is_keyframe || is_idr(frame) || contains_sps_or_pps_nalu(&au)) {
-        return au;
-    }
-    if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
-        if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
-            return annex_b_with_config(sps, pps, &au);
-        }
-    }
-    au
-}
-
-fn is_playable_video(frame: &MediaFrame) -> bool {
-    if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
-        return false;
-    }
-    let data = ensure_annex_b(&frame.data);
-    !data.is_empty() && !is_parameter_set_only(&data)
+    crate::core::live_play::prepend_h264_config(manager, stream_id, frame)
 }
 
 pub fn is_idr(frame: &MediaFrame) -> bool {
-    frame.is_keyframe || contains_idr_nalu(&ensure_annex_b(&frame.data))
-}
-
-fn prepare_h264_play_frame(
-    manager: &StreamManager,
-    stream_id: &str,
-    frame: MediaFrame,
-) -> MediaFrame {
-    let annex = prepend_h264_config(manager, stream_id, &frame);
-    MediaFrame::new(
-        stream_id.to_string(),
-        frame.track_id,
-        frame.timestamp,
-        bytes::Bytes::from(annex),
-        true,
-        frame.codec,
-    )
-    .with_optional_clock_rate(frame.clock_rate)
+    is_idr_frame(frame)
 }
 
 /// Jump to live edge and wait for a fresh IDR (do not replay ring history).
@@ -102,70 +62,10 @@ pub async fn prime_rtsp_play(
     manager: &StreamManager,
     stream_id: &str,
 ) -> Option<MediaFrame> {
-    let started_at = Instant::now();
-    reader.finish_prime();
-    let requested = request_publisher_keyframe(stream_id);
-    info!(
-        "[RTSP] [{}] PLAY prime start latest_seq={} latest_idr={:?} requested_keyframe={}",
-        stream_id,
-        reader.hub().latest_seq(),
-        reader.hub().latest_idr_seq(),
-        requested
-    );
-
-    let deadline = Instant::now() + LIVE_IDR_WAIT;
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, reader.recv_coalesced()).await {
-            Ok(Ok(frame)) if is_playable_video(&frame) && is_idr(&frame) => {
-                info!(
-                    "[RTSP] [{}] PLAY live IDR after={}ms ts={} bytes={}",
-                    stream_id,
-                    started_at.elapsed().as_millis(),
-                    frame.timestamp,
-                    frame.data.len()
-                );
-                return Some(prepare_h264_play_frame(manager, stream_id, frame));
-            }
-            Ok(Ok(_)) => continue,
-            Ok(Err(DispatchError::Closed)) => break,
-            Err(_) => break,
-        }
-    }
-
-    if let Some(idr) = reader.hub().latest_idr_frame() {
-        if is_playable_video(&idr) && is_idr(&idr) {
-            info!(
-                "[RTSP] [{}] PLAY fallback IDR after={}ms ts={} bytes={}",
-                stream_id,
-                started_at.elapsed().as_millis(),
-                idr.timestamp,
-                idr.data.len()
-            );
-            reader.finish_prime();
-            return Some(prepare_h264_play_frame(manager, stream_id, idr));
-        }
-    }
-
-    info!(
-        "[RTSP] [{}] PLAY no IDR after={}ms — wait in relay loop",
-        stream_id,
-        started_at.elapsed().as_millis()
-    );
-    None
+    prime_live_play(reader, manager, stream_id, "RTSP").await
 }
 
-/// Block for one frame, coalescing video bursts to the latest playable frame.
-pub async fn recv_coalesced_play_frame(
-    reader: &mut DispatchReader,
-) -> Result<MediaFrame, DispatchError> {
-    loop {
-        let frame = reader.recv_coalesced().await?;
-        if is_playable_video(&frame) || !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
-            return Ok(frame);
-        }
-    }
-}
+pub use crate::core::recv_coalesced_play_frame;
 
 /// Build RTP packet(s) for one media frame using a local seq/timeline (never forward ingest RTP).
 pub fn egress_rtp_packets(

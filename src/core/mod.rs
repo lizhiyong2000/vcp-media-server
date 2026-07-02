@@ -1,6 +1,7 @@
 mod config;
 pub mod dispatch;
 mod frame_ring;
+pub mod live_play;
 pub mod protocol;
 mod pusher;
 mod stream_hub;
@@ -22,10 +23,11 @@ pub use config::{
 pub use protocol::{ProtocolInfo, ProtocolRegistry, ProtocolType, StreamSink};
 pub use pusher::*;
 pub use tester::StreamTester;
+pub use live_play::{is_idr_frame, is_playable_video_frame, prime_live_play, recv_coalesced_play_frame};
 pub use timestamp::{
     flv_timestamp_ms, media_frame_timestamp_delta_ms, media_timestamp_delta_ms,
-    media_timestamp_delta_ms_with_clock, FlvPlayTimeline, AAC_DEFAULT_CLOCK_RATE,
-    MILLISECOND_CLOCK_RATE, VIDEO_RTP_CLOCK_RATE,
+    media_timestamp_delta_ms_with_clock, FlvPlayTimeline, WallclockMsTimeline,
+    AAC_DEFAULT_CLOCK_RATE, MILLISECOND_CLOCK_RATE, VIDEO_RTP_CLOCK_RATE,
 };
 
 pub type StreamId = String;

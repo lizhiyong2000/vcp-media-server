@@ -6,29 +6,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{error, info, warn};
 
-use crate::core::dispatch::DispatchError;
 use crate::core::{
-    CodecType, DispatchPolicy, DispatchReader, StreamManager, StreamProtocol, StreamSourceMode,
-    Track,
+    is_idr_frame, prime_live_play, CodecType, DispatchError, DispatchPolicy, DispatchReader,
+    StreamManager, StreamProtocol, StreamSourceMode, Track, WallclockMsTimeline,
 };
 use crate::hls::HlsServer;
 use crate::http_flv::{format_chunk, HttpFlvServer, HttpFlvSession};
 use crate::rtmp::RtmpPuller;
 use crate::rtsp::{RtspPuller, RtspPusher};
 use crate::webrtc::request_publisher_keyframe;
-
-const HTTP_FLV_PRIME_MAX_FRAME_LAG: u64 = 30;
-const HTTP_FLV_PRIME_MAX_MEDIA_LAG_MS: u64 = 1_000;
-const HTTP_FLV_PLAY_MAX_SEND_LEAD_MS: u64 = 200;
-
-fn http_flv_pacing_delay_ms(tag_ts: u32, elapsed_ms: u64, max_lead_ms: u64) -> Option<u64> {
-    let lead_ms = (tag_ts as u64).saturating_sub(elapsed_ms);
-    if lead_ms > max_lead_ms {
-        Some(lead_ms - max_lead_ms)
-    } else {
-        None
-    }
-}
 
 pub struct HttpServer {
     stream_manager: Arc<StreamManager>,
@@ -219,7 +205,7 @@ impl HttpServer {
                             manager.get_hub(stream_id).and_then(|hub| hub.latest_idr_seq())
                         );
                         let mut reader = match manager
-                            .dispatch_subscribe(stream_id, DispatchPolicy::LiveSequential)
+                            .dispatch_subscribe(stream_id, DispatchPolicy::LiveCoalesce)
                         {
                             Some(r) => r,
                             None => {
@@ -280,205 +266,134 @@ impl HttpServer {
                         }
 
                         info!(
-                            "[HTTP-FLV] [{}] prime sequential IDR start cursor={} latest_seq={} latest_idr={:?}",
+                            "[HTTP-FLV] [{}] prime live IDR start cursor={} latest_seq={} latest_idr={:?}",
                             stream_id,
                             reader.cursor(),
                             reader.hub().latest_seq(),
                             reader.hub().latest_idr_seq()
                         );
-                        let mut pending_idr =
-                            reader.prime_from_idr(manager, &stream_id_owned).await;
-                        if pending_idr.is_some() {
-                            let live_lag =
-                                reader.hub().latest_seq().saturating_sub(reader.cursor());
-                            let media_lag_ms = reader.cursor_media_lag_ms();
-                            let frame_lag_ok = live_lag <= HTTP_FLV_PRIME_MAX_FRAME_LAG;
-                            let media_lag_ok = media_lag_ms
-                                .map(|lag| lag <= HTTP_FLV_PRIME_MAX_MEDIA_LAG_MS)
-                                .unwrap_or(true);
-                            info!(
-                                "[HTTP-FLV] [{}] prime media-lag decision after={}ms cursor={} latest_seq={} latest_idr={:?} live_lag={} media_lag_ms={:?} frame_threshold={} media_threshold_ms={} frame_lag_ok={} media_lag_ok={}",
-                                stream_id,
-                                play_started_at.elapsed().as_millis(),
-                                reader.cursor(),
-                                reader.hub().latest_seq(),
-                                reader.hub().latest_idr_seq(),
-                                live_lag,
-                                media_lag_ms,
-                                HTTP_FLV_PRIME_MAX_FRAME_LAG,
-                                HTTP_FLV_PRIME_MAX_MEDIA_LAG_MS,
-                                frame_lag_ok,
-                                media_lag_ok
-                            );
-                            if !frame_lag_ok || !media_lag_ok {
-                                info!(
-                                    "[HTTP-FLV] [{}] primed IDR rejected reason_frame_lag={} reason_media_lag={} live_lag={} media_lag_ms={:?}; snap live and wait for fresh IDR",
-                                    stream_id,
-                                    !frame_lag_ok,
-                                    !media_lag_ok,
-                                    live_lag,
-                                    media_lag_ms
-                                );
-                                pending_idr = None;
-                                reader.snap_to_live_edge();
-                                let requested = request_publisher_keyframe(&stream_id_owned);
-                                info!(
-                                    "[HTTP-FLV] [{}] after stale prime snap cursor={} latest_seq={} requested_fresh_keyframe={}",
-                                    stream_id,
-                                    reader.cursor(),
-                                    reader.hub().latest_seq(),
-                                    requested
-                                );
-                            } else {
-                                reader.advance_cursor();
-                            }
-                        } else {
-                            reader.snap_to_live_edge();
-                            let requested = request_publisher_keyframe(&stream_id_owned);
-                            info!(
-                                "[HTTP-FLV] [{}] prime returned no IDR after={}ms; snapped live cursor={} requested_keyframe={} latest_seq={} latest_idr={:?}",
-                                stream_id,
-                                play_started_at.elapsed().as_millis(),
-                                reader.cursor(),
-                                requested,
-                                reader.hub().latest_seq(),
-                                reader.hub().latest_idr_seq()
-                            );
-                        }
-                        let mut video_streaming = false;
+                        let mut pending_idr = prime_live_play(
+                            &mut reader,
+                            manager,
+                            &stream_id_owned,
+                            "HTTP-FLV",
+                        )
+                        .await;
+                        let mut video_streaming = pending_idr.is_some();
                         let mut frames_sent = 0u64;
+                        let mut wallclock = WallclockMsTimeline::default();
                         let send_started_at = Instant::now();
 
                         loop {
-                            let (frames, frame_source) = if let Some(frame) = pending_idr.take() {
-                                (vec![frame], "pending_prime")
+                            let frames = if let Some(frame) = pending_idr.take() {
+                                vec![frame]
                             } else {
                                 match reader.recv_batch().await {
-                                    Ok(frames) if !frames.is_empty() => (frames, "dispatch_batch"),
+                                    Ok(frames) if !frames.is_empty() => frames,
                                     Ok(_) => continue,
                                     Err(DispatchError::Closed) => break,
                                 }
                             };
+                            if reader.take_muxer_resync() {
+                                video_streaming = false;
+                                reader.clear_video_catchup();
+                                request_publisher_keyframe(&stream_id_owned);
+                                info!(
+                                    "[HTTP-FLV] [{}] ring gap — wait for fresh IDR cursor={} latest_seq={}",
+                                    stream_id,
+                                    reader.cursor(),
+                                    reader.hub().latest_seq()
+                                );
+                            }
                             for frame in frames {
-                                if frame.codec == CodecType::Opus || frame.codec == CodecType::G711
-                                {
+                            if frame.codec == CodecType::Opus || frame.codec == CodecType::G711 {
+                                continue;
+                            }
+                            if matches!(frame.codec, CodecType::H264 | CodecType::H265)
+                                && !video_streaming
+                            {
+                                if !is_idr_frame(&frame) {
+                                    let requested =
+                                        request_publisher_keyframe(&stream_id_owned);
+                                    info!(
+                                        "[HTTP-FLV] [{}] waiting for first IDR; dropped non-IDR ts={} requested_keyframe={}",
+                                        stream_id, frame.timestamp, requested
+                                    );
                                     continue;
                                 }
-                                if matches!(frame.codec, CodecType::H264 | CodecType::H265)
-                                    && !video_streaming
+                                info!(
+                                    "[HTTP-FLV] [{}] accepted first video IDR after={}ms raw_ts={} size={} cursor={} latest_seq={}",
+                                    stream_id,
+                                    play_started_at.elapsed().as_millis(),
+                                    frame.timestamp,
+                                    frame.data.len(),
+                                    reader.cursor(),
+                                    reader.hub().latest_seq()
+                                );
+                                video_streaming = true;
+                            }
+                            if frame.codec == CodecType::AAC && frame.data.len() < 8 {
+                                continue;
+                            }
+
+                            if session.needs_sequence_headers() {
+                                if let Some(stream) =
+                                    flv.stream_manager().get_stream(&stream_id_owned)
                                 {
-                                    let is_idr = frame.is_keyframe
-                                        || crate::webrtc::h264_util::is_keyframe_annex_b(
-                                            &frame.data,
-                                        );
-                                    if !is_idr {
-                                        let requested =
-                                            request_publisher_keyframe(&stream_id_owned);
-                                        info!(
-                                            "[HTTP-FLV] [{}] waiting for first IDR; dropped non-IDR ts={} requested_keyframe={}",
-                                            stream_id, frame.timestamp, requested
-                                        );
-                                        continue;
+                                    let more = session.generate_initial_data(&stream);
+                                    if !more.is_empty() {
+                                        let chunk = format_chunk(&more);
+                                        if socket.write_all(&chunk).await.is_err() {
+                                            break;
+                                        }
                                     }
+                                }
+                                if session.needs_sequence_headers() {
+                                    continue;
+                                }
+                            }
+
+                            let (flv_data, tag_ts) =
+                                session.frame_to_flv_with_wallclock(&frame, &mut wallclock);
+                            if !flv_data.is_empty() {
+                                let chunk = format_chunk(&flv_data);
+                                if socket.write_all(&chunk).await.is_err() {
+                                    break;
+                                }
+                                if frames_sent == 0 {
                                     info!(
-                                        "[HTTP-FLV] [{}] accepted first video IDR after={}ms source={} raw_ts={} size={} cursor={} latest_seq={} live_lag={}",
+                                        "[HTTP-FLV] [{}] >>> SENT first frame after={}ms codec={:?} keyframe={} raw_ts={} tag_ts={} send_elapsed_ms={} tag_bytes={} chunk_bytes={} cursor={} latest_seq={}",
                                         stream_id,
                                         play_started_at.elapsed().as_millis(),
-                                        frame_source,
+                                        frame.codec,
+                                        frame.is_keyframe,
                                         frame.timestamp,
-                                        frame.data.len(),
-                                        reader.cursor(),
-                                        reader.hub().latest_seq(),
-                                        reader.hub().latest_seq().saturating_sub(reader.cursor())
-                                    );
-                                    video_streaming = true;
-                                }
-                                if frame.codec == CodecType::AAC && frame.data.len() < 8 {
-                                    continue;
-                                }
-
-                                if session.needs_sequence_headers() {
-                                    if let Some(stream) =
-                                        flv.stream_manager().get_stream(&stream_id_owned)
-                                    {
-                                        let more = session.generate_initial_data(&stream);
-                                        if !more.is_empty() {
-                                            let chunk = format_chunk(&more);
-                                            if socket.write_all(&chunk).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if session.needs_sequence_headers() {
-                                        continue;
-                                    }
-                                }
-
-                                let (flv_data, tag_ts) =
-                                    session.frame_to_flv_with_timestamp(&frame);
-                                if !flv_data.is_empty() {
-                                    let send_elapsed_ms =
-                                        send_started_at.elapsed().as_millis() as u64;
-                                    if let Some(delay_ms) = http_flv_pacing_delay_ms(
                                         tag_ts,
-                                        send_elapsed_ms,
-                                        HTTP_FLV_PLAY_MAX_SEND_LEAD_MS,
-                                    ) {
-                                        if frames_sent == 0 || delay_ms >= 100 {
-                                            info!(
-                                                "[HTTP-FLV] [{}] pacing send tag_ts={} elapsed_ms={} delay_ms={} max_lead_ms={} cursor={} latest_seq={}",
-                                                stream_id,
-                                                tag_ts,
-                                                send_elapsed_ms,
-                                                delay_ms,
-                                                HTTP_FLV_PLAY_MAX_SEND_LEAD_MS,
-                                                reader.cursor(),
-                                                reader.hub().latest_seq()
-                                            );
-                                        }
-                                        sleep(Duration::from_millis(delay_ms)).await;
-                                    }
-                                    let chunk = format_chunk(&flv_data);
-                                    if socket.write_all(&chunk).await.is_err() {
-                                        break;
-                                    }
-                                    if frames_sent == 0 {
-                                        info!(
-                                            "[HTTP-FLV] [{}] >>> SENT first frame after={}ms source={} codec={:?} keyframe={} raw_ts={} tag_ts={} send_elapsed_ms={} tag_bytes={} chunk_bytes={} cursor={} latest_seq={} live_lag={} media_lag_ms={:?}",
-                                            stream_id,
-                                            play_started_at.elapsed().as_millis(),
-                                            frame_source,
-                                            frame.codec,
-                                            frame.is_keyframe,
-                                            frame.timestamp,
-                                            tag_ts,
-                                            send_started_at.elapsed().as_millis(),
-                                            flv_data.len(),
-                                            chunk.len(),
-                                            reader.cursor(),
-                                            reader.hub().latest_seq(),
-                                            reader.hub().latest_seq().saturating_sub(reader.cursor()),
-                                            reader.cursor_media_lag_ms()
-                                        );
-                                    }
-                                    frames_sent += 1;
-                                    if frames_sent % 100 == 0 {
-                                        let elapsed_ms =
-                                            send_started_at.elapsed().as_millis() as u64;
-                                        let send_lead_ms =
-                                            (tag_ts as u64).saturating_sub(elapsed_ms);
-                                        info!(
-                                            "[HTTP-FLV] [{}] >>> SEND {} frames tag_ts={} elapsed_ms={} send_lead_ms={} cursor={} latest_seq={}",
-                                            stream_id,
-                                            frames_sent,
-                                            tag_ts,
-                                            elapsed_ms,
-                                            send_lead_ms,
-                                            reader.cursor(),
-                                            reader.hub().latest_seq()
-                                        );
-                                    }
+                                        send_started_at.elapsed().as_millis(),
+                                        flv_data.len(),
+                                        chunk.len(),
+                                        reader.cursor(),
+                                        reader.hub().latest_seq()
+                                    );
                                 }
+                                frames_sent += 1;
+                                if frames_sent % 100 == 0 {
+                                    let elapsed_ms =
+                                        send_started_at.elapsed().as_millis() as u64;
+                                    let send_lead_ms =
+                                        (tag_ts as u64).saturating_sub(elapsed_ms);
+                                    info!(
+                                        "[HTTP-FLV] [{}] >>> SEND {} frames tag_ts={} elapsed_ms={} send_lead_ms={} cursor={} latest_seq={}",
+                                        stream_id,
+                                        frames_sent,
+                                        tag_ts,
+                                        elapsed_ms,
+                                        send_lead_ms,
+                                        reader.cursor(),
+                                        reader.hub().latest_seq()
+                                    );
+                                }
+                            }
                             }
                         }
                         socket.flush().await?;
@@ -923,11 +838,4 @@ impl HttpServer {
 mod tests {
     use super::*;
 
-    #[test]
-    fn http_flv_pacing_limits_future_media_lead() {
-        assert_eq!(http_flv_pacing_delay_ms(1_000, 1_000, 200), None);
-        assert_eq!(http_flv_pacing_delay_ms(1_200, 1_000, 200), None);
-        assert_eq!(http_flv_pacing_delay_ms(1_500, 1_000, 200), Some(300));
-        assert_eq!(http_flv_pacing_delay_ms(900, 1_000, 200), None);
-    }
 }

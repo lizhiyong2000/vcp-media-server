@@ -6,6 +6,7 @@ use tracing::{debug, info, Level};
 
 use super::amf0::{self, Amf0Value};
 use crate::core::{CodecType, MediaFrame, StreamProtocol, StreamSourceMode};
+use crate::webrtc::h264_util::is_keyframe_annex_b;
 
 /// RTMP session state
 #[derive(Debug, Clone, PartialEq)]
@@ -213,6 +214,23 @@ pub fn build_result_response(transaction_id: f64, command: &str) -> Vec<u8> {
     amf0::encode(&values)
 }
 
+/// RTMP User Control: StreamBegin (event 0).
+pub fn build_user_control_stream_begin(stream_id: u32) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(6);
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    payload.extend_from_slice(&stream_id.to_be_bytes());
+    payload
+}
+
+/// RTMP User Control: SetBufferLength (event 3) — caps client-side buffer in milliseconds.
+pub fn build_user_control_set_buffer_length(stream_id: u32, buffer_ms: u32) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(10);
+    payload.extend_from_slice(&3u16.to_be_bytes());
+    payload.extend_from_slice(&stream_id.to_be_bytes());
+    payload.extend_from_slice(&buffer_ms.to_be_bytes());
+    payload
+}
+
 /// Build onStatus response for publish/play
 pub fn build_on_status(code: &str, description: &str, level: &str) -> Vec<u8> {
     let mut values = vec![
@@ -311,7 +329,11 @@ pub fn frame_to_rtmp_video(frame: &MediaFrame) -> Vec<u8> {
     let mut data = Vec::new();
 
     // Frame type + codec
-    let frame_type = if frame.is_keyframe { 0x10 } else { 0x20 };
+    let frame_type = if frame.is_keyframe || is_keyframe_annex_b(&frame.data) {
+        0x10
+    } else {
+        0x20
+    };
     data.push(frame_type | 0x07); // AVC
                                   // AVC packet type: NALU = 0x01
     data.push(0x01);
@@ -366,12 +388,12 @@ pub fn frame_to_rtmp_audio(frame: &MediaFrame) -> Vec<u8> {
     data
 }
 
-/// Map publisher timestamps (RTMP ms or RTP 90 kHz) to a session-local RTMP timeline.
+/// Map wall-clock elapsed time to RTMP tag timestamps for low-latency live play.
 #[derive(Default)]
-pub struct RtmpPlayClock(crate::core::FlvPlayTimeline);
+pub struct RtmpPlayClock(crate::core::WallclockMsTimeline);
 
 impl RtmpPlayClock {
-    pub fn map(&mut self, frame: &MediaFrame) -> u32 {
-        self.0.map(frame)
+    pub fn map_wallclock(&mut self) -> u32 {
+        self.0.map_ms()
     }
 }

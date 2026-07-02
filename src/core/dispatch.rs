@@ -15,6 +15,8 @@ use crate::webrtc::{h264_util::is_keyframe_annex_b, request_publisher_keyframe};
 const MAX_SEQUENTIAL_BATCH: u64 = 96;
 /// WebRTC play: only snap to live edge when this many frames behind (~1.5s @ 30fps).
 const WEBRTC_LAG_SNAP_THRESHOLD: u64 = 45;
+/// LiveCoalesce: log + keyframe hint when this many frames behind ingest.
+const LIVE_COALESCE_LAG_SNAP_THRESHOLD: u64 = 2;
 /// Reuse an existing IDR only when it is close to live edge; otherwise wait for a fresh one.
 const PRIME_EXISTING_IDR_MAX_LAG: u64 = 30;
 /// Low-latency live playback should not replay an old GOP even if the frame count is small.
@@ -46,6 +48,8 @@ pub struct DispatchReader {
     primed: bool,
     pending_muxer_resync: bool,
     pending_live_snap: bool,
+    /// After coalescing to an IDR, send every video frame through this seq (inclusive).
+    video_catchup_until: Option<u64>,
 }
 
 impl DispatchReader {
@@ -67,7 +71,22 @@ impl DispatchReader {
             primed: false,
             pending_muxer_resync: false,
             pending_live_snap: false,
+            video_catchup_until: None,
         }
+    }
+
+    /// After emitting an IDR from a collapsed batch, replay P-frames until `batch_end`.
+    pub fn begin_video_catchup_after_idr(&mut self, idr_seq: u64, batch_end: u64) {
+        self.video_catchup_until = Some(batch_end);
+        self.cursor = idr_seq.saturating_add(1);
+        info!(
+            "[Dispatch] [{}] video catch-up after IDR seq={} through {} (next cursor={})",
+            self.stream_id, idr_seq, batch_end, self.cursor
+        );
+    }
+
+    pub fn clear_video_catchup(&mut self) {
+        self.video_catchup_until = None;
     }
 
     pub fn hub(&self) -> &std::sync::Arc<StreamHub> {
@@ -82,11 +101,16 @@ impl DispatchReader {
         self.cursor
     }
 
+    pub fn set_cursor(&mut self, cursor: u64) {
+        self.cursor = cursor;
+    }
+
     pub fn advance_cursor(&mut self) {
         self.cursor = self.cursor.saturating_add(1);
     }
 
     pub fn snap_to_live_edge(&mut self) {
+        self.video_catchup_until = None;
         self.cursor = self.hub.snap(SnapMode::LiveEdge).saturating_add(1);
     }
 
@@ -279,23 +303,36 @@ impl DispatchReader {
     /// Read next batch according to policy.
     pub async fn recv_batch(&mut self) -> Result<Vec<MediaFrame>, DispatchError> {
         self.ensure_data().await?;
+
+        if matches!(self.policy, DispatchPolicy::LiveCoalesce) {
+            if let Some(until) = self.video_catchup_until {
+                let latest = self.hub.latest_seq();
+                if self.cursor > latest {
+                    return Ok(Vec::new());
+                }
+                let end = latest.min(until);
+                let frames = self.hub.frames_from(self.cursor, end);
+                if frames.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.cursor = end.saturating_add(1);
+                if self.cursor > until {
+                    self.video_catchup_until = None;
+                }
+                return Ok(frames);
+            }
+        }
+
         let mut latest = self.hub.latest_seq();
         let lag = latest.saturating_sub(self.cursor);
 
         match self.policy {
-            DispatchPolicy::LiveCoalesce => {
-                if lag > 0 {
-                    if lag > 1 {
-                        info!(
-                            "[Dispatch] [{}] live lag {} frames — snap to edge",
-                            self.stream_id, lag
-                        );
-                        request_publisher_keyframe(&self.stream_id);
-                        self.pending_live_snap = true;
-                    }
-                    self.snap_to_live_edge();
-                    latest = self.hub.latest_seq();
-                }
+            DispatchPolicy::LiveCoalesce if lag > LIVE_COALESCE_LAG_SNAP_THRESHOLD => {
+                info!(
+                    "[Dispatch] [{}] live lag {} frames — coalesce to edge",
+                    self.stream_id, lag
+                );
+                request_publisher_keyframe(&self.stream_id);
             }
             DispatchPolicy::WebRtcPlay if lag > WEBRTC_LAG_SNAP_THRESHOLD => {
                 info!(
@@ -308,6 +345,7 @@ impl DispatchReader {
                 latest = self.hub.latest_seq();
             }
             DispatchPolicy::WebRtcPlay => {}
+            DispatchPolicy::LiveCoalesce => {}
             // Sequential readers preserve every frame while data remains in the ring.
             DispatchPolicy::LiveSequential | DispatchPolicy::SequentialFromIdr => {}
         }
@@ -321,7 +359,8 @@ impl DispatchReader {
                 self.cursor
                     .saturating_add(MAX_SEQUENTIAL_BATCH.saturating_sub(1)),
             ),
-            DispatchPolicy::LiveCoalesce | DispatchPolicy::WebRtcPlay => self.cursor,
+            DispatchPolicy::LiveCoalesce => latest,
+            DispatchPolicy::WebRtcPlay => self.cursor,
         };
 
         let frames = self.hub.frames_from(self.cursor, batch_end);
@@ -334,7 +373,6 @@ impl DispatchReader {
                     );
                     request_publisher_keyframe(&self.stream_id);
                     self.pending_muxer_resync = true;
-                    self.pending_live_snap = true;
                     self.cursor = self.hub.snap(SnapMode::LatestIdr).max(oldest);
                     let latest = self.hub.latest_seq();
                     if self.cursor <= latest {
@@ -354,12 +392,42 @@ impl DispatchReader {
         if frames.is_empty() {
             return Ok(Vec::new());
         }
+
+        let from_seq = self.cursor;
+        if matches!(self.policy, DispatchPolicy::LiveCoalesce) {
+            let video_count = frames.iter().filter(|f| is_playable_video(f)).count();
+            if video_count > 1 {
+                let out = coalesce_flv_batch(frames);
+                if let Some(idr_seq) = last_playable_idr_seq(&self.hub, from_seq, batch_end) {
+                    self.begin_video_catchup_after_idr(idr_seq, batch_end);
+                } else {
+                    self.cursor = batch_end.saturating_add(1);
+                    request_publisher_keyframe(&self.stream_id);
+                }
+                return Ok(out);
+            }
+        }
+
         self.cursor = batch_end.saturating_add(1);
 
         Ok(match self.policy {
             DispatchPolicy::LiveCoalesce | DispatchPolicy::WebRtcPlay => coalesce_flv_batch(frames),
             DispatchPolicy::LiveSequential | DispatchPolicy::SequentialFromIdr => frames,
         })
+    }
+
+    /// Read `[cursor..latest]` without coalescing; does not advance the cursor.
+    pub async fn recv_live_edge_batch(
+        &mut self,
+    ) -> Result<(u64, u64, Vec<MediaFrame>), DispatchError> {
+        self.ensure_data().await?;
+        let from_seq = self.cursor;
+        let latest = self.hub.latest_seq();
+        if from_seq > latest {
+            return Ok((from_seq, latest, Vec::new()));
+        }
+        let frames = self.hub.frames_from(from_seq, latest);
+        Ok((from_seq, latest, frames))
     }
 
     /// Single frame, coalescing any burst of video to the latest playable frame.
@@ -419,18 +487,42 @@ fn is_playable_idr(frame: &MediaFrame) -> bool {
     is_playable_video(frame) && (frame.is_keyframe || is_keyframe_annex_b(&frame.data))
 }
 
-/// Coalesce video to latest in batch; keep audio in order.
+pub fn last_playable_idr_seq(hub: &StreamHub, from_seq: u64, to_seq: u64) -> Option<u64> {
+    (from_seq..=to_seq).rev().find_map(|seq| {
+        hub.get(seq)
+            .filter(|frame| is_playable_idr(frame))
+            .map(|_| seq)
+    })
+}
+
+/// Coalesce video to a decoder-safe frame in batch; keep audio in order.
+///
+/// When multiple video frames are collapsed, only an IDR can be forwarded — otherwise
+/// the player would receive P-frames without their reference pictures.
 pub fn coalesce_flv_batch(frames: Vec<MediaFrame>) -> Vec<MediaFrame> {
     let mut out = Vec::new();
-    let mut last_video: Option<MediaFrame> = None;
+    let mut video_in_batch: Vec<MediaFrame> = Vec::new();
     for f in frames {
         if is_playable_video(&f) {
-            last_video = Some(f);
+            video_in_batch.push(f);
         } else {
             out.push(f);
         }
     }
-    if let Some(v) = last_video {
+    if video_in_batch.is_empty() {
+        return out;
+    }
+    let skipped = video_in_batch.len() > 1;
+    let chosen = if skipped {
+        video_in_batch
+            .iter()
+            .rev()
+            .find(|f| is_playable_idr(f))
+            .cloned()
+    } else {
+        Some(video_in_batch.into_iter().next().expect("one video frame"))
+    };
+    if let Some(v) = chosen {
         out.push(v);
     }
     out
@@ -442,7 +534,7 @@ mod tests {
     use bytes::Bytes;
 
     #[test]
-    fn coalesce_keeps_latest_video() {
+    fn coalesce_keeps_single_video_in_order_with_audio() {
         let frames = vec![
             MediaFrame::new(
                 "s".into(),
@@ -470,9 +562,57 @@ mod tests {
             ),
         ];
         let out = coalesce_flv_batch(frames);
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 1);
         assert_eq!(out[0].codec, CodecType::AAC);
-        assert_eq!(&out[1].data[..], b"v2");
+    }
+
+    #[test]
+    fn coalesce_drops_non_idr_when_burst_is_collapsed() {
+        let frames = vec![
+            MediaFrame::new(
+                "s".into(),
+                0,
+                1,
+                annex_b_p(),
+                false,
+                CodecType::H264,
+            ),
+            MediaFrame::new(
+                "s".into(),
+                0,
+                2,
+                annex_b_p(),
+                false,
+                CodecType::H264,
+            ),
+        ];
+        assert!(coalesce_flv_batch(frames).is_empty());
+    }
+
+    #[test]
+    fn coalesce_prefers_idr_when_burst_is_collapsed() {
+        let frames = vec![
+            MediaFrame::new(
+                "s".into(),
+                0,
+                1,
+                annex_b_idr(),
+                true,
+                CodecType::H264,
+            ),
+            MediaFrame::new(
+                "s".into(),
+                0,
+                2,
+                annex_b_p(),
+                false,
+                CodecType::H264,
+            ),
+        ];
+        let out = coalesce_flv_batch(frames);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_keyframe);
+        assert_eq!(out[0].timestamp, 1);
     }
 
     fn annex_b_idr() -> Bytes {
@@ -569,6 +709,51 @@ mod tests {
             !reader.take_muxer_resync(),
             "large buffered lag should not flag muxer resync"
         );
+    }
+
+    #[tokio::test]
+    async fn live_coalesce_drains_backlog_in_one_batch() {
+        let hub = StreamHub::new("s");
+        let base = 2_648_000_000u64;
+        for i in 0..50u64 {
+            hub.publish(MediaFrame::new(
+                "s".into(),
+                0,
+                base + i * 3600,
+                if i % 25 == 0 {
+                    annex_b_idr()
+                } else {
+                    annex_b_p()
+                },
+                i % 25 == 0,
+                CodecType::H264,
+            ));
+        }
+
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::LiveCoalesce);
+        reader.cursor = 0;
+
+        let batch = reader.recv_batch().await.unwrap();
+        assert!(
+            !batch.is_empty(),
+            "LiveCoalesce should return coalesced frames from a backlog"
+        );
+        assert_eq!(
+            reader.cursor(),
+            26,
+            "LiveCoalesce should rewind cursor to IDR+1 for GOP catch-up"
+        );
+        let video = batch
+            .iter()
+            .filter(|f| matches!(f.codec, CodecType::H264))
+            .last()
+            .expect("coalesced batch should include video");
+        assert_eq!(video.timestamp, base + 25 * 3600);
+        assert!(video.is_keyframe);
+
+        let catchup = reader.recv_batch().await.unwrap();
+        assert_eq!(catchup.len(), 24, "catch-up should send remaining GOP frames");
+        assert_eq!(reader.cursor(), 50);
     }
 
     #[tokio::test]

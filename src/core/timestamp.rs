@@ -1,5 +1,7 @@
 //! Normalize inter-frame deltas from RTMP (ms) vs RTP (90 kHz video clock).
 
+use std::time::Instant;
+
 use crate::core::{CodecType, MediaFrame};
 
 /// Minimum tag timestamp step when separate A/V clocks would move backward in mux order.
@@ -77,6 +79,30 @@ pub fn flv_timestamp_ms(codec: crate::core::CodecType, raw: u64) -> u32 {
         _ => raw,
     };
     (ms & 0xFFFF_FFFF) as u32
+}
+
+/// Wall-clock FLV/RTMP tag timeline for low-latency live play.
+///
+/// Tag timestamps follow elapsed wall time instead of publisher media time, so players
+/// do not buffer a replayed GOP after subscribe.
+#[derive(Debug, Default)]
+pub struct WallclockMsTimeline {
+    anchor: Option<Instant>,
+    last_emit_ms: u64,
+}
+
+impl WallclockMsTimeline {
+    pub fn map_ms(&mut self) -> u32 {
+        let anchor = *self.anchor.get_or_insert_with(Instant::now);
+        let ideal = anchor.elapsed().as_millis() as u64;
+        let ts = if ideal > self.last_emit_ms {
+            ideal
+        } else {
+            self.last_emit_ms.saturating_add(FLV_MUX_MIN_STEP_MS)
+        };
+        self.last_emit_ms = ts;
+        (ts & 0xFFFF_FFFF) as u32
+    }
 }
 
 /// Monotonic FLV/RTMP tag timeline in mux order.
@@ -254,6 +280,15 @@ mod tests {
         let rtp_prev = h264_with_clock(90_000, VIDEO_RTP_CLOCK_RATE);
         let rtp_curr = h264_with_clock(91_800, VIDEO_RTP_CLOCK_RATE);
         assert_eq!(media_frame_timestamp_delta_ms(&rtp_prev, &rtp_curr), 20);
+    }
+
+    #[test]
+    fn wallclock_ms_timeline_monotonic() {
+        let mut tl = WallclockMsTimeline::default();
+        let t0 = tl.map_ms();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let t1 = tl.map_ms();
+        assert!(t1 >= t0);
     }
 
     #[test]
