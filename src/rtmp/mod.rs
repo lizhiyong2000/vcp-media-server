@@ -904,9 +904,14 @@ impl RtmpServer {
                     if let Some(handle) = conn.play_abort.take() {
                         handle.abort();
                     }
+                    let initial_keyframe_requested = request_publisher_keyframe(&play_stream_id);
+                    info!(
+                        "[RTMP] [{}] PLAY start stream='{}' requested_keyframe_before_response={} started_at=0ms",
+                        peer_addr, play_stream_id, initial_keyframe_requested
+                    );
                     if let Some(mut reader) = conn
                         .stream_manager
-                        .dispatch_subscribe(&play_stream_id, DispatchPolicy::LiveCoalesce)
+                        .dispatch_subscribe(&play_stream_id, DispatchPolicy::LiveSequential)
                     {
                         info!(
                             "[RTMP] [{}] PLAY subscribe stream='{}' latest_seq={} latest_idr={:?}",
@@ -964,8 +969,12 @@ impl RtmpServer {
                         }
 
                         info!(
-                            "[RTMP] [{}] >>> SENT play response (onStatus+AVCHeader, aac={})",
-                            peer_addr, has_aac
+                            "[RTMP] [{}] >>> SENT play response after={}ms stream='{}' avc_header={} aac_header={}",
+                            peer_addr,
+                            play_started_at.elapsed().as_millis(),
+                            play_stream_id,
+                            stream.sps.is_some() && stream.pps.is_some(),
+                            has_aac
                         );
                         drop(w);
 
@@ -985,7 +994,7 @@ impl RtmpServer {
                                 reader.cursor(),
                                 live_lag
                             );
-                            if live_lag > 2 {
+                            if live_lag > 30 {
                                 info!(
                                     "[RTMP] [{}] primed IDR is stale by {} frames; wait for fresh live IDR",
                                     peer_addr, live_lag
@@ -998,7 +1007,7 @@ impl RtmpServer {
                                     peer_addr, requested
                                 );
                             } else {
-                                reader.snap_to_live_edge();
+                                reader.advance_cursor();
                             }
                         } else {
                             reader.snap_to_live_edge();
@@ -1052,6 +1061,15 @@ impl RtmpServer {
                                             }
                                             continue;
                                         }
+                                        info!(
+                                            "[RTMP] [{}] accepted first video IDR after={}ms stream='{}' raw_ts={} size={} pending_prime={}",
+                                            peer_log,
+                                            play_started_at.elapsed().as_millis(),
+                                            stream_id_for_play,
+                                            frame.timestamp,
+                                            frame.data.len(),
+                                            frames_sent == 0
+                                        );
                                         video_streaming = true;
                                     }
                                     if frame.codec == CodecType::AAC && frame.data.len() < 8 {
@@ -1059,9 +1077,10 @@ impl RtmpServer {
                                     }
                                     if frames_sent == 0 {
                                         info!(
-                                            "[RTMP] [{}] >>> SEND first frame after={}ms: codec={:?} keyframe={} raw_ts={} size={}",
+                                            "[RTMP] [{}] >>> PREPARE first frame after={}ms: stream='{}' codec={:?} keyframe={} raw_ts={} size={}",
                                             peer_log,
                                             play_started_at.elapsed().as_millis(),
+                                            stream_id_for_play,
                                             frame.codec,
                                             frame.is_keyframe,
                                             frame.timestamp,
@@ -1103,6 +1122,20 @@ impl RtmpServer {
                                     if guard.write_all(&rtmp_msg).await.is_err() {
                                         info!("[RTMP] [{}] Play client disconnected", peer_log);
                                         return;
+                                    }
+                                    if frames_sent == 0 {
+                                        info!(
+                                            "[RTMP] [{}] >>> SENT first frame after={}ms: stream='{}' codec={:?} keyframe={} raw_ts={} rtmp_ts={} payload_bytes={} message_bytes={}",
+                                            peer_log,
+                                            play_started_at.elapsed().as_millis(),
+                                            stream_id_for_play,
+                                            frame.codec,
+                                            frame.is_keyframe,
+                                            frame.timestamp,
+                                            rtmp_ts,
+                                            data.len(),
+                                            rtmp_msg.len()
+                                        );
                                     }
                                     frames_sent += 1;
                                     if frames_sent % 100 == 0 {

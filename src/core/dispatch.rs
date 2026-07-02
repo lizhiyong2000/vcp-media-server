@@ -79,6 +79,10 @@ impl DispatchReader {
         self.cursor
     }
 
+    pub fn advance_cursor(&mut self) {
+        self.cursor = self.cursor.saturating_add(1);
+    }
+
     pub fn snap_to_live_edge(&mut self) {
         self.cursor = self.hub.snap(SnapMode::LiveEdge).saturating_add(1);
     }
@@ -93,9 +97,20 @@ impl DispatchReader {
         manager: &StreamManager,
         stream_id: &str,
     ) -> Option<MediaFrame> {
+        let started_at = Instant::now();
         let baseline_latest = self.hub.latest_seq();
-        request_publisher_keyframe(stream_id);
+        let baseline_idr = self.hub.latest_idr_seq();
+        let requested = request_publisher_keyframe(stream_id);
         let deadline = Instant::now() + Duration::from_millis(800);
+        info!(
+            "[Dispatch] [{}] prime_from_idr start policy={:?} cursor={} baseline_latest={} baseline_idr={:?} requested_keyframe={}",
+            stream_id,
+            self.policy,
+            self.cursor,
+            baseline_latest,
+            baseline_idr,
+            requested
+        );
 
         while Instant::now() < deadline {
             if let Some(idr_seq) = self.hub.latest_idr_seq() {
@@ -107,25 +122,34 @@ impl DispatchReader {
                         self.cursor = idr_seq;
                         self.primed = true;
                         info!(
-                            "[Dispatch] [{}] primed IDR ts={} seq={} fresh={} live_lag={}",
+                            "[Dispatch] [{}] prime_from_idr hit IDR after={}ms ts={} seq={} fresh={} live_lag={} latest_seq={}",
                             stream_id,
+                            started_at.elapsed().as_millis(),
                             idr.timestamp,
                             self.cursor,
                             fresh_after_request,
-                            self.hub.latest_seq().saturating_sub(idr_seq)
+                            self.hub.latest_seq().saturating_sub(idr_seq),
+                            self.hub.latest_seq()
                         );
                         return Some(idr);
                     }
                 } else {
                     info!(
-                        "[Dispatch] [{}] latest IDR seq={} is {} frames behind live; waiting for fresh IDR",
+                        "[Dispatch] [{}] prime_from_idr waiting fresh IDR after={}ms latest_idr_seq={} lag_from_baseline={} baseline_latest={}",
                         stream_id,
+                        started_at.elapsed().as_millis(),
                         idr_seq,
-                        baseline_latest.saturating_sub(idr_seq)
+                        baseline_latest.saturating_sub(idr_seq),
+                        baseline_latest
                     );
                 }
             }
             if self.wait_new_frames(deadline).await.is_err() {
+                info!(
+                    "[Dispatch] [{}] prime_from_idr wake closed after={}ms",
+                    stream_id,
+                    started_at.elapsed().as_millis()
+                );
                 break;
             }
         }
@@ -135,11 +159,13 @@ impl DispatchReader {
                 self.cursor = idr_seq;
                 self.primed = true;
                 info!(
-                    "[Dispatch] [{}] primed fallback IDR ts={} seq={} live_lag={}",
+                    "[Dispatch] [{}] prime_from_idr fallback IDR after={}ms ts={} seq={} live_lag={} latest_seq={}",
                     stream_id,
+                    started_at.elapsed().as_millis(),
                     idr.timestamp,
                     self.cursor,
-                    self.hub.latest_seq().saturating_sub(idr_seq)
+                    self.hub.latest_seq().saturating_sub(idr_seq),
+                    self.hub.latest_seq()
                 );
                 return Some(idr);
             }
@@ -149,6 +175,15 @@ impl DispatchReader {
         if let Some((data, ts)) = manager.get_last_keyframe(stream_id) {
             self.cursor = self.hub.snap(SnapMode::LatestIdr);
             self.primed = true;
+            info!(
+                "[Dispatch] [{}] prime_from_idr metadata fallback after={}ms ts={} cursor={} latest_seq={} latest_idr={:?}",
+                stream_id,
+                started_at.elapsed().as_millis(),
+                ts,
+                self.cursor,
+                self.hub.latest_seq(),
+                self.hub.latest_idr_seq()
+            );
             return Some(MediaFrame::new(
                 stream_id.to_string(),
                 0,
@@ -158,6 +193,13 @@ impl DispatchReader {
                 CodecType::H264,
             ));
         }
+        info!(
+            "[Dispatch] [{}] prime_from_idr failed after={}ms latest_seq={} latest_idr={:?}",
+            stream_id,
+            started_at.elapsed().as_millis(),
+            self.hub.latest_seq(),
+            self.hub.latest_idr_seq()
+        );
 
         None
     }

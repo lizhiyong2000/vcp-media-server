@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::core::{
-    CodecType, DispatchPolicy, DispatchReader, FlvPlayTimeline, MediaFrame, StreamManager,
+    CodecType, DispatchPolicy, DispatchReader, FlvPlayTimeline, MediaFrame, Stream, StreamManager,
 };
 use crate::rtmp::session::{frame_to_rtmp_audio, frame_to_rtmp_video};
 
@@ -117,6 +117,10 @@ fn generate_aac_sequence_header() -> Vec<u8> {
     generate_flv_tag(0x08, 0, &data)
 }
 
+fn stream_has_codec(stream: &Stream, codec: CodecType) -> bool {
+    stream.tracks.iter().any(|track| track.codec == codec)
+}
+
 /// Generate onMetaData script tag
 fn generate_metadata_tag(stream_id: &str, has_video: bool, has_audio: bool) -> Vec<u8> {
     let mut data = Vec::new();
@@ -224,24 +228,31 @@ impl HttpFlvSession {
     /// Generate the initial FLV data (header + metadata + sequence headers)
     pub fn generate_initial_data(&mut self, stream: &crate::core::Stream) -> Vec<u8> {
         let mut data = Vec::new();
+        let has_video =
+            stream_has_codec(stream, CodecType::H264) || stream_has_codec(stream, CodecType::H265);
+        let has_audio = stream_has_codec(stream, CodecType::AAC);
 
         // FLV header
         if !self.header_sent {
-            data.extend(generate_flv_header(true, true));
+            data.extend(generate_flv_header(has_video, has_audio));
             self.header_sent = true;
         }
 
         // Metadata
         if !self.metadata_sent {
-            data.extend(generate_metadata_tag(&self.stream_id, true, true));
+            data.extend(generate_metadata_tag(&self.stream_id, has_video, has_audio));
             self.metadata_sent = true;
         }
 
         // AVC sequence header (SPS/PPS)
         if !self.sequence_header_sent {
             if let (Some(ref sps), Some(ref pps)) = (&stream.sps, &stream.pps) {
-                data.extend(generate_avc_sequence_header(sps, pps));
-                data.extend(generate_aac_sequence_header());
+                if has_video {
+                    data.extend(generate_avc_sequence_header(sps, pps));
+                }
+                if has_audio {
+                    data.extend(generate_aac_sequence_header());
+                }
                 self.sequence_header_sent = true;
             }
         }
@@ -308,5 +319,61 @@ impl HttpFlvServer {
     ) -> Option<DispatchReader> {
         self.stream_manager
             .dispatch_subscribe(&stream_id.to_string(), policy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{
+        PlaybackStatus, Stream, StreamProtocol, StreamSourceMode, StreamStatus, Track,
+    };
+
+    fn publishing_stream_with_tracks(tracks: Vec<Track>) -> Stream {
+        Stream {
+            id: "webrtc_test".to_string(),
+            tracks,
+            status: StreamStatus::Publishing,
+            playback_status: PlaybackStatus::Idle,
+            source: StreamSourceMode::Push,
+            protocol: StreamProtocol::WebRTC,
+            pull_url: None,
+            sps: Some(vec![0x67, 0x42, 0x00, 0x1e]),
+            pps: Some(vec![0x68, 0xce, 0x1f, 0x20]),
+        }
+    }
+
+    #[test]
+    fn initial_data_for_video_only_stream_does_not_advertise_aac() {
+        let stream =
+            publishing_stream_with_tracks(vec![Track::new(0, CodecType::H264, 103, 90_000)]);
+        let mut session = HttpFlvSession::new("webrtc_test");
+
+        let data = session.generate_initial_data(&stream);
+
+        assert_eq!(&data[0..3], b"FLV");
+        assert_eq!(data[4] & 0x01, 0x01, "FLV video flag should be set");
+        assert_eq!(data[4] & 0x04, 0x00, "FLV audio flag should not be set");
+        assert!(
+            !data.windows(4).any(|w| w == [0x08, 0x00, 0x00, 0x04]),
+            "AAC sequence tag should not be present for pure video streams"
+        );
+    }
+
+    #[test]
+    fn initial_data_for_aac_stream_advertises_audio() {
+        let stream = publishing_stream_with_tracks(vec![
+            Track::new(0, CodecType::H264, 103, 90_000),
+            Track::new(1, CodecType::AAC, 111, 44_100),
+        ]);
+        let mut session = HttpFlvSession::new("webrtc_test");
+
+        let data = session.generate_initial_data(&stream);
+
+        assert_eq!(data[4] & 0x04, 0x04, "FLV audio flag should be set");
+        assert!(
+            data.windows(4).any(|w| w == [0x08, 0x00, 0x00, 0x04]),
+            "AAC sequence tag should be present when stream has AAC"
+        );
     }
 }

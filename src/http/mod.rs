@@ -190,11 +190,23 @@ impl HttpServer {
                 if let Some(ref flv) = flv_server {
                     let stream_id = path.trim_start_matches("/flv/").trim_end_matches('/');
                     if let Some((mut session, mut stream)) = flv.create_session(stream_id) {
+                        let play_started_at = Instant::now();
                         let stream_id_owned = stream_id.to_string();
                         let manager = flv.stream_manager();
                         manager.ensure_stream_hub(stream_id);
+                        let requested_keyframe = request_publisher_keyframe(stream_id);
+                        info!(
+                            "[HTTP-FLV] [{}] play request start requested_keyframe={} latest_seq={} latest_idr={:?}",
+                            stream_id,
+                            requested_keyframe,
+                            manager
+                                .get_hub(stream_id)
+                                .map(|hub| hub.latest_seq())
+                                .unwrap_or_default(),
+                            manager.get_hub(stream_id).and_then(|hub| hub.latest_idr_seq())
+                        );
                         let mut reader = match manager
-                            .dispatch_subscribe(stream_id, DispatchPolicy::LiveCoalesce)
+                            .dispatch_subscribe(stream_id, DispatchPolicy::LiveSequential)
                         {
                             Some(r) => r,
                             None => {
@@ -210,6 +222,11 @@ impl HttpServer {
                         let deadline = Instant::now() + Duration::from_secs(5);
                         while stream.sps.is_none() || stream.pps.is_none() {
                             if Instant::now() >= deadline {
+                                warn!(
+                                    "[HTTP-FLV] [{}] stream not ready after={}ms: waiting for SPS/PPS",
+                                    stream_id,
+                                    play_started_at.elapsed().as_millis()
+                                );
                                 let response = Self::http_response(
                                     503,
                                     "Service Unavailable",
@@ -224,6 +241,14 @@ impl HttpServer {
                                 stream = s;
                             }
                         }
+                        info!(
+                            "[HTTP-FLV] [{}] stream ready after={}ms sps={} pps={} tracks={}",
+                            stream_id,
+                            play_started_at.elapsed().as_millis(),
+                            stream.sps.as_ref().map(|s| s.len()).unwrap_or_default(),
+                            stream.pps.as_ref().map(|p| p.len()).unwrap_or_default(),
+                            stream.tracks.len()
+                        );
 
                         let http_headers = HttpFlvSession::generate_http_headers();
                         socket.write_all(http_headers.as_bytes()).await?;
@@ -232,15 +257,45 @@ impl HttpServer {
                         if !initial_data.is_empty() {
                             let chunk = format_chunk(&initial_data);
                             socket.write_all(&chunk).await?;
+                            info!(
+                                "[HTTP-FLV] [{}] sent initial FLV headers after={}ms data_bytes={} chunk_bytes={}",
+                                stream_id,
+                                play_started_at.elapsed().as_millis(),
+                                initial_data.len(),
+                                chunk.len()
+                            );
                         }
 
-                        let mut pending_idr = crate::rtsp::play_egress::prime_rtsp_play(
-                            &mut reader,
-                            manager,
-                            &stream_id_owned,
-                        )
-                        .await;
+                        info!(
+                            "[HTTP-FLV] [{}] prime sequential IDR start cursor={} latest_seq={} latest_idr={:?}",
+                            stream_id,
+                            reader.cursor(),
+                            reader.hub().latest_seq(),
+                            reader.hub().latest_idr_seq()
+                        );
+                        let mut pending_idr =
+                            reader.prime_from_idr(manager, &stream_id_owned).await;
+                        if pending_idr.is_some() {
+                            reader.advance_cursor();
+                            info!(
+                                "[HTTP-FLV] [{}] prime got pending IDR after={}ms next_cursor={} latest_seq={}",
+                                stream_id,
+                                play_started_at.elapsed().as_millis(),
+                                reader.cursor(),
+                                reader.hub().latest_seq()
+                            );
+                        } else {
+                            info!(
+                                "[HTTP-FLV] [{}] prime returned no IDR after={}ms cursor={} latest_seq={} latest_idr={:?}",
+                                stream_id,
+                                play_started_at.elapsed().as_millis(),
+                                reader.cursor(),
+                                reader.hub().latest_seq(),
+                                reader.hub().latest_idr_seq()
+                            );
+                        }
                         let mut video_streaming = false;
+                        let mut frames_sent = 0u64;
 
                         loop {
                             let frames = if let Some(frame) = pending_idr.take() {
@@ -267,6 +322,13 @@ impl HttpServer {
                                     if !is_idr {
                                         continue;
                                     }
+                                    info!(
+                                        "[HTTP-FLV] [{}] accepted first video IDR after={}ms raw_ts={} size={}",
+                                        stream_id,
+                                        play_started_at.elapsed().as_millis(),
+                                        frame.timestamp,
+                                        frame.data.len()
+                                    );
                                     video_streaming = true;
                                 }
                                 if frame.codec == CodecType::AAC && frame.data.len() < 8 {
@@ -296,6 +358,19 @@ impl HttpServer {
                                     if socket.write_all(&chunk).await.is_err() {
                                         break;
                                     }
+                                    if frames_sent == 0 {
+                                        info!(
+                                            "[HTTP-FLV] [{}] >>> SENT first frame after={}ms codec={:?} keyframe={} raw_ts={} tag_bytes={} chunk_bytes={}",
+                                            stream_id,
+                                            play_started_at.elapsed().as_millis(),
+                                            frame.codec,
+                                            frame.is_keyframe,
+                                            frame.timestamp,
+                                            flv_data.len(),
+                                            chunk.len()
+                                        );
+                                    }
+                                    frames_sent += 1;
                                 }
                             }
                         }
