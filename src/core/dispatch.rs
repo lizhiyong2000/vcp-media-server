@@ -569,22 +569,8 @@ mod tests {
     #[test]
     fn coalesce_drops_non_idr_when_burst_is_collapsed() {
         let frames = vec![
-            MediaFrame::new(
-                "s".into(),
-                0,
-                1,
-                annex_b_p(),
-                false,
-                CodecType::H264,
-            ),
-            MediaFrame::new(
-                "s".into(),
-                0,
-                2,
-                annex_b_p(),
-                false,
-                CodecType::H264,
-            ),
+            MediaFrame::new("s".into(), 0, 1, annex_b_p(), false, CodecType::H264),
+            MediaFrame::new("s".into(), 0, 2, annex_b_p(), false, CodecType::H264),
         ];
         assert!(coalesce_flv_batch(frames).is_empty());
     }
@@ -592,22 +578,8 @@ mod tests {
     #[test]
     fn coalesce_prefers_idr_when_burst_is_collapsed() {
         let frames = vec![
-            MediaFrame::new(
-                "s".into(),
-                0,
-                1,
-                annex_b_idr(),
-                true,
-                CodecType::H264,
-            ),
-            MediaFrame::new(
-                "s".into(),
-                0,
-                2,
-                annex_b_p(),
-                false,
-                CodecType::H264,
-            ),
+            MediaFrame::new("s".into(), 0, 1, annex_b_idr(), true, CodecType::H264),
+            MediaFrame::new("s".into(), 0, 2, annex_b_p(), false, CodecType::H264),
         ];
         let out = coalesce_flv_batch(frames);
         assert_eq!(out.len(), 1);
@@ -752,7 +724,11 @@ mod tests {
         assert!(video.is_keyframe);
 
         let catchup = reader.recv_batch().await.unwrap();
-        assert_eq!(catchup.len(), 24, "catch-up should send remaining GOP frames");
+        assert_eq!(
+            catchup.len(),
+            24,
+            "catch-up should send remaining GOP frames"
+        );
         assert_eq!(reader.cursor(), 50);
     }
 

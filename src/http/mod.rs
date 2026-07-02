@@ -6,14 +6,17 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{error, info, warn};
 
+use crate::analysis::{AnalysisManager, StartAnalysisRequest, StopAnalysisRequest};
 use crate::core::{
-    is_idr_frame, prime_live_play, CodecType, DispatchError, DispatchPolicy, DispatchReader,
-    StreamManager, StreamProtocol, StreamSourceMode, Track, WallclockMsTimeline,
+    is_idr_frame, prime_live_play, CodecType, DispatchError, DispatchPolicy, StreamManager,
+    StreamProtocol, StreamSourceMode, Track, WallclockMsTimeline,
 };
 use crate::hls::HlsServer;
 use crate::http_flv::{format_chunk, HttpFlvServer, HttpFlvSession};
+use crate::record::{RecorderManager, StartRecordRequest, StopRecordRequest};
 use crate::rtmp::RtmpPuller;
 use crate::rtsp::{RtspPuller, RtspPusher};
+use crate::snapshot::{CaptureSnapshotRequest, SnapshotManager};
 use crate::webrtc::request_publisher_keyframe;
 
 pub struct HttpServer {
@@ -21,6 +24,9 @@ pub struct HttpServer {
     port: u16,
     hls_server: Option<Arc<HlsServer>>,
     http_flv_server: Option<Arc<HttpFlvServer>>,
+    recorder: Option<Arc<RecorderManager>>,
+    analysis: Option<Arc<AnalysisManager>>,
+    snapshot: Option<Arc<SnapshotManager>>,
 }
 
 impl HttpServer {
@@ -29,12 +35,18 @@ impl HttpServer {
         port: u16,
         hls_server: Option<Arc<HlsServer>>,
         http_flv_server: Option<Arc<HttpFlvServer>>,
+        recorder: Option<Arc<RecorderManager>>,
+        analysis: Option<Arc<AnalysisManager>>,
+        snapshot: Option<Arc<SnapshotManager>>,
     ) -> Self {
         Self {
             stream_manager,
             port,
             hls_server,
             http_flv_server,
+            recorder,
+            analysis,
+            snapshot,
         }
     }
 
@@ -54,6 +66,22 @@ impl HttpServer {
         info!("[HTTP]   POST /api/rtsp/pull      - RTSP pull from remote URL");
         info!("[HTTP]   POST /api/rtsp/push      - RTSP push to remote URL");
         info!("[HTTP]   POST /api/rtmp/pull      - RTMP pull from remote URL");
+        if self.recorder.is_some() {
+            info!("[HTTP]   POST /api/record/start  - Start DVR recording");
+            info!("[HTTP]   POST /api/record/stop   - Stop DVR recording");
+            info!("[HTTP]   GET  /api/recordings    - List recordings");
+        }
+        if self.analysis.is_some() {
+            info!("[HTTP]   POST /api/analysis/start - Start video analysis");
+            info!("[HTTP]   POST /api/analysis/stop  - Stop video analysis");
+            info!("[HTTP]   GET  /api/analysis/<stream_id>/metrics - Analysis metrics");
+            info!("[HTTP]   GET  /api/analysis/<stream_id>/events  - Analysis events");
+        }
+        if self.snapshot.is_some() {
+            info!("[HTTP]   POST /api/snapshot      - Capture stream snapshot");
+            info!("[HTTP]   GET  /api/snapshots     - List snapshots");
+            info!("[HTTP]   GET  /api/snapshots/<id>.jpg - Read snapshot image");
+        }
         info!("[HTTP]   GET  /webrtc/webrtc-test.html - WebRTC test page");
         if self.hls_server.is_some() {
             info!("[HTTP]   GET  /hls/<stream_id>/live.m3u8 - HLS playlist");
@@ -70,8 +98,15 @@ impl HttpServer {
                     let manager = self.stream_manager.clone();
                     let hls = self.hls_server.clone();
                     let flv = self.http_flv_server.clone();
+                    let recorder = self.recorder.clone();
+                    let analysis = self.analysis.clone();
+                    let snapshot = self.snapshot.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(socket, manager, hls, flv).await {
+                        if let Err(e) = Self::handle_connection(
+                            socket, manager, hls, flv, recorder, analysis, snapshot,
+                        )
+                        .await
+                        {
                             error!("[HTTP] Connection error from {}: {}", peer_addr, e);
                         }
                     });
@@ -88,6 +123,9 @@ impl HttpServer {
         manager: Arc<StreamManager>,
         hls_server: Option<Arc<HlsServer>>,
         flv_server: Option<Arc<HttpFlvServer>>,
+        recorder: Option<Arc<RecorderManager>>,
+        analysis: Option<Arc<AnalysisManager>>,
+        snapshot: Option<Arc<SnapshotManager>>,
     ) -> Result<()> {
         let mut buffer = vec![0u8; 8192];
         let mut socket = socket;
@@ -272,13 +310,9 @@ impl HttpServer {
                             reader.hub().latest_seq(),
                             reader.hub().latest_idr_seq()
                         );
-                        let mut pending_idr = prime_live_play(
-                            &mut reader,
-                            manager,
-                            &stream_id_owned,
-                            "HTTP-FLV",
-                        )
-                        .await;
+                        let mut pending_idr =
+                            prime_live_play(&mut reader, manager, &stream_id_owned, "HTTP-FLV")
+                                .await;
                         let mut video_streaming = pending_idr.is_some();
                         let mut frames_sent = 0u64;
                         let mut wallclock = WallclockMsTimeline::default();
@@ -306,22 +340,23 @@ impl HttpServer {
                                 );
                             }
                             for frame in frames {
-                            if frame.codec == CodecType::Opus || frame.codec == CodecType::G711 {
-                                continue;
-                            }
-                            if matches!(frame.codec, CodecType::H264 | CodecType::H265)
-                                && !video_streaming
-                            {
-                                if !is_idr_frame(&frame) {
-                                    let requested =
-                                        request_publisher_keyframe(&stream_id_owned);
-                                    info!(
+                                if frame.codec == CodecType::Opus || frame.codec == CodecType::G711
+                                {
+                                    continue;
+                                }
+                                if matches!(frame.codec, CodecType::H264 | CodecType::H265)
+                                    && !video_streaming
+                                {
+                                    if !is_idr_frame(&frame) {
+                                        let requested =
+                                            request_publisher_keyframe(&stream_id_owned);
+                                        info!(
                                         "[HTTP-FLV] [{}] waiting for first IDR; dropped non-IDR ts={} requested_keyframe={}",
                                         stream_id, frame.timestamp, requested
                                     );
-                                    continue;
-                                }
-                                info!(
+                                        continue;
+                                    }
+                                    info!(
                                     "[HTTP-FLV] [{}] accepted first video IDR after={}ms raw_ts={} size={} cursor={} latest_seq={}",
                                     stream_id,
                                     play_started_at.elapsed().as_millis(),
@@ -330,38 +365,38 @@ impl HttpServer {
                                     reader.cursor(),
                                     reader.hub().latest_seq()
                                 );
-                                video_streaming = true;
-                            }
-                            if frame.codec == CodecType::AAC && frame.data.len() < 8 {
-                                continue;
-                            }
-
-                            if session.needs_sequence_headers() {
-                                if let Some(stream) =
-                                    flv.stream_manager().get_stream(&stream_id_owned)
-                                {
-                                    let more = session.generate_initial_data(&stream);
-                                    if !more.is_empty() {
-                                        let chunk = format_chunk(&more);
-                                        if socket.write_all(&chunk).await.is_err() {
-                                            break;
-                                        }
-                                    }
+                                    video_streaming = true;
                                 }
-                                if session.needs_sequence_headers() {
+                                if frame.codec == CodecType::AAC && frame.data.len() < 8 {
                                     continue;
                                 }
-                            }
 
-                            let (flv_data, tag_ts) =
-                                session.frame_to_flv_with_wallclock(&frame, &mut wallclock);
-                            if !flv_data.is_empty() {
-                                let chunk = format_chunk(&flv_data);
-                                if socket.write_all(&chunk).await.is_err() {
-                                    break;
+                                if session.needs_sequence_headers() {
+                                    if let Some(stream) =
+                                        flv.stream_manager().get_stream(&stream_id_owned)
+                                    {
+                                        let more = session.generate_initial_data(&stream);
+                                        if !more.is_empty() {
+                                            let chunk = format_chunk(&more);
+                                            if socket.write_all(&chunk).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if session.needs_sequence_headers() {
+                                        continue;
+                                    }
                                 }
-                                if frames_sent == 0 {
-                                    info!(
+
+                                let (flv_data, tag_ts) =
+                                    session.frame_to_flv_with_wallclock(&frame, &mut wallclock);
+                                if !flv_data.is_empty() {
+                                    let chunk = format_chunk(&flv_data);
+                                    if socket.write_all(&chunk).await.is_err() {
+                                        break;
+                                    }
+                                    if frames_sent == 0 {
+                                        info!(
                                         "[HTTP-FLV] [{}] >>> SENT first frame after={}ms codec={:?} keyframe={} raw_ts={} tag_ts={} send_elapsed_ms={} tag_bytes={} chunk_bytes={} cursor={} latest_seq={}",
                                         stream_id,
                                         play_started_at.elapsed().as_millis(),
@@ -375,14 +410,14 @@ impl HttpServer {
                                         reader.cursor(),
                                         reader.hub().latest_seq()
                                     );
-                                }
-                                frames_sent += 1;
-                                if frames_sent % 100 == 0 {
-                                    let elapsed_ms =
-                                        send_started_at.elapsed().as_millis() as u64;
-                                    let send_lead_ms =
-                                        (tag_ts as u64).saturating_sub(elapsed_ms);
-                                    info!(
+                                    }
+                                    frames_sent += 1;
+                                    if frames_sent % 100 == 0 {
+                                        let elapsed_ms =
+                                            send_started_at.elapsed().as_millis() as u64;
+                                        let send_lead_ms =
+                                            (tag_ts as u64).saturating_sub(elapsed_ms);
+                                        info!(
                                         "[HTTP-FLV] [{}] >>> SEND {} frames tag_ts={} elapsed_ms={} send_lead_ms={} cursor={} latest_seq={}",
                                         stream_id,
                                         frames_sent,
@@ -392,8 +427,8 @@ impl HttpServer {
                                         reader.cursor(),
                                         reader.hub().latest_seq()
                                     );
+                                    }
                                 }
-                            }
                             }
                         }
                         socket.flush().await?;
@@ -405,17 +440,61 @@ impl HttpServer {
                 socket.flush().await?;
                 return Ok(());
             }
+
+            if path.starts_with("/api/snapshots/") && path.ends_with(".jpg") {
+                let Some(ref snapshot) = snapshot else {
+                    let response = Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"snapshot API disabled\"}",
+                    );
+                    socket.write_all(response.as_bytes()).await?;
+                    socket.flush().await?;
+                    return Ok(());
+                };
+                let id = path
+                    .trim_start_matches("/api/snapshots/")
+                    .trim_end_matches(".jpg");
+                if let Some(entry) = snapshot.get(id) {
+                    if entry.status == "completed" {
+                        if let Some(path) = entry.path {
+                            if let Ok(data) = tokio::fs::read(path).await {
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                                    data.len()
+                                );
+                                socket.write_all(response.as_bytes()).await?;
+                                socket.write_all(&data).await?;
+                                socket.shutdown().await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                let response =
+                    Self::http_response(404, "Not Found", "{\"error\":\"snapshot not found\"}");
+                socket.write_all(response.as_bytes()).await?;
+                socket.flush().await?;
+                return Ok(());
+            }
         }
 
         // Regular API request
-        let response = Self::process_request(&request, manager.clone()).await?;
+        let response =
+            Self::process_request(&request, manager.clone(), recorder, analysis, snapshot).await?;
         socket.write_all(response.as_bytes()).await?;
         socket.flush().await?;
 
         Ok(())
     }
 
-    async fn process_request(request: &str, manager: Arc<StreamManager>) -> Result<String> {
+    async fn process_request(
+        request: &str,
+        manager: Arc<StreamManager>,
+        recorder: Option<Arc<RecorderManager>>,
+        analysis: Option<Arc<AnalysisManager>>,
+        snapshot: Option<Arc<SnapshotManager>>,
+    ) -> Result<String> {
         let lines: Vec<&str> = request.lines().collect();
         if lines.is_empty() {
             return Ok(Self::http_response(400, "Bad Request", ""));
@@ -751,6 +830,307 @@ impl HttpServer {
                 .to_string();
                 Ok(Self::http_response(200, "OK", &body))
             }
+            ("POST", "/api/record/start") => {
+                let Some(recorder) = recorder else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"recording API disabled\"}",
+                    ));
+                };
+                let body = Self::json_body(request);
+                let req = match serde_json::from_str::<StartRecordRequest>(body) {
+                    Ok(req) => req,
+                    Err(_) => {
+                        return Ok(Self::http_response(
+                            400,
+                            "Bad Request",
+                            "{\"error\":\"Invalid JSON body\"}",
+                        ));
+                    }
+                };
+                match recorder.start(req) {
+                    Ok(info) => Ok(Self::http_response(
+                        200,
+                        "OK",
+                        &json!({"recording": info, "message": "recording started"}).to_string(),
+                    )),
+                    Err(err) => Ok(Self::http_response(
+                        400,
+                        "Bad Request",
+                        &json!({"error": err.to_string()}).to_string(),
+                    )),
+                }
+            }
+            ("POST", "/api/record/stop") => {
+                let Some(recorder) = recorder else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"recording API disabled\"}",
+                    ));
+                };
+                let body = Self::json_body(request);
+                let req = match serde_json::from_str::<StopRecordRequest>(body) {
+                    Ok(req) => req,
+                    Err(_) => {
+                        return Ok(Self::http_response(
+                            400,
+                            "Bad Request",
+                            "{\"error\":\"Invalid JSON body\"}",
+                        ));
+                    }
+                };
+                match recorder.stop(req) {
+                    Ok(info) => Ok(Self::http_response(
+                        200,
+                        "OK",
+                        &json!({"recording": info, "message": "recording stopped"}).to_string(),
+                    )),
+                    Err(err) => Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        &json!({"error": err.to_string()}).to_string(),
+                    )),
+                }
+            }
+            ("GET", "/api/recordings") => {
+                let Some(recorder) = recorder else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"recording API disabled\"}",
+                    ));
+                };
+                let body = json!({
+                    "active": recorder.active_sessions(),
+                    "recordings": recorder.list_recordings(None)
+                })
+                .to_string();
+                Ok(Self::http_response(200, "OK", &body))
+            }
+            ("GET", path)
+                if path.starts_with("/api/recordings/") && path.ends_with("/playback") =>
+            {
+                let Some(recorder) = recorder else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"recording API disabled\"}",
+                    ));
+                };
+                let id = path
+                    .trim_start_matches("/api/recordings/")
+                    .trim_end_matches("/playback")
+                    .trim_end_matches('/');
+                let recording = recorder
+                    .list_recordings(None)
+                    .into_iter()
+                    .find(|entry| entry.id == id);
+                if let Some(recording) = recording {
+                    let body = json!({
+                        "id": recording.id,
+                        "path": recording.path,
+                        "content_type": "video/mp2t"
+                    })
+                    .to_string();
+                    Ok(Self::http_response(200, "OK", &body))
+                } else {
+                    Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"recording not found\"}",
+                    ))
+                }
+            }
+            ("POST", "/api/analysis/start") => {
+                let Some(analysis) = analysis else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"analysis API disabled\"}",
+                    ));
+                };
+                let body = Self::json_body(request);
+                let req = match serde_json::from_str::<StartAnalysisRequest>(body) {
+                    Ok(req) => req,
+                    Err(_) => {
+                        return Ok(Self::http_response(
+                            400,
+                            "Bad Request",
+                            "{\"error\":\"Invalid JSON body\"}",
+                        ));
+                    }
+                };
+                match analysis.start(req) {
+                    Ok(info) => Ok(Self::http_response(
+                        200,
+                        "OK",
+                        &json!({"analysis": info, "message": "analysis started"}).to_string(),
+                    )),
+                    Err(err) => Ok(Self::http_response(
+                        400,
+                        "Bad Request",
+                        &json!({"error": err.to_string()}).to_string(),
+                    )),
+                }
+            }
+            ("POST", "/api/analysis/stop") => {
+                let Some(analysis) = analysis else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"analysis API disabled\"}",
+                    ));
+                };
+                let body = Self::json_body(request);
+                let req = match serde_json::from_str::<StopAnalysisRequest>(body) {
+                    Ok(req) => req,
+                    Err(_) => {
+                        return Ok(Self::http_response(
+                            400,
+                            "Bad Request",
+                            "{\"error\":\"Invalid JSON body\"}",
+                        ));
+                    }
+                };
+                match analysis.stop(req) {
+                    Ok(info) => Ok(Self::http_response(
+                        200,
+                        "OK",
+                        &json!({"analysis": info, "message": "analysis stopped"}).to_string(),
+                    )),
+                    Err(err) => Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        &json!({"error": err.to_string()}).to_string(),
+                    )),
+                }
+            }
+            ("GET", "/api/analysis") | ("GET", "/api/analysis/") => {
+                let Some(analysis) = analysis else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"analysis API disabled\"}",
+                    ));
+                };
+                let body = json!({"active": analysis.active_sessions()}).to_string();
+                Ok(Self::http_response(200, "OK", &body))
+            }
+            ("GET", path) if path.starts_with("/api/analysis/") && path.ends_with("/metrics") => {
+                let Some(analysis) = analysis else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"analysis API disabled\"}",
+                    ));
+                };
+                let stream_id = path
+                    .trim_start_matches("/api/analysis/")
+                    .trim_end_matches("/metrics")
+                    .trim_end_matches('/');
+                if let Some(metrics) = analysis.metrics(stream_id) {
+                    Ok(Self::http_response(200, "OK", &json!(metrics).to_string()))
+                } else {
+                    Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"analysis metrics not found\"}",
+                    ))
+                }
+            }
+            ("GET", path) if path.starts_with("/api/analysis/") && path.ends_with("/events") => {
+                let Some(analysis) = analysis else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"analysis API disabled\"}",
+                    ));
+                };
+                let stream_id = path
+                    .trim_start_matches("/api/analysis/")
+                    .trim_end_matches("/events")
+                    .trim_end_matches('/');
+                let body = json!({"events": analysis.events(stream_id)}).to_string();
+                Ok(Self::http_response(200, "OK", &body))
+            }
+            ("POST", "/api/snapshot") => {
+                let Some(snapshot) = snapshot else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"snapshot API disabled\"}",
+                    ));
+                };
+                let body = Self::json_body(request);
+                let req = match serde_json::from_str::<CaptureSnapshotRequest>(body) {
+                    Ok(req) => req,
+                    Err(_) => {
+                        return Ok(Self::http_response(
+                            400,
+                            "Bad Request",
+                            "{\"error\":\"Invalid JSON body\"}",
+                        ));
+                    }
+                };
+                match snapshot.submit(req) {
+                    Ok(info) => Ok(Self::http_response(
+                        202,
+                        "Accepted",
+                        &json!({"snapshot": info, "message": "snapshot task accepted"}).to_string(),
+                    )),
+                    Err(err) => Ok(Self::http_response(
+                        400,
+                        "Bad Request",
+                        &json!({"error": err.to_string()}).to_string(),
+                    )),
+                }
+            }
+            ("GET", "/api/snapshots") => {
+                let Some(snapshot) = snapshot else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"snapshot API disabled\"}",
+                    ));
+                };
+                let body = json!({"snapshots": snapshot.list(None)}).to_string();
+                Ok(Self::http_response(200, "OK", &body))
+            }
+            ("GET", path) if path.starts_with("/api/snapshots/") => {
+                let Some(snapshot) = snapshot else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"snapshot API disabled\"}",
+                    ));
+                };
+                let id = path
+                    .trim_start_matches("/api/snapshots/")
+                    .trim_end_matches('/')
+                    .trim_end_matches(".jpg");
+                if id.is_empty() {
+                    return Ok(Self::http_response(
+                        400,
+                        "Bad Request",
+                        "{\"error\":\"missing snapshot id\"}",
+                    ));
+                }
+                if let Some(info) = snapshot.get(id) {
+                    Ok(Self::http_response(
+                        200,
+                        "OK",
+                        &json!({"snapshot": info}).to_string(),
+                    ))
+                } else {
+                    Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"snapshot not found\"}",
+                    ))
+                }
+            }
             ("DELETE", path) if path.starts_with("/api/stream/") => {
                 let stream_id = path.trim_start_matches("/api/stream/");
                 if manager.remove_stream(&stream_id.to_string()).is_some() {
@@ -783,6 +1163,44 @@ impl HttpServer {
                 endpoints.insert(
                     "POST /api/rtsp/push".to_string(),
                     json!("Start RTSP push to remote URL"),
+                );
+                endpoints.insert(
+                    "POST /api/record/start".to_string(),
+                    json!("Start DVR recording"),
+                );
+                endpoints.insert(
+                    "POST /api/record/stop".to_string(),
+                    json!("Stop DVR recording"),
+                );
+                endpoints.insert("GET /api/recordings".to_string(), json!("List recordings"));
+                endpoints.insert(
+                    "POST /api/analysis/start".to_string(),
+                    json!("Start video analysis"),
+                );
+                endpoints.insert(
+                    "POST /api/analysis/stop".to_string(),
+                    json!("Stop video analysis"),
+                );
+                endpoints.insert(
+                    "GET /api/analysis/<stream_id>/metrics".to_string(),
+                    json!("Analysis metrics"),
+                );
+                endpoints.insert(
+                    "GET /api/analysis/<stream_id>/events".to_string(),
+                    json!("Analysis events"),
+                );
+                endpoints.insert(
+                    "POST /api/snapshot".to_string(),
+                    json!("Capture stream snapshot"),
+                );
+                endpoints.insert("GET /api/snapshots".to_string(), json!("List snapshots"));
+                endpoints.insert(
+                    "GET /api/snapshots/<id>".to_string(),
+                    json!("Get snapshot status"),
+                );
+                endpoints.insert(
+                    "GET /api/snapshots/<id>.jpg".to_string(),
+                    json!("Read snapshot image"),
                 );
                 endpoints.insert(
                     "GET /hls/<stream_id>/live.m3u8".to_string(),
@@ -832,10 +1250,12 @@ impl HttpServer {
             body
         )
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
+    fn json_body(request: &str) -> &str {
+        request
+            .find("\r\n\r\n")
+            .map(|i| &request[i + 4..])
+            .unwrap_or("")
+            .trim()
+    }
 }

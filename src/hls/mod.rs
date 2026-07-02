@@ -682,10 +682,7 @@ impl HlsServer {
             request_publisher_keyframe(&stream_id_owned);
 
             loop {
-                let lag = reader
-                    .hub()
-                    .latest_seq()
-                    .saturating_sub(reader.cursor());
+                let lag = reader.hub().latest_seq().saturating_sub(reader.cursor());
                 if lag > HLS_MUX_LAG_SNAP_THRESHOLD {
                     info!(
                         "[HLS] [{}] mux lag {} frames — snap to live IDR",

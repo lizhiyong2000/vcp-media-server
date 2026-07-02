@@ -19,6 +19,24 @@ output_dir = "./hls"
 [http_flv]
 enabled = true
 
+[record]
+enabled = true
+base_dir = "./recordings"
+default_format = "ts"
+segment_duration_sec = 300
+align_keyframe = true
+
+[analysis]
+enabled = true
+default_sample_interval = 1
+max_events_per_stream = 256
+
+[snapshot]
+enabled = true
+base_dir = "./snapshots"
+ffmpeg_path = "ffmpeg"
+wait_keyframe_ms = 1000
+
 [log]
 level = "info"
 path = "./logs/media-server.log"

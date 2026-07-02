@@ -8,6 +8,9 @@ pub struct Config {
     pub http: HttpConfig,
     pub hls: Option<HlsConfig>,
     pub http_flv: Option<HttpFlvConfig>,
+    pub record: Option<RecordConfig>,
+    pub analysis: Option<AnalysisConfig>,
+    pub snapshot: Option<SnapshotConfig>,
     pub streams: Vec<StreamConfig>,
     pub log: LogConfig,
 }
@@ -43,6 +46,30 @@ pub struct HlsConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpFlvConfig {
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordConfig {
+    pub enabled: bool,
+    pub base_dir: Option<String>,
+    pub default_format: Option<String>,
+    pub segment_duration_sec: Option<u64>,
+    pub align_keyframe: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalysisConfig {
+    pub enabled: bool,
+    pub default_sample_interval: Option<u64>,
+    pub max_events_per_stream: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotConfig {
+    pub enabled: bool,
+    pub base_dir: Option<String>,
+    pub ffmpeg_path: Option<String>,
+    pub wait_keyframe_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,6 +124,24 @@ impl Default for Config {
                 output_dir: Some("./hls".to_string()),
             }),
             http_flv: Some(HttpFlvConfig { enabled: true }),
+            record: Some(RecordConfig {
+                enabled: false,
+                base_dir: Some("./recordings".to_string()),
+                default_format: Some("ts".to_string()),
+                segment_duration_sec: Some(300),
+                align_keyframe: Some(true),
+            }),
+            analysis: Some(AnalysisConfig {
+                enabled: false,
+                default_sample_interval: Some(1),
+                max_events_per_stream: Some(256),
+            }),
+            snapshot: Some(SnapshotConfig {
+                enabled: false,
+                base_dir: Some("./snapshots".to_string()),
+                ffmpeg_path: Some("ffmpeg".to_string()),
+                wait_keyframe_ms: Some(1_000),
+            }),
             streams: vec![StreamConfig {
                 id: "live".to_string(),
                 tracks: vec![

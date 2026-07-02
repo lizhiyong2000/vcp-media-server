@@ -983,10 +983,8 @@ impl RtmpServer {
                         // Tell players to keep a minimal buffer (ffplay defaults to ~5s otherwise).
                         let stream_begin =
                             session::build_user_control_stream_begin(server_stream_id);
-                        let set_buffer = session::build_user_control_set_buffer_length(
-                            server_stream_id,
-                            100,
-                        );
+                        let set_buffer =
+                            session::build_user_control_set_buffer_length(server_stream_id, 100);
                         for (payload, label) in [
                             (stream_begin, "StreamBegin"),
                             (set_buffer, "SetBufferLength(100ms)"),
@@ -1043,17 +1041,18 @@ impl RtmpServer {
                                     );
                                 }
                                 for frame in frames {
-                                if frame.codec == CodecType::Opus || frame.codec == CodecType::G711
-                                {
-                                    continue;
-                                }
-                                if matches!(frame.codec, CodecType::H264 | CodecType::H265)
-                                    && !video_streaming
-                                {
-                                    if !is_idr_frame(&frame) {
+                                    if frame.codec == CodecType::Opus
+                                        || frame.codec == CodecType::G711
+                                    {
                                         continue;
                                     }
-                                    info!(
+                                    if matches!(frame.codec, CodecType::H264 | CodecType::H265)
+                                        && !video_streaming
+                                    {
+                                        if !is_idr_frame(&frame) {
+                                            continue;
+                                        }
+                                        info!(
                                         "[RTMP] [{}] accepted first video IDR after={}ms stream='{}' raw_ts={} size={} cursor={} latest_seq={}",
                                         peer_log,
                                         play_started_at.elapsed().as_millis(),
@@ -1063,13 +1062,13 @@ impl RtmpServer {
                                         reader.cursor(),
                                         reader.hub().latest_seq()
                                     );
-                                    video_streaming = true;
-                                }
-                                if frame.codec == CodecType::AAC && frame.data.len() < 8 {
-                                    continue;
-                                }
-                                if frames_sent == 0 {
-                                    info!(
+                                        video_streaming = true;
+                                    }
+                                    if frame.codec == CodecType::AAC && frame.data.len() < 8 {
+                                        continue;
+                                    }
+                                    if frames_sent == 0 {
+                                        info!(
                                         "[RTMP] [{}] >>> PREPARE first frame after={}ms: stream='{}' codec={:?} keyframe={} raw_ts={} size={} cursor={} latest_seq={}",
                                         peer_log,
                                         play_started_at.elapsed().as_millis(),
@@ -1081,45 +1080,45 @@ impl RtmpServer {
                                         reader.cursor(),
                                         reader.hub().latest_seq()
                                     );
-                                }
-                                let data = match frame.codec {
-                                    CodecType::H264 | CodecType::H265 => {
-                                        session::frame_to_rtmp_video(
-                                            &prepend_rtmp_video_config(
-                                                &manager_for_play,
-                                                &stream_id_for_play,
-                                                &frame,
-                                            ),
-                                        )
                                     }
-                                    CodecType::AAC => session::frame_to_rtmp_audio(&frame),
-                                    _ => continue,
-                                };
-                                if data.is_empty() {
-                                    continue;
-                                }
-                                let (msg_type, csid) = match frame.codec {
-                                    CodecType::H264 | CodecType::H265 => {
-                                        (0x09u8, chunk::CSID_VIDEO)
+                                    let data = match frame.codec {
+                                        CodecType::H264 | CodecType::H265 => {
+                                            session::frame_to_rtmp_video(
+                                                &prepend_rtmp_video_config(
+                                                    &manager_for_play,
+                                                    &stream_id_for_play,
+                                                    &frame,
+                                                ),
+                                            )
+                                        }
+                                        CodecType::AAC => session::frame_to_rtmp_audio(&frame),
+                                        _ => continue,
+                                    };
+                                    if data.is_empty() {
+                                        continue;
                                     }
-                                    _ => (0x08u8, chunk::CSID_AUDIO),
-                                };
-                                let rtmp_ts = clock.map_wallclock();
-                                let rtmp_msg = chunk::encode_message(
-                                    msg_type,
-                                    rtmp_ts,
-                                    server_stream_id,
-                                    &data,
-                                    chunk_size_val,
-                                    csid,
-                                );
-                                let mut guard = writer_clone.lock().await;
-                                if guard.write_all(&rtmp_msg).await.is_err() {
-                                    info!("[RTMP] [{}] Play client disconnected", peer_log);
-                                    return;
-                                }
-                                if frames_sent == 0 {
-                                    info!(
+                                    let (msg_type, csid) = match frame.codec {
+                                        CodecType::H264 | CodecType::H265 => {
+                                            (0x09u8, chunk::CSID_VIDEO)
+                                        }
+                                        _ => (0x08u8, chunk::CSID_AUDIO),
+                                    };
+                                    let rtmp_ts = clock.map_wallclock();
+                                    let rtmp_msg = chunk::encode_message(
+                                        msg_type,
+                                        rtmp_ts,
+                                        server_stream_id,
+                                        &data,
+                                        chunk_size_val,
+                                        csid,
+                                    );
+                                    let mut guard = writer_clone.lock().await;
+                                    if guard.write_all(&rtmp_msg).await.is_err() {
+                                        info!("[RTMP] [{}] Play client disconnected", peer_log);
+                                        return;
+                                    }
+                                    if frames_sent == 0 {
+                                        info!(
                                         "[RTMP] [{}] >>> SENT first frame after={}ms: stream='{}' codec={:?} keyframe={} raw_ts={} rtmp_ts={} send_elapsed_ms={} payload_bytes={} message_bytes={} cursor={} latest_seq={}",
                                         peer_log,
                                         play_started_at.elapsed().as_millis(),
@@ -1134,14 +1133,14 @@ impl RtmpServer {
                                         reader.cursor(),
                                         reader.hub().latest_seq()
                                     );
-                                }
-                                frames_sent += 1;
-                                if frames_sent % 100 == 0 {
-                                    let elapsed_ms =
-                                        send_started_at.elapsed().as_millis() as u64;
-                                    let send_lead_ms =
-                                        (rtmp_ts as u64).saturating_sub(elapsed_ms);
-                                    info!(
+                                    }
+                                    frames_sent += 1;
+                                    if frames_sent % 100 == 0 {
+                                        let elapsed_ms =
+                                            send_started_at.elapsed().as_millis() as u64;
+                                        let send_lead_ms =
+                                            (rtmp_ts as u64).saturating_sub(elapsed_ms);
+                                        info!(
                                         "[RTMP] >>> SEND {} frames to player (codec={:?} rtmp_ts={} elapsed_ms={} send_lead_ms={} cursor={} latest_seq={})",
                                         frames_sent,
                                         frame.codec,
@@ -1151,7 +1150,7 @@ impl RtmpServer {
                                         reader.cursor(),
                                         reader.hub().latest_seq()
                                     );
-                                }
+                                    }
                                 }
                             }
                         });
@@ -1443,5 +1442,4 @@ mod tests {
         assert_eq!(prepared.timestamp, frame.timestamp);
         assert!(prepared.is_keyframe);
     }
-
 }

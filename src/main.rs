@@ -1,13 +1,15 @@
+mod analysis;
 mod core;
 mod hls;
 mod http;
 mod http_flv;
+mod record;
 mod rtmp;
 mod rtsp;
+mod snapshot;
 mod webrtc;
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -19,8 +21,10 @@ use tracing_subscriber::{
     prelude::*,
 };
 
-use crate::core::{CodecType, Config, StreamManager, StreamProtocol, StreamSourceMode};
-use crate::hls::{HlsConfig as HlsModuleConfig, HlsServer};
+use crate::core::{Config, StreamManager, StreamProtocol, StreamSourceMode};
+use crate::hls::HlsConfig as HlsModuleConfig;
+use crate::record::{RecordFormat, RecorderManager};
+use crate::snapshot::SnapshotManager;
 static LOG_GUARD: Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> = Mutex::new(None);
 
 fn server_task_result(
@@ -232,11 +236,93 @@ async fn main() -> Result<()> {
         None
     };
 
+    let record_config = config
+        .record
+        .as_ref()
+        .map(|c| record::RecordConfig {
+            enabled: c.enabled,
+            base_dir: c
+                .base_dir
+                .clone()
+                .map(Into::into)
+                .unwrap_or_else(|| "./recordings".into()),
+            default_format: c
+                .default_format
+                .as_deref()
+                .and_then(RecordFormat::parse)
+                .unwrap_or(RecordFormat::Ts),
+            segment_duration: std::time::Duration::from_secs(
+                c.segment_duration_sec.unwrap_or(300).max(1),
+            ),
+            align_keyframe: c.align_keyframe.unwrap_or(true),
+        })
+        .unwrap_or_default();
+    let recorder_manager = Arc::new(RecorderManager::new(
+        stream_manager.clone(),
+        record_config.clone(),
+    ));
+    let recorder_http = if record_config.enabled {
+        Some(recorder_manager.clone())
+    } else {
+        None
+    };
+
+    let analysis_config = config
+        .analysis
+        .as_ref()
+        .map(|c| analysis::AnalysisConfig {
+            enabled: c.enabled,
+            default_sample_interval: c.default_sample_interval.unwrap_or(1).max(1),
+            max_events_per_stream: c.max_events_per_stream.unwrap_or(256).max(1),
+        })
+        .unwrap_or_default();
+    let analysis_manager = Arc::new(analysis::AnalysisManager::new(
+        stream_manager.clone(),
+        analysis_config.clone(),
+    ));
+    let analysis_http = if analysis_config.enabled {
+        Some(analysis_manager.clone())
+    } else {
+        None
+    };
+
+    let snapshot_config = config
+        .snapshot
+        .as_ref()
+        .map(|c| snapshot::SnapshotConfig {
+            enabled: c.enabled,
+            base_dir: c
+                .base_dir
+                .clone()
+                .map(Into::into)
+                .unwrap_or_else(|| "./snapshots".into()),
+            ffmpeg_path: c
+                .ffmpeg_path
+                .clone()
+                .unwrap_or_else(|| "ffmpeg".to_string()),
+            wait_keyframe: std::time::Duration::from_millis(
+                c.wait_keyframe_ms.unwrap_or(1_000).max(1),
+            ),
+        })
+        .unwrap_or_default();
+    let snapshot_manager = Arc::new(SnapshotManager::new(
+        stream_manager.clone(),
+        snapshot_config.clone(),
+    ));
+    let snapshot_http = if snapshot_config.enabled {
+        Some(snapshot_manager.clone())
+    } else {
+        None
+    };
+
     let http_server = http::HttpServer::new(
         stream_manager.clone(),
         config.http.port,
         hls_server_http,
         http_flv_server_http,
+        recorder_http,
+        analysis_http,
+        snapshot_http,
     );
 
     let rtmp_server =
@@ -258,6 +344,24 @@ async fn main() -> Result<()> {
         "  HLS:   http://localhost:{}/hls/<stream_id>/live.m3u8",
         config.http.port
     );
+    if record_config.enabled {
+        info!(
+            "  Record API:   http://localhost:{}/api/record/start",
+            config.http.port
+        );
+    }
+    if analysis_config.enabled {
+        info!(
+            "  Analysis API: http://localhost:{}/api/analysis/start",
+            config.http.port
+        );
+    }
+    if snapshot_config.enabled {
+        info!(
+            "  Snapshot API: http://localhost:{}/api/snapshot",
+            config.http.port
+        );
+    }
     info!(
         "  FLV:   http://localhost:{}/flv/<stream_id>",
         config.http.port

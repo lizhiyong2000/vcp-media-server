@@ -3,9 +3,7 @@
 use std::time::{Duration, Instant};
 
 use crate::core::{
-    dispatch::DispatchReader,
-    is_idr_frame, prime_live_play,
-    CodecType, MediaFrame, StreamManager,
+    dispatch::DispatchReader, is_idr_frame, prime_live_play, CodecType, MediaFrame, StreamManager,
 };
 
 use super::common::{wrap_mpeg4_generic_aac_hbr, RtspCommon};

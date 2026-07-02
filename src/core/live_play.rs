@@ -25,7 +25,11 @@ pub fn is_idr_frame(frame: &MediaFrame) -> bool {
     frame.is_keyframe || contains_idr_nalu(&ensure_annex_b(&frame.data))
 }
 
-pub fn prepend_h264_config(manager: &StreamManager, stream_id: &str, frame: &MediaFrame) -> Vec<u8> {
+pub fn prepend_h264_config(
+    manager: &StreamManager,
+    stream_id: &str,
+    frame: &MediaFrame,
+) -> Vec<u8> {
     let au = ensure_annex_b(&frame.data);
     if !(frame.is_keyframe || is_idr_frame(frame) || contains_sps_or_pps_nalu(&au)) {
         return au;
@@ -103,10 +107,7 @@ pub async fn prime_live_play(
     ) {
         let frame_lag = reader.hub().latest_seq().saturating_sub(idr_seq);
         let latest = reader.hub().latest_seq();
-        if frame_lag <= 30
-            && is_playable_video_frame(&idr)
-            && is_idr_frame(&idr)
-        {
+        if frame_lag <= 30 && is_playable_video_frame(&idr) && is_idr_frame(&idr) {
             reader.begin_video_catchup_after_idr(idr_seq, latest);
             info!(
                 "[{log_prefix}] [{stream_id}] PLAY fallback IDR after={}ms ts={} bytes={} seq={} catchup_through={}",
