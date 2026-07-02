@@ -33,6 +33,18 @@ fn is_hls_video_keyframe(frame: &MediaFrame) -> bool {
         && (frame.is_keyframe || is_keyframe_annex_b(&frame.data))
 }
 
+fn audio_timestamp_delta_ms(prev: u64, curr: u64) -> u64 {
+    if curr <= prev {
+        return 0;
+    }
+    let delta = curr - prev;
+    if delta > 2000 {
+        delta.saturating_mul(1000) / 44100
+    } else {
+        delta
+    }
+}
+
 /// HLS configuration
 #[derive(Debug, Clone)]
 pub struct HlsConfig {
@@ -68,19 +80,21 @@ struct HlsSession {
     active: bool,
     /// Drop video until the first keyframe (late HLS join)
     primed: bool,
-    /// Session-wide AAC frame count for continuous audio PTS
+    /// Count of accepted AAC media packets
     session_audio_frames: u64,
     /// Last raw video timestamp for segment duration (ms)
     last_video_timestamp: u64,
     /// Session-continuous video mux timeline (ms) in TS — matches ffmpeg HLS first_timestamp.
     session_video_mux_ms: u64,
-    /// Session-continuous AAC frame index
-    session_audio_mux_frames: u64,
+    /// Session-continuous AAC mux timeline (ms), kept close to the video live edge.
+    session_audio_mux_ms: u64,
     /// Last publisher video timestamp (session-wide)
     session_last_raw_video: u64,
+    /// Last publisher audio timestamp (session-wide)
+    session_last_raw_audio: Option<u64>,
     /// Session mux ms when the open segment started
     segment_open_mux_ms: u64,
-    /// Session mux ms after the last frame in the open segment
+    /// Session video mux ms after the last video frame in the open segment
     segment_last_mux_ms: u64,
     /// Wall-clock anchor for the segment currently being muxed
     segment_wall_start: Option<Instant>,
@@ -128,8 +142,9 @@ impl HlsSession {
             session_audio_frames: 0,
             last_video_timestamp: 0,
             session_video_mux_ms: 0,
-            session_audio_mux_frames: 0,
+            session_audio_mux_ms: 0,
             session_last_raw_video: 0,
+            session_last_raw_audio: None,
             segment_open_mux_ms: 0,
             segment_last_mux_ms: 0,
             segment_open_mux_ms_at_split: 0,
@@ -195,12 +210,46 @@ impl HlsSession {
         self.ensure_wall_timeline();
         match frame.codec {
             CodecType::AAC => {
-                let pts = self.session_audio_mux_frames * 1024 * 1000 / 44100;
-                self.session_audio_mux_frames += 1;
-                // Keep audio from running ahead of video.
-                pts.min(self.session_video_mux_ms.saturating_add(100))
+                let prev_raw = self.session_last_raw_audio;
+                let prev_mux = self.session_audio_mux_ms;
+                let pts = match prev_raw {
+                    Some(last_raw) if frame.timestamp > last_raw => {
+                        let delta = audio_timestamp_delta_ms(last_raw, frame.timestamp);
+                        if delta > 0 && delta < 2000 {
+                            prev_mux.saturating_add(delta)
+                        } else {
+                            self.session_video_mux_ms
+                        }
+                    }
+                    Some(_) => prev_mux,
+                    None => self.session_video_mux_ms,
+                };
+                self.session_last_raw_audio = Some(frame.timestamp);
+
+                // RTSP AAC packetization is not guaranteed to be one AAC frame per RTP packet.
+                // Keep audio close enough to the video live edge so TS demuxers do not infer a
+                // huge program duration from divergent audio/video PTS ranges.
+                let min_audio_ms = self.session_video_mux_ms.saturating_sub(200);
+                let max_audio_ms = self.session_video_mux_ms.saturating_add(100);
+                let clamped = pts.clamp(min_audio_ms, max_audio_ms);
+                self.session_audio_mux_ms = clamped;
+                debug!(
+                    "[HLS] [{}] AAC PTS map: raw_ts={} prev_raw_ts={:?} prev_mux_ms={} ideal_mux_ms={} clamped_mux_ms={} video_mux_ms={} segment_open_ms={} segment_last_video_ms={}",
+                    self.stream_id,
+                    frame.timestamp,
+                    prev_raw,
+                    prev_mux,
+                    pts,
+                    clamped,
+                    self.session_video_mux_ms,
+                    self.segment_open_mux_ms_at_split,
+                    self.segment_last_mux_ms
+                );
+                clamped
             }
             CodecType::H264 | CodecType::H265 => {
+                let prev_raw = self.session_last_raw_video;
+                let prev_mux = self.session_video_mux_ms;
                 let (last_raw, mux_ms) = timing::advance_video_mux_ms(
                     self.session_last_raw_video,
                     self.session_video_mux_ms,
@@ -208,6 +257,18 @@ impl HlsSession {
                 );
                 self.session_last_raw_video = last_raw;
                 self.session_video_mux_ms = mux_ms;
+                debug!(
+                    "[HLS] [{}] Video PTS map: codec={:?} raw_ts={} prev_raw_ts={} prev_mux_ms={} mux_ms={} keyframe={} segment_open_ms={} segment_last_video_ms={}",
+                    self.stream_id,
+                    frame.codec,
+                    frame.timestamp,
+                    prev_raw,
+                    prev_mux,
+                    mux_ms,
+                    is_hls_video_keyframe(frame),
+                    self.segment_open_mux_ms_at_split,
+                    self.segment_last_mux_ms
+                );
                 self.session_video_mux_ms
             }
             _ => 0,
@@ -239,6 +300,12 @@ impl HlsSession {
 
         // Skip AAC sequence header / tiny config payloads
         if frame.codec == CodecType::AAC && frame.data.len() < 8 {
+            debug!(
+                "[HLS] [{}] Skip AAC config/tiny frame: raw_ts={} len={}",
+                self.stream_id,
+                frame.timestamp,
+                frame.data.len()
+            );
             return Ok(None);
         }
         if frame.codec == CodecType::AAC {
@@ -265,10 +332,20 @@ impl HlsSession {
             let has_audio = self.session_audio_frames > 0 || frame.codec == CodecType::AAC;
             let pat_pmt = self.muxer.generate_pat_pmt(true, has_audio);
             self.segment_buffer.extend(pat_pmt);
+            debug!(
+                "[HLS] [{}] Open segment: open_mux_ms={} has_audio={} first_codec={:?} first_raw_ts={} keyframe={}",
+                self.stream_id,
+                self.segment_open_mux_ms_at_split,
+                has_audio,
+                frame.codec,
+                frame.timestamp,
+                is_hls_video_keyframe(frame)
+            );
         }
 
         // Track segment duration from video timestamps only (audio/video RTMP clocks differ)
         if matches!(frame.codec, CodecType::H264 | CodecType::H265) {
+            let mut video_delta_ms = 0;
             if self.last_video_timestamp > 0 && frame.timestamp > self.last_video_timestamp {
                 let delta_ms = crate::core::media_timestamp_delta_ms(
                     self.last_video_timestamp,
@@ -276,8 +353,18 @@ impl HlsSession {
                 );
                 if delta_ms > 0 && delta_ms < 2000 {
                     self.segment_duration_acc += delta_ms as f64 / 1000.0;
+                    video_delta_ms = delta_ms;
                 }
             }
+            debug!(
+                "[HLS] [{}] Video segment clock: raw_ts={} last_raw_ts={} delta_ms={} publisher_secs={:.3} keyframe={}",
+                self.stream_id,
+                frame.timestamp,
+                self.last_video_timestamp,
+                video_delta_ms,
+                self.segment_duration_acc,
+                is_hls_video_keyframe(frame)
+            );
             self.last_video_timestamp = frame.timestamp;
         }
 
@@ -298,7 +385,7 @@ impl HlsSession {
             request_publisher_keyframe(&self.stream_id);
         }
 
-        let should_split = should_split_segment(&SplitEval {
+        let split_eval = SplitEval {
             is_keyframe: is_hls_video_keyframe(frame),
             mux_secs,
             publisher_secs: self.segment_duration_acc,
@@ -307,7 +394,27 @@ impl HlsSession {
             has_muxed_media: self.segment_last_mux_ms > self.segment_open_mux_ms_at_split,
             buffer_len: self.segment_buffer.len(),
             min_segment_bytes: MIN_SEGMENT_BYTES,
-        });
+        };
+        let should_split = should_split_segment(&split_eval);
+        if matches!(frame.codec, CodecType::H264 | CodecType::H265) || should_split {
+            debug!(
+                "[HLS] [{}] Split eval: codec={:?} raw_ts={} keyframe={} mux_secs={:.3} publisher_secs={:.3} threshold={:.3} committed={} has_muxed_media={} buffer={} should_split={} open_ms={} last_video_ms={} last_idr_ms={}",
+                self.stream_id,
+                frame.codec,
+                frame.timestamp,
+                split_eval.is_keyframe,
+                split_eval.mux_secs,
+                split_eval.publisher_secs,
+                split_eval.split_threshold,
+                split_eval.committed_segments,
+                split_eval.has_muxed_media,
+                split_eval.buffer_len,
+                should_split,
+                self.segment_open_mux_ms_at_split,
+                self.segment_last_mux_ms,
+                self.segment_last_idr_mux_ms
+            );
+        }
 
         let mut completed: Option<CompletedSegment> = None;
 
@@ -319,6 +426,19 @@ impl HlsSession {
             self.pending_discontinuity = false;
             let pdt = live_pdt(duration, SystemTime::now());
             let data = std::mem::take(&mut self.segment_buffer);
+            debug!(
+                "[HLS] [{}] Closing segment: seq={} filename={} duration={:.3}s open_ms={} last_video_ms={} last_idr_ms={} publisher_secs={:.3} bytes={} discontinuity={}",
+                self.stream_id,
+                seq,
+                filename,
+                duration,
+                self.segment_open_mux_ms_at_split,
+                self.segment_last_mux_ms,
+                self.segment_last_idr_mux_ms,
+                self.segment_duration_acc,
+                data.len(),
+                discontinuity
+            );
 
             if duration > self.playlist.target_duration() * 2.0 {
                 warn!(
@@ -356,23 +476,53 @@ impl HlsSession {
             let pat_pmt = self.muxer.generate_pat_pmt(true, has_audio);
             self.segment_buffer.extend(pat_pmt);
             self.segment_wall_start = Some(Instant::now());
+            debug!(
+                "[HLS] [{}] Open next segment after split: seq={} open_mux_ms={} has_audio={} start_raw_ts={} keyframe={}",
+                self.stream_id,
+                seq.saturating_add(1),
+                self.segment_open_mux_ms_at_split,
+                has_audio,
+                frame.timestamp,
+                is_hls_video_keyframe(frame)
+            );
             // Prime PCR to the keyframe PTS before the first PES (avoids DTS 0 at segment open).
             let mux_frame = self.prepare_frame_for_mux(frame);
             self.segment_last_mux_ms = mux_frame.timestamp;
             self.segment_last_idr_mux_ms = mux_frame.timestamp;
             self.muxer.update_pcr(mux_frame.timestamp);
             let ts_data = self.muxer.frame_to_ts(&mux_frame);
+            debug!(
+                "[HLS] [{}] Mux split keyframe: raw_ts={} mux_ms={} ts_bytes={} segment_last_video_ms={}",
+                self.stream_id,
+                frame.timestamp,
+                mux_frame.timestamp,
+                ts_data.len(),
+                self.segment_last_mux_ms
+            );
             self.segment_buffer.extend(ts_data);
             return Ok(completed);
         }
 
         let mux_frame = self.prepare_frame_for_mux(frame);
-        self.segment_last_mux_ms = mux_frame.timestamp;
-        if is_hls_video_keyframe(frame) {
-            self.segment_last_idr_mux_ms = mux_frame.timestamp;
+        if matches!(mux_frame.codec, CodecType::H264 | CodecType::H265) {
+            self.segment_last_mux_ms = mux_frame.timestamp;
+            if is_hls_video_keyframe(frame) {
+                self.segment_last_idr_mux_ms = mux_frame.timestamp;
+            }
         }
         self.muxer.update_pcr(mux_frame.timestamp);
         let ts_data = self.muxer.frame_to_ts(&mux_frame);
+        debug!(
+            "[HLS] [{}] Mux frame: codec={:?} raw_ts={} mux_ms={} keyframe={} ts_bytes={} segment_last_video_ms={} buffer_before={}",
+            self.stream_id,
+            frame.codec,
+            frame.timestamp,
+            mux_frame.timestamp,
+            is_hls_video_keyframe(frame),
+            ts_data.len(),
+            self.segment_last_mux_ms,
+            self.segment_buffer.len()
+        );
         self.segment_buffer.extend(ts_data);
 
         Ok(completed)
@@ -806,6 +956,28 @@ mod playback_tests {
         )
     }
 
+    fn aac_frame(index: u64) -> MediaFrame {
+        MediaFrame::new(
+            "test".into(),
+            1,
+            index * 1024,
+            Bytes::from_static(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+            false,
+            CodecType::AAC,
+        )
+    }
+
+    fn rtsp_aac_frame(ts: u64) -> MediaFrame {
+        MediaFrame::new(
+            "test".into(),
+            1,
+            ts,
+            Bytes::from_static(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+            false,
+            CodecType::AAC,
+        )
+    }
+
     fn temp_hls_config(suffix: &str) -> HlsConfig {
         let dir =
             std::env::temp_dir().join(format!("vcp_hls_test_{}_{suffix}", std::process::id()));
@@ -867,6 +1039,76 @@ mod playback_tests {
                 d
             );
         }
+    }
+
+    #[test]
+    fn interleaved_audio_does_not_hide_video_split_point() {
+        let config = temp_hls_config("av_split");
+        let mut session = HlsSession::new("t", &config).unwrap();
+        let mut durations = Vec::new();
+        let mut audio_index = 0;
+
+        for gop in 0..4 {
+            for f in 0..25u64 {
+                let ts = RTP_BASE + (gop * 25 + f) * FRAME_TICKS;
+                let video = h264_frame(ts, f == 0);
+                if let Ok(Some(seg)) = session.on_frame(&video) {
+                    durations.push(seg.duration);
+                }
+
+                // RTSP push commonly interleaves AAC between video access units. These audio
+                // timestamps must not overwrite the video segment clock used for IDR splitting.
+                let audio = aac_frame(audio_index);
+                audio_index += 1;
+                if let Ok(Some(seg)) = session.on_frame(&audio) {
+                    durations.push(seg.duration);
+                }
+            }
+        }
+
+        assert!(
+            durations.len() >= 3,
+            "expected one segment per ~1s GOP with interleaved audio, got {:?}",
+            durations
+        );
+        for duration in durations {
+            assert!(
+                duration <= 1.5,
+                "audio interleave should not cause long HLS segments, got {duration:.3}s"
+            );
+        }
+    }
+
+    #[test]
+    fn rtsp_audio_pts_stays_near_video_pts_over_long_run() {
+        let config = temp_hls_config("rtsp_audio_pts");
+        let mut session = HlsSession::new("t", &config).unwrap();
+        let video_base = RTP_BASE;
+        let audio_base = 1_424_000_000u64;
+        let mut audio_ts = audio_base;
+
+        for i in 0..(25 * 180u64) {
+            let video = h264_frame(video_base + i * FRAME_TICKS, i % 25 == 0);
+            let _ = session.on_frame(&video).unwrap();
+
+            // Simulate RTSP AAC where each RTP packet can represent multiple AAC samples.
+            if i % 2 == 0 {
+                let audio = rtsp_aac_frame(audio_ts);
+                audio_ts += 3072;
+                let _ = session.on_frame(&audio).unwrap();
+            }
+        }
+
+        let av_delta = session
+            .session_video_mux_ms
+            .abs_diff(session.session_audio_mux_ms);
+        assert!(
+            av_delta <= 250,
+            "audio/video HLS PTS drifted too far: video={}ms audio={}ms delta={}ms",
+            session.session_video_mux_ms,
+            session.session_audio_mux_ms,
+            av_delta
+        );
     }
 
     #[test]
