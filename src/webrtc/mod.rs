@@ -28,8 +28,8 @@ use webrtc::peer_connection::RTCPeerConnection;
 use crate::core::StreamManager;
 use crate::hls::HlsServer;
 use peer::create_api;
-use player::{cancel_play_relay, signal_play_relay_stop, start_play};
 use play_relay::stop_play_relays_for_stream;
+use player::{cancel_play_relay, signal_play_relay_stop, start_play};
 use publish_signaling::{register_publish_signaling, unregister_publish_signaling};
 use publisher::{add_ice_candidate, start_publish};
 use signaling::{ClientSignal, ServerSignal};
@@ -447,8 +447,32 @@ where
             if state.stream_id.is_none() {
                 state.stream_id = Some(stream_id.clone());
             }
-            let session =
-                start_play(api.clone(), manager.clone(), stream_id, sdp, ice_tx.clone()).await?;
+            let session = match start_play(
+                api.clone(),
+                manager.clone(),
+                stream_id.clone(),
+                sdp,
+                ice_tx.clone(),
+            )
+            .await
+            {
+                Ok(session) => session,
+                Err(e) => {
+                    warn!(
+                        "[WebRTC] Rejecting play request stream='{}': {}",
+                        stream_id, e
+                    );
+                    ws_tx
+                        .send(Message::Text(
+                            ServerSignal::Error {
+                                message: format!("play rejected: {}", e),
+                            }
+                            .to_json(),
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+            };
 
             state.play_pc = Some(session.pc);
             state.play_relay_id = Some(session.relay_id);

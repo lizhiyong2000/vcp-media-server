@@ -43,9 +43,7 @@ pub async fn start_play(
     offer_sdp: String,
     ice_tx: mpsc::UnboundedSender<ServerSignal>,
 ) -> Result<PlaySession> {
-    if manager.get_stream(&stream_id).is_none() {
-        return Err(anyhow!("Stream '{}' not found", stream_id));
-    }
+    validate_playable_stream(&manager, &stream_id)?;
 
     manager.ensure_stream_hub(&stream_id);
     log_stream_codec_state(&manager, &stream_id, "play-request");
@@ -147,6 +145,22 @@ pub async fn start_play(
         relay_id,
         relay_handle,
     })
+}
+
+fn validate_playable_stream(manager: &StreamManager, stream_id: &str) -> Result<()> {
+    let stream = manager
+        .get_stream(&stream_id.to_string())
+        .ok_or_else(|| anyhow!("Stream '{}' not found", stream_id))?;
+
+    if !stream.status.is_publishing() {
+        return Err(anyhow!(
+            "Stream '{}' is not publishing (status={})",
+            stream_id,
+            stream.status.as_str()
+        ));
+    }
+
+    Ok(())
 }
 
 fn log_stream_codec_state(manager: &StreamManager, stream_id: &str, phase: &str) {
@@ -407,10 +421,7 @@ async fn relay_stream_to_track(
             sample_data = prepend_stream_config(&manager, &stream_id, &sample_data);
         }
 
-        let lag = reader
-            .hub()
-            .latest_seq()
-            .saturating_sub(reader.cursor());
+        let lag = reader.hub().latest_seq().saturating_sub(reader.cursor());
         let catch_up = lag > 2 || coalesced > 0;
         let duration = if catch_up {
             Duration::from_millis(1)
@@ -541,5 +552,42 @@ fn store_live_nalu_config(manager: &StreamManager, stream_id: &str, data: &[u8])
     }
     for (start, end) in iter_annex_b_nal_ranges(data) {
         manager.merge_stream_nalu_config(stream_id, &data[start..end]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{StreamProtocol, StreamSourceMode};
+
+    #[test]
+    fn validate_playable_stream_rejects_missing_stream() {
+        let manager = StreamManager::new();
+
+        let err = validate_playable_stream(&manager, "missing").unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn validate_playable_stream_rejects_non_publishing_stream() {
+        let manager = StreamManager::new();
+        manager.create_stream("s", StreamSourceMode::Push, StreamProtocol::WebRTC, None);
+
+        let err = validate_playable_stream(&manager, "s").unwrap_err();
+        assert!(err.to_string().contains("not publishing"));
+
+        manager.set_unpublished("s").unwrap();
+        let err = validate_playable_stream(&manager, "s").unwrap_err();
+        assert!(err.to_string().contains("status=unpublished"));
+    }
+
+    #[test]
+    fn validate_playable_stream_accepts_publishing_stream() {
+        let manager = StreamManager::new();
+        manager.create_stream("s", StreamSourceMode::Push, StreamProtocol::WebRTC, None);
+        manager.set_publishing("s").unwrap();
+
+        validate_playable_stream(&manager, "s").unwrap();
     }
 }

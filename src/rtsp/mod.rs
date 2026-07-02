@@ -204,7 +204,7 @@ impl RtspServer {
                 let stream_id = session.stream_id.as_ref().unwrap();
 
                 let session_id = session.session_id.clone();
-                let rtp_info = Self::build_rtp_info(stream_id);
+                let rtp_info = Self::build_rtp_info(stream_id, manager);
                 let response = Self::build_play_response(cseq, session_id.as_deref(), &rtp_info);
                 Ok(response)
             }
@@ -561,27 +561,28 @@ impl RtspServer {
             (None, None)
         };
 
-        // Build fmtp line with SPS/PPS if available
-        let h264_fmtp = if let (Some(sps_data), Some(pps_data)) = (&sps, &pps) {
-            let sps_b64 = base64::engine::general_purpose::STANDARD.encode(sps_data);
-            let pps_b64 = base64::engine::general_purpose::STANDARD.encode(pps_data);
-            let profile_level_id = if sps_data.len() >= 4 {
-                format!("{:02X}{:02X}{:02X}", sps_data[1], sps_data[2], sps_data[3])
-            } else {
-                "42E01F".to_string()
-            };
-            info!("[RTSP] [{}] Building SDP with SPS ({} bytes) and PPS ({} bytes), profile-level-id={}", 
+        let h264_fmtp = |payload_type: u8| {
+            if let (Some(sps_data), Some(pps_data)) = (&sps, &pps) {
+                let sps_b64 = base64::engine::general_purpose::STANDARD.encode(sps_data);
+                let pps_b64 = base64::engine::general_purpose::STANDARD.encode(pps_data);
+                let profile_level_id = if sps_data.len() >= 4 {
+                    format!("{:02X}{:02X}{:02X}", sps_data[1], sps_data[2], sps_data[3])
+                } else {
+                    "42E01F".to_string()
+                };
+                info!("[RTSP] [{}] Building SDP with SPS ({} bytes) and PPS ({} bytes), profile-level-id={}", 
                   stream_id, sps_data.len(), pps_data.len(), profile_level_id);
-            format!(
-                "a=fmtp:96 packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}\r\n",
-                profile_level_id, sps_b64, pps_b64
+                format!(
+                "a=fmtp:{} packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}\r\n",
+                payload_type, profile_level_id, sps_b64, pps_b64
             )
-        } else {
-            warn!(
-                "[RTSP] [{}] Building SDP with default SPS/PPS (not yet received)",
-                stream_id
-            );
-            String::from("a=fmtp:96 packetization-mode=1;profile-level-id=42E01F;sprop-parameter-sets=Z0LAHukBQBbsAAADAAQAAAMABAAAAwHNgYI=\r\n")
+            } else {
+                warn!(
+                    "[RTSP] [{}] Building SDP with default SPS/PPS (not yet received)",
+                    stream_id
+                );
+                format!("a=fmtp:{} packetization-mode=1;profile-level-id=42E01F;sprop-parameter-sets=Z0LAHukBQBbsAAADAAQAAAMABAAAAwHNgYI=\r\n", payload_type)
+            }
         };
 
         if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
@@ -612,9 +613,9 @@ impl RtspServer {
                 sdp.push_str(&format!("a=control:trackID={}\r\n", idx));
 
                 if track.codec == CodecType::H264 {
-                    sdp.push_str(&h264_fmtp);
+                    sdp.push_str(&h264_fmtp(track.payload_type));
                 } else if track.codec == CodecType::AAC {
-                    sdp.push_str("a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;\r\n");
+                    sdp.push_str(&format!("a=fmtp:{} profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;\r\n", track.payload_type));
                 }
             }
         } else {
@@ -622,7 +623,7 @@ impl RtspServer {
             sdp.push_str("c=IN IP4 0.0.0.0\r\n");
             sdp.push_str("a=rtpmap:96 H264/90000\r\n");
             sdp.push_str("a=control:trackID=0\r\n");
-            sdp.push_str(&h264_fmtp);
+            sdp.push_str(&h264_fmtp(96));
 
             sdp.push_str("m=audio 0 RTP/AVP 97\r\n");
             sdp.push_str("c=IN IP4 0.0.0.0\r\n");
@@ -645,8 +646,29 @@ impl RtspServer {
         "0"
     }
 
-    fn build_rtp_info(stream_id: &str) -> String {
-        format!("url=rtsp://localhost:554/{}/trackID=0;seq=0;rtptime=0,url=rtsp://localhost:554/{}/trackID=1;seq=0;rtptime=0", stream_id, stream_id)
+    fn build_rtp_info(stream_id: &str, manager: &StreamManager) -> String {
+        let tracks = manager
+            .get_stream(&stream_id.to_string())
+            .map(|stream| {
+                if stream.tracks.is_empty() {
+                    crate::core::default_live_tracks()
+                } else {
+                    stream.tracks
+                }
+            })
+            .unwrap_or_else(crate::core::default_live_tracks);
+
+        tracks
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                format!(
+                    "url=rtsp://localhost:554/{}/trackID={};seq=0;rtptime=0",
+                    stream_id, idx
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn parse_sdp_tracks(sdp: &str) -> Vec<Track> {
@@ -684,6 +706,59 @@ impl RtspServer {
         }
 
         tracks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{StreamProtocol, StreamSourceMode};
+
+    #[test]
+    fn build_sdp_uses_track_payload_type_for_h264_fmtp() {
+        let manager = StreamManager::new();
+        manager.create_stream(
+            "webrtc_test",
+            StreamSourceMode::Push,
+            StreamProtocol::WebRTC,
+            None,
+        );
+        manager.set_stream_tracks(
+            "webrtc_test",
+            vec![Track::new(0, CodecType::H264, 103, 90_000)],
+        );
+        manager.set_stream_sps_pps(
+            "webrtc_test",
+            vec![0x67, 0x42, 0x00, 0x1e],
+            vec![0x68, 0xce, 0x1f, 0x20],
+        );
+
+        let sdp = RtspServer::build_sdp("webrtc_test", &manager);
+
+        assert!(sdp.contains("m=video 0 RTP/AVP 103"));
+        assert!(sdp.contains("a=rtpmap:103 H264/90000"));
+        assert!(sdp.contains("a=fmtp:103 "));
+        assert!(!sdp.contains("a=fmtp:96 "));
+    }
+
+    #[test]
+    fn build_rtp_info_only_lists_existing_tracks() {
+        let manager = StreamManager::new();
+        manager.create_stream(
+            "webrtc_test",
+            StreamSourceMode::Push,
+            StreamProtocol::WebRTC,
+            None,
+        );
+        manager.set_stream_tracks(
+            "webrtc_test",
+            vec![Track::new(0, CodecType::H264, 103, 90_000)],
+        );
+
+        let rtp_info = RtspServer::build_rtp_info("webrtc_test", &manager);
+
+        assert!(rtp_info.contains("trackID=0"));
+        assert!(!rtp_info.contains("trackID=1"));
     }
 }
 

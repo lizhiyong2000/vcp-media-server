@@ -13,15 +13,14 @@ use webrtc::track::track_remote::TrackRemote;
 
 use super::h264_util::{describe_annex_b, is_keyframe_annex_b, is_parameter_set_only};
 use super::peer::{new_peer_connection, wire_pc_debug};
+use super::publish_signaling::register_publish_pli;
 use super::rtp_h264::{
     self, annex_b_from_rtp_payload, describe_rtp_payload, extract_sps_pps_from_nalus, hex_prefix,
     is_idr_rtp_payload, parse_rtp_h264,
 };
 use super::sdp_h264::parse_sprop_parameter_sets;
 use super::signaling::ServerSignal;
-use crate::core::{
-    default_live_tracks, CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode,
-};
+use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track};
 use webrtc::api::API;
 
 pub struct PublishSession {
@@ -50,7 +49,7 @@ pub async fn start_publish(
         close_failed_publish_pc(&pc, &stream_id).await;
         return Err(e);
     }
-    manager.set_stream_tracks(&stream_id, default_live_tracks());
+    manager.set_stream_tracks(&stream_id, parse_offer_tracks(&offer_sdp));
     let _ = manager.set_unpublished(&stream_id);
     manager.ensure_stream_broadcast(&stream_id);
 
@@ -67,6 +66,7 @@ pub async fn start_publish(
 
     let manager_track = manager.clone();
     let sid = stream_id.clone();
+    let pc_for_track = pc.clone();
     pc.on_track(Box::new(move |track, _receiver, transceiver| {
         info!(
             "[WebRTC] on_track stream='{}' kind={:?} id={} mid={:?}",
@@ -77,9 +77,12 @@ pub async fn start_publish(
         );
         let manager_track = manager_track.clone();
         let sid = sid.clone();
+        let pc = pc_for_track.clone();
         let sid_for_task = sid.clone();
         Box::pin(async move {
-            if let Err(e) = read_track_to_stream(manager_track, sid_for_task.clone(), track).await {
+            if let Err(e) =
+                read_track_to_stream(manager_track, sid_for_task.clone(), pc, track).await
+            {
                 error!(
                     "[WebRTC] Publish track error stream='{}': {}",
                     sid_for_task, e
@@ -129,6 +132,67 @@ pub async fn start_publish(
     })
 }
 
+fn parse_offer_tracks(sdp: &str) -> Vec<Track> {
+    let mut tracks = Vec::new();
+    let mut pending_media: Option<(String, u8)> = None;
+
+    for line in sdp.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("m=") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 4 {
+                let media = parts[0].to_ascii_lowercase();
+                let pt = parts[3].parse::<u8>().unwrap_or(match media.as_str() {
+                    "audio" => 97,
+                    _ => 96,
+                });
+                pending_media = Some((media, pt));
+            }
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            let Some((media, fallback_pt)) = pending_media.take() else {
+                continue;
+            };
+            let mut parts = rest.split_whitespace();
+            let pt = parts
+                .next()
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(fallback_pt);
+            let codec_name = parts.next().unwrap_or("").to_ascii_lowercase();
+            let codec = if media == "video" && codec_name.contains("h264") {
+                CodecType::H264
+            } else if media == "audio" && codec_name.contains("opus") {
+                CodecType::Opus
+            } else if media == "audio" && codec_name.contains("mp4a") {
+                CodecType::AAC
+            } else if media == "audio" {
+                CodecType::AAC
+            } else {
+                CodecType::Unknown
+            };
+            let clock_rate = codec_name
+                .split('/')
+                .nth(1)
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(match codec {
+                    CodecType::AAC => 44_100,
+                    CodecType::Opus => 48_000,
+                    _ => 90_000,
+                });
+            if codec != CodecType::Unknown {
+                tracks.push(Track::new(tracks.len() as u8, codec, pt, clock_rate));
+            }
+        }
+    }
+
+    if tracks.is_empty() {
+        tracks.push(Track::new(0, CodecType::H264, 96, 90_000));
+    }
+    tracks
+}
+
 async fn cleanup_failed_publish_setup(
     pc: &Arc<RTCPeerConnection>,
     manager: &StreamManager,
@@ -151,6 +215,7 @@ async fn close_failed_publish_pc(pc: &Arc<RTCPeerConnection>, stream_id: &str) {
 async fn read_track_to_stream(
     manager: Arc<StreamManager>,
     stream_id: String,
+    pc: Arc<RTCPeerConnection>,
     track: Arc<TrackRemote>,
 ) -> Result<()> {
     let kind = track.kind();
@@ -170,6 +235,7 @@ async fn read_track_to_stream(
                 codec.capability.mime_type
             );
         }
+        register_publish_pli(&stream_id, pc, track.ssrc());
         read_h264_track(manager, stream_id, track).await
     } else if kind == RTPCodecType::Audio {
         read_audio_track(manager, stream_id, track).await
@@ -474,4 +540,36 @@ pub async fn add_ice_candidate(
     })
     .await
     .map_err(|e| anyhow!("add ICE candidate: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_offer_tracks_uses_video_only_when_offer_has_no_audio() {
+        let sdp = "v=0\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                   a=rtpmap:96 H264/90000\r\n";
+
+        let tracks = parse_offer_tracks(sdp);
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, CodecType::H264);
+    }
+
+    #[test]
+    fn parse_offer_tracks_keeps_audio_when_offer_has_audio() {
+        let sdp = "v=0\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+                   a=rtpmap:96 H264/90000\r\n\
+                   m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+                   a=rtpmap:111 opus/48000/2\r\n";
+
+        let tracks = parse_offer_tracks(sdp);
+
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].codec, CodecType::H264);
+        assert_eq!(tracks[1].codec, CodecType::Opus);
+    }
 }

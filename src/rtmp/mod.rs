@@ -9,6 +9,7 @@ use anyhow::Result;
 use bytes::{Buf, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -19,6 +20,7 @@ use crate::core::{
     default_live_tracks, CodecType, DispatchPolicy, MediaFrame, StreamManager, StreamProtocol,
     StreamSourceMode, StreamStatus,
 };
+use crate::webrtc::{annex_b_with_config, request_publisher_keyframe};
 use chunk::RtmpMessage;
 use session::{RtmpSession, SessionState};
 
@@ -63,6 +65,34 @@ fn video_codec_name(b: u8) -> &'static str {
         0x0C => "H265",
         _ => "Unknown",
     }
+}
+
+fn prepend_rtmp_video_config(
+    manager: &StreamManager,
+    stream_id: &str,
+    frame: &MediaFrame,
+) -> MediaFrame {
+    if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
+        return frame.clone();
+    }
+    let Some(stream) = manager.get_stream(&stream_id.to_string()) else {
+        return frame.clone();
+    };
+    let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) else {
+        return frame.clone();
+    };
+    MediaFrame::new(
+        frame.stream_id.clone(),
+        frame.track_id,
+        frame.timestamp,
+        bytes::Bytes::from(annex_b_with_config(sps, pps, &frame.data)),
+        frame.is_keyframe,
+        frame.codec,
+    )
+}
+
+fn stream_has_codec(stream: &crate::core::Stream, codec: CodecType) -> bool {
+    stream.tracks.iter().any(|track| track.codec == codec)
 }
 
 /// 将 AMF0 值格式化为可读字符串
@@ -868,9 +898,9 @@ impl RtmpServer {
 
                     // Start forwarding frames
                     let writer_clone = conn.writer.clone();
-                    let stream_id_clone = play_stream_id.clone();
                     let chunk_size_val = conn.session.chunk_size;
                     let server_stream_id = conn.session.server_stream_id;
+                    let play_started_at = Instant::now();
                     if let Some(handle) = conn.play_abort.take() {
                         handle.abort();
                     }
@@ -879,11 +909,12 @@ impl RtmpServer {
                         .dispatch_subscribe(&play_stream_id, DispatchPolicy::LiveCoalesce)
                     {
                         info!(
-                            "[RTMP] [{}] Subscribed to stream '{}'",
-                            peer_addr, play_stream_id
+                            "[RTMP] [{}] PLAY subscribe stream='{}' latest_seq={} latest_idr={:?}",
+                            peer_addr,
+                            play_stream_id,
+                            reader.hub().latest_seq(),
+                            reader.hub().latest_idr_seq()
                         );
-
-                        reader.snap_to_live_edge();
 
                         // Send Stream Begin
                         let mut w = conn.writer.lock().await;
@@ -917,36 +948,73 @@ impl RtmpServer {
                             w.write_all(&header_msg).await?;
                             info!("[RTMP] [{}] Sent AVC sequence header", peer_addr);
                         }
-                        // Send AAC sequence header
-                        let aac_header = session::build_aac_sequence_header();
-                        let aac_msg = chunk::encode_message(
-                            0x08,
-                            0,
-                            conn.session.server_stream_id,
-                            &aac_header,
-                            conn.session.chunk_size,
-                            chunk::CSID_AUDIO,
-                        );
-                        w.write_all(&aac_msg).await?;
+                        let has_aac = stream_has_codec(&stream, CodecType::AAC);
+                        if has_aac {
+                            let aac_header = session::build_aac_sequence_header();
+                            let aac_msg = chunk::encode_message(
+                                0x08,
+                                0,
+                                conn.session.server_stream_id,
+                                &aac_header,
+                                conn.session.chunk_size,
+                                chunk::CSID_AUDIO,
+                            );
+                            w.write_all(&aac_msg).await?;
+                            info!("[RTMP] [{}] Sent AAC sequence header", peer_addr);
+                        }
 
                         info!(
-                            "[RTMP] [{}] >>> SENT play response (onStatus+AVCHeader+AACHeader)",
-                            peer_addr
+                            "[RTMP] [{}] >>> SENT play response (onStatus+AVCHeader, aac={})",
+                            peer_addr, has_aac
                         );
                         drop(w);
 
                         let peer_log = peer_addr.to_string();
-                        let manager_clone = conn.stream_manager.clone();
-                        let handle = tokio::spawn(async move {
-                            let mut pending = crate::rtsp::play_egress::prime_rtsp_play(
-                                &mut reader,
-                                &manager_clone,
-                                &stream_id_clone,
-                            )
+                        let stream_id_for_play = play_stream_id.clone();
+                        let manager_for_play = Arc::clone(&conn.stream_manager);
+                        let mut pending = reader
+                            .prime_from_idr(&conn.stream_manager, &play_stream_id)
                             .await;
+                        if pending.is_some() {
+                            let live_lag =
+                                reader.hub().latest_seq().saturating_sub(reader.cursor());
+                            info!(
+                                "[RTMP] [{}] PLAY prime got IDR after={}ms cursor={} live_lag={}",
+                                peer_addr,
+                                play_started_at.elapsed().as_millis(),
+                                reader.cursor(),
+                                live_lag
+                            );
+                            if live_lag > 2 {
+                                info!(
+                                    "[RTMP] [{}] primed IDR is stale by {} frames; wait for fresh live IDR",
+                                    peer_addr, live_lag
+                                );
+                                pending = None;
+                                reader.snap_to_live_edge();
+                                let requested = request_publisher_keyframe(&play_stream_id);
+                                info!(
+                                    "[RTMP] [{}] requested fresh keyframe after stale prime: {}",
+                                    peer_addr, requested
+                                );
+                            } else {
+                                reader.snap_to_live_edge();
+                            }
+                        } else {
+                            reader.snap_to_live_edge();
+                            let requested = request_publisher_keyframe(&play_stream_id);
+                            info!(
+                                "[RTMP] [{}] PLAY prime no IDR after={}ms; snapped live and requested_keyframe={}",
+                                peer_addr,
+                                play_started_at.elapsed().as_millis(),
+                                requested
+                            );
+                        }
+                        let handle = tokio::spawn(async move {
                             let mut video_streaming = false;
                             let mut frames_sent = 0u64;
                             let mut clock = session::RtmpPlayClock::default();
+                            let mut last_keyframe_request = Instant::now();
                             loop {
                                 let frames = if let Some(frame) = pending.take() {
                                     vec![frame]
@@ -971,6 +1039,17 @@ impl RtmpServer {
                                                 &frame.data,
                                             );
                                         if !is_idr {
+                                            if last_keyframe_request.elapsed()
+                                                >= Duration::from_millis(500)
+                                            {
+                                                let requested =
+                                                    request_publisher_keyframe(&stream_id_for_play);
+                                                info!(
+                                                    "[RTMP] [{}] waiting for first IDR; dropped non-IDR ts={} requested_keyframe={}",
+                                                    peer_log, frame.timestamp, requested
+                                                );
+                                                last_keyframe_request = Instant::now();
+                                            }
                                             continue;
                                         }
                                         video_streaming = true;
@@ -980,13 +1059,24 @@ impl RtmpServer {
                                     }
                                     if frames_sent == 0 {
                                         info!(
-                                            "[RTMP] >>> SEND first frame: codec={:?} keyframe={} raw_ts={} size={}",
-                                            frame.codec, frame.is_keyframe, frame.timestamp, frame.data.len()
+                                            "[RTMP] [{}] >>> SEND first frame after={}ms: codec={:?} keyframe={} raw_ts={} size={}",
+                                            peer_log,
+                                            play_started_at.elapsed().as_millis(),
+                                            frame.codec,
+                                            frame.is_keyframe,
+                                            frame.timestamp,
+                                            frame.data.len()
                                         );
                                     }
                                     let data = match frame.codec {
                                         CodecType::H264 | CodecType::H265 => {
-                                            session::frame_to_rtmp_video(&frame)
+                                            session::frame_to_rtmp_video(
+                                                &prepend_rtmp_video_config(
+                                                    &manager_for_play,
+                                                    &stream_id_for_play,
+                                                    &frame,
+                                                ),
+                                            )
                                         }
                                         CodecType::AAC => session::frame_to_rtmp_audio(&frame),
                                         _ => continue,
@@ -1286,5 +1376,30 @@ impl RtmpServer {
             }
             _ => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn annex_b_idr() -> Bytes {
+        Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x88, 0x84])
+    }
+
+    #[test]
+    fn prepend_rtmp_video_config_adds_sps_pps_to_keyframe() {
+        let manager = StreamManager::new();
+        manager.create_stream("s", StreamSourceMode::Push, StreamProtocol::WebRTC, None);
+        manager.set_stream_sps_pps("s", vec![0x67, 0x42, 0x00, 0x1f], vec![0x68, 0xce]);
+        let frame = MediaFrame::new("s".into(), 0, 90_000, annex_b_idr(), true, CodecType::H264);
+
+        let prepared = prepend_rtmp_video_config(&manager, "s", &frame);
+
+        assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x67]));
+        assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x68]));
+        assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x65]));
+        assert_eq!(prepared.timestamp, frame.timestamp);
+        assert!(prepared.is_keyframe);
     }
 }

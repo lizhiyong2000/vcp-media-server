@@ -116,7 +116,12 @@
         log(label + ': 无推流连接');
         return false;
       }
-      if (keyframeMethod === 'none') return false;
+      const serverTriggered = label.includes('need-keyframe') || label.includes('need_keyframe');
+      if (keyframeMethod === 'none' && !serverTriggered) return false;
+      if (keyframeMethod === 'none' && serverTriggered) {
+        log(label + ': 重新尝试关键帧请求方式');
+        keyframeMethod = null;
+      }
       if (publishPc.connectionState !== 'connected') {
         return false;
       }
@@ -145,7 +150,6 @@
         return true;
       };
 
-      const serverTriggered = label.includes('need-keyframe') || label.includes('need_keyframe');
       const allMethods = [
         ['generateKeyFrame', tryGenerateKeyFrame],
         ['setParameters', () => trySetParametersKeyFrame(sender)],
@@ -237,6 +241,11 @@
         || negotiatingPc === publishPc;
     }
 
+    function isPlayFailure(message) {
+      return /play rejected|play failed|not publishing|Stream .*not found|播放/i.test(message || '')
+        || negotiatingPc === playPc;
+    }
+
     function clearRemoteVideo() {
       const video = $('remoteVideo');
       const stream = video.srcObject;
@@ -268,6 +277,22 @@
       $('btnPlay').disabled = !(ws && ws.readyState === WebSocket.OPEN);
       $('btnStopPlay').disabled = true;
       if (reason) log(reason);
+    }
+
+    function resetDisconnectedState(reason) {
+      const hadPublish = !!publishPc || !!localStream;
+      const hadPlay = !!playPc;
+      resetPublishState(hadPublish ? reason + '，推流状态已清理' : null, false);
+      resetPlayState(hadPlay ? reason + '，播放状态已清理' : null, false);
+      pendingServerIce.length = 0;
+      negotiatingPc = null;
+      activePc = null;
+      $('btnConnect').disabled = false;
+      $('btnDisconnect').disabled = true;
+      $('btnPublish').disabled = true;
+      $('btnStopPublish').disabled = true;
+      $('btnPlay').disabled = true;
+      $('btnStopPlay').disabled = true;
     }
 
     function wsSend(obj) {
@@ -346,23 +371,28 @@
 
     $('btnConnect').onclick = () => {
       const url = $('wsUrl').value.trim();
-      ws = new WebSocket(url);
-      ws.onopen = () => {
+      const socket = new WebSocket(url);
+      ws = socket;
+      socket.onopen = () => {
+        if (ws !== socket) return;
         log('信令已连接: ' + url);
         $('btnConnect').disabled = true;
         $('btnDisconnect').disabled = false;
         $('btnPublish').disabled = false;
         $('btnPlay').disabled = false;
       };
-      ws.onclose = () => {
+      socket.onclose = () => {
+        if (ws !== socket) return;
+        ws = null;
         log('信令已断开');
-        $('btnConnect').disabled = false;
-        $('btnDisconnect').disabled = true;
-        $('btnPublish').disabled = true;
-        $('btnPlay').disabled = true;
+        resetDisconnectedState('信令连接已断开');
       };
-      ws.onerror = () => log('WebSocket 错误');
-      ws.onmessage = async (ev) => {
+      socket.onerror = () => {
+        if (ws !== socket) return;
+        log('WebSocket 错误');
+      };
+      socket.onmessage = async (ev) => {
+        if (ws !== socket) return;
         let msg;
         try { msg = JSON.parse(ev.data); } catch { log('无效 JSON: ' + ev.data); return; }
         if (msg.type === 'answer') {
@@ -388,14 +418,19 @@
           log('服务器错误: ' + msg.message);
           if (isPublishFailure(msg.message)) {
             resetPublishState('推流失败: ' + msg.message);
+          } else if (isPlayFailure(msg.message)) {
+            resetPlayState('播放失败: ' + msg.message);
           }
         }
       };
     };
 
     $('btnDisconnect').onclick = () => {
-      if (ws) ws.close();
-      ws = null;
+      if (ws) {
+        ws.close();
+      } else {
+        resetDisconnectedState('信令连接已断开');
+      }
     };
 
     $('btnPublish').onclick = async () => {
