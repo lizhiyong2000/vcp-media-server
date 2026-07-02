@@ -1,13 +1,6 @@
-mod analysis;
 mod core;
-mod hls;
-mod http;
-mod http_flv;
-mod record;
-mod rtmp;
-mod rtsp;
-mod snapshot;
-mod webrtc;
+mod process;
+mod server;
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -21,10 +14,12 @@ use tracing_subscriber::{
     prelude::*,
 };
 
-use crate::core::{Config, StreamManager, StreamProtocol, StreamSourceMode};
-use crate::hls::HlsConfig as HlsModuleConfig;
-use crate::record::{RecordFormat, RecorderManager};
-use crate::snapshot::SnapshotManager;
+use crate::core::{Config, StreamManager};
+use crate::process::analysis;
+use crate::process::record::{self, RecordFormat, RecorderManager};
+use crate::process::snapshot::{self, SnapshotManager};
+use crate::server::hls::{self, HlsConfig as HlsModuleConfig};
+use crate::server::{http, http_flv, rtmp, rtsp, webrtc};
 static LOG_GUARD: Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> = Mutex::new(None);
 
 fn server_task_result(
@@ -72,6 +67,13 @@ fn init_logging(config: &Config) -> Result<()> {
         for (module, level) in modules {
             let target = if module.contains("::") {
                 module.clone()
+            } else if matches!(module.as_str(), "analysis" | "record" | "snapshot") {
+                format!("vcp_media_server::process::{}", module)
+            } else if matches!(
+                module.as_str(),
+                "hls" | "http" | "http_flv" | "rtmp" | "rtsp" | "webrtc"
+            ) {
+                format!("vcp_media_server::server::{}", module)
             } else {
                 format!("vcp_media_server::{}", module)
             };
@@ -138,6 +140,9 @@ fn init_logging(config: &Config) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = read_config()?;
+    config
+        .ensure_storage_dirs()
+        .context("Failed to create storage directories")?;
 
     init_logging(&config)?;
 
@@ -145,56 +150,21 @@ async fn main() -> Result<()> {
 
     let stream_manager = Arc::new(StreamManager::new());
 
-    for stream_config in &config.streams {
-        let source = stream_config
-            .source
-            .as_ref()
-            .map_or(StreamSourceMode::Push, |s| {
-                match s.to_uppercase().as_str() {
-                    "PULL" => StreamSourceMode::Pull,
-                    "PUSH" => StreamSourceMode::Push,
-                    _ => StreamSourceMode::Push,
-                }
-            });
-
-        let protocol = stream_config
-            .protocol
-            .as_ref()
-            .map_or(StreamProtocol::Unknown, |p| {
-                match p.to_uppercase().as_str() {
-                    "RTSP" => StreamProtocol::RTSP,
-                    "RTMP" => StreamProtocol::RTMP,
-                    "WEBRTC" => StreamProtocol::WebRTC,
-                    "HTTP" => StreamProtocol::HTTP,
-                    _ => StreamProtocol::Unknown,
-                }
-            });
-
-        let source_clone = source.clone();
-        let protocol_clone = protocol.clone();
-        stream_manager.create_stream(
-            &stream_config.id,
-            source,
-            protocol,
-            stream_config.pull_url.clone(),
-        );
-        info!(
-            "Created stream: {} (source: {:?}, protocol: {:?})",
-            stream_config.id, source_clone, protocol_clone
-        );
-    }
-
     // Initialize HLS server
     let hls_config = config
+        .server
         .hls
         .as_ref()
         .map(|h| HlsModuleConfig {
             enabled: h.enabled,
             segment_duration: h.segment_duration.unwrap_or(1.0),
             max_segments: h.max_segments.unwrap_or(1),
-            output_dir: h.output_dir.clone().unwrap_or("./hls".to_string()),
+            output_dir: config.hls_output_dir(),
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| HlsModuleConfig {
+            output_dir: config.hls_output_dir(),
+            ..Default::default()
+        });
 
     let hls_server = Arc::new(hls::HlsServer::new(
         stream_manager.clone(),
@@ -211,12 +181,12 @@ async fn main() -> Result<()> {
 
     let rtsp_server = rtsp::RtspServer::new(
         stream_manager.clone(),
-        config.rtsp.port,
+        config.server.rtsp.port,
         hls_server_publish.clone(),
     );
     let webrtc_server = webrtc::WebrtcServer::new(
         stream_manager.clone(),
-        config.webrtc.port,
+        config.server.webrtc.port,
         hls_server_publish.clone(),
     );
 
@@ -228,7 +198,12 @@ async fn main() -> Result<()> {
     let hls_server_rtmp = hls_server_publish.clone();
 
     // Initialize HTTP-FLV server
-    let http_flv_enabled = config.http_flv.as_ref().map(|c| c.enabled).unwrap_or(true);
+    let http_flv_enabled = config
+        .server
+        .http_flv
+        .as_ref()
+        .map(|c| c.enabled)
+        .unwrap_or(true);
     let http_flv_server = Arc::new(http_flv::HttpFlvServer::new(stream_manager.clone()));
     let http_flv_server_http = if http_flv_enabled {
         Some(http_flv_server.clone())
@@ -241,11 +216,7 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|c| record::RecordConfig {
             enabled: c.enabled,
-            base_dir: c
-                .base_dir
-                .clone()
-                .map(Into::into)
-                .unwrap_or_else(|| "./recordings".into()),
+            base_dir: config.record_output_dir(),
             default_format: c
                 .default_format
                 .as_deref()
@@ -256,7 +227,10 @@ async fn main() -> Result<()> {
             ),
             align_keyframe: c.align_keyframe.unwrap_or(true),
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| record::RecordConfig {
+            base_dir: config.record_output_dir(),
+            ..Default::default()
+        });
     let recorder_manager = Arc::new(RecorderManager::new(
         stream_manager.clone(),
         record_config.clone(),
@@ -274,6 +248,19 @@ async fn main() -> Result<()> {
             enabled: c.enabled,
             default_sample_interval: c.default_sample_interval.unwrap_or(1).max(1),
             max_events_per_stream: c.max_events_per_stream.unwrap_or(256).max(1),
+            ffmpeg_path: c
+                .ffmpeg_path
+                .clone()
+                .unwrap_or_else(|| "ffmpeg".to_string()),
+            face_detection_dir: std::path::PathBuf::from(
+                c.face_detection_dir
+                    .clone()
+                    .unwrap_or_else(|| "./analysis".to_string()),
+            ),
+            face_detection_interval: std::time::Duration::from_millis(
+                c.face_detection_interval_ms.unwrap_or(1_000).max(1),
+            ),
+            face_detector_command: c.face_detector_command.clone(),
         })
         .unwrap_or_default();
     let analysis_manager = Arc::new(analysis::AnalysisManager::new(
@@ -291,11 +278,7 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|c| snapshot::SnapshotConfig {
             enabled: c.enabled,
-            base_dir: c
-                .base_dir
-                .clone()
-                .map(Into::into)
-                .unwrap_or_else(|| "./snapshots".into()),
+            base_dir: config.snapshot_output_dir(),
             ffmpeg_path: c
                 .ffmpeg_path
                 .clone()
@@ -304,7 +287,10 @@ async fn main() -> Result<()> {
                 c.wait_keyframe_ms.unwrap_or(1_000).max(1),
             ),
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| snapshot::SnapshotConfig {
+            base_dir: config.snapshot_output_dir(),
+            ..Default::default()
+        });
     let snapshot_manager = Arc::new(SnapshotManager::new(
         stream_manager.clone(),
         snapshot_config.clone(),
@@ -317,7 +303,7 @@ async fn main() -> Result<()> {
 
     let http_server = http::HttpServer::new(
         stream_manager.clone(),
-        config.http.port,
+        config.server.http.port,
         hls_server_http,
         http_flv_server_http,
         recorder_http,
@@ -325,8 +311,11 @@ async fn main() -> Result<()> {
         snapshot_http,
     );
 
-    let rtmp_server =
-        rtmp::RtmpServer::new(stream_manager.clone(), config.rtmp.port, hls_server_rtmp);
+    let rtmp_server = rtmp::RtmpServer::new(
+        stream_manager.clone(),
+        config.server.rtmp.port,
+        hls_server_rtmp,
+    );
 
     let rtmp_handle = tokio::spawn(async move { rtmp_server.start().await });
 
@@ -337,36 +326,39 @@ async fn main() -> Result<()> {
     let http_handle = tokio::spawn(async move { http_server.start().await });
 
     info!("Media Server started successfully!");
-    info!("  RTSP:  rtsp://localhost:{}", config.rtsp.port);
-    info!("  RTMP:  rtmp://localhost:{}", config.rtmp.port);
-    info!("  HTTP:  http://localhost:{}", config.http.port);
+    info!("  RTSP:  rtsp://localhost:{}", config.server.rtsp.port);
+    info!("  RTMP:  rtmp://localhost:{}", config.server.rtmp.port);
+    info!("  HTTP:  http://localhost:{}", config.server.http.port);
     info!(
-        "  HLS:   http://localhost:{}/hls/<stream_id>/live.m3u8",
-        config.http.port
+        "  HLS:   http://localhost:{}/hls/<stream_id>/live.m3u8 (dir: {})",
+        config.server.http.port,
+        hls_config.output_dir
     );
     if record_config.enabled {
         info!(
-            "  Record API:   http://localhost:{}/api/record/start",
-            config.http.port
+            "  Record API:   http://localhost:{}/api/record/start (dir: {})",
+            config.server.http.port,
+            record_config.base_dir.display()
         );
     }
     if analysis_config.enabled {
         info!(
             "  Analysis API: http://localhost:{}/api/analysis/start",
-            config.http.port
+            config.server.http.port
         );
     }
     if snapshot_config.enabled {
         info!(
-            "  Snapshot API: http://localhost:{}/api/snapshot",
-            config.http.port
+            "  Snapshot API: http://localhost:{}/api/snapshot (dir: {})",
+            config.server.http.port,
+            snapshot_config.base_dir.display()
         );
     }
     info!(
         "  FLV:   http://localhost:{}/flv/<stream_id>",
-        config.http.port
+        config.server.http.port
     );
-    info!("  WebRTC: ws://localhost:{}", config.webrtc.port);
+    info!("  WebRTC: ws://localhost:{}", config.server.webrtc.port);
 
     let result = tokio::select! {
         res = rtmp_handle => server_task_result("RTMP", res),

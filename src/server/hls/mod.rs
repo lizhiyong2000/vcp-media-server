@@ -16,8 +16,8 @@ use tracing::{debug, error, info, warn};
 use self::m3u8::M3u8Generator;
 use self::ts_muxer::TsMuxer;
 use crate::core::dispatch::DispatchError;
-use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager, MILLISECOND_CLOCK_RATE};
-use crate::webrtc::{
+use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager, DEFAULT_HLS_DIR, MILLISECOND_CLOCK_RATE};
+use crate::server::webrtc::{
     annex_b_with_config, h264_util::is_keyframe_annex_b, request_publisher_keyframe,
 };
 
@@ -52,7 +52,7 @@ impl Default for HlsConfig {
             enabled: true,
             segment_duration: 1.0,
             max_segments: 1,
-            output_dir: "./hls".to_string(),
+            output_dir: DEFAULT_HLS_DIR.to_string(),
         }
     }
 }

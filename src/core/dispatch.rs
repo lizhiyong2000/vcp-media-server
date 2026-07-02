@@ -9,7 +9,7 @@ use super::frame_ring::{is_playable_video, is_video_keyframe, SnapMode};
 use super::stream_hub::StreamHub;
 use super::timestamp::media_frame_timestamp_delta_ms;
 use super::{CodecType, MediaFrame, StreamManager};
-use crate::webrtc::{h264_util::is_keyframe_annex_b, request_publisher_keyframe};
+use crate::server::webrtc::{h264_util::is_keyframe_annex_b, request_publisher_keyframe};
 
 /// Max frames per batch for sequential muxers (HLS); keeps pace with live ingest.
 const MAX_SEQUENTIAL_BATCH: u64 = 96;

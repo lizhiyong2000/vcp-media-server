@@ -13,7 +13,7 @@ use crate::core::{
     CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track,
     AAC_DEFAULT_CLOCK_RATE,
 };
-use crate::webrtc::H264RtpIngest;
+use crate::server::webrtc::H264RtpIngest;
 
 pub struct RtspPuller {
     stream_manager: Arc<StreamManager>,
@@ -99,7 +99,7 @@ impl RtspPuller {
         self.stream_manager.ensure_stream_broadcast(local_stream_id);
 
         // Prime SPS/PPS from remote SDP when available (helps WebRTC play before first IDR).
-        use crate::webrtc::parse_sprop_parameter_sets;
+        use crate::server::webrtc::parse_sprop_parameter_sets;
         let (sdp_sps, sdp_pps) = parse_sprop_parameter_sets(sdp);
         if let (Some(sps), Some(pps)) = (sdp_sps, sdp_pps) {
             info!(
@@ -233,7 +233,7 @@ impl RtspPuller {
                     } else {
                         CodecType::AAC
                     };
-                    let media = crate::webrtc::rtp_h264_media_payload(&rtp_payload)
+                    let media = crate::server::webrtc::rtp_h264_media_payload(&rtp_payload)
                         .map(|(p, _, _)| p)
                         .unwrap_or(&rtp_payload[12..]);
                     let aac_data = if codec == CodecType::AAC {
@@ -341,9 +341,10 @@ impl RtspPuller {
                                     track_id as u8,
                                     payload_type,
                                 );
-                                let media = crate::webrtc::rtp_h264_media_payload(&buffer[..len])
-                                    .map(|(p, _, _)| p)
-                                    .unwrap_or(&buffer[12..len]);
+                                let media =
+                                    crate::server::webrtc::rtp_h264_media_payload(&buffer[..len])
+                                        .map(|(p, _, _)| p)
+                                        .unwrap_or(&buffer[12..len]);
                                 let aac_data = match super::common::strip_mpeg4_generic_aac(media) {
                                     Some(raw) if !raw.is_empty() => raw,
                                     _ => continue,

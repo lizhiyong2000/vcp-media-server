@@ -20,7 +20,7 @@ use crate::core::{
     MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, StreamStatus,
     MILLISECOND_CLOCK_RATE,
 };
-use crate::webrtc::{annex_b_with_config, request_publisher_keyframe};
+use crate::server::webrtc::{annex_b_with_config, request_publisher_keyframe};
 use chunk::RtmpMessage;
 use session::{RtmpSession, SessionState};
 
@@ -116,7 +116,7 @@ fn fmt_amf0(val: &amf0::Amf0Value) -> String {
 
 struct RtmpConnection {
     stream_manager: Arc<StreamManager>,
-    hls_server: Option<Arc<crate::hls::HlsServer>>,
+    hls_server: Option<Arc<crate::server::hls::HlsServer>>,
     session: RtmpSession,
     writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     chunk_size: usize,
@@ -132,7 +132,7 @@ struct RtmpConnection {
 impl RtmpConnection {
     fn new(
         stream_manager: Arc<StreamManager>,
-        hls_server: Option<Arc<crate::hls::HlsServer>>,
+        hls_server: Option<Arc<crate::server::hls::HlsServer>>,
         writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
         peer_addr: &str,
     ) -> Self {
@@ -156,14 +156,14 @@ impl RtmpConnection {
 pub struct RtmpServer {
     stream_manager: Arc<StreamManager>,
     port: u16,
-    hls_server: Option<Arc<crate::hls::HlsServer>>,
+    hls_server: Option<Arc<crate::server::hls::HlsServer>>,
 }
 
 impl RtmpServer {
     pub fn new(
         stream_manager: Arc<StreamManager>,
         port: u16,
-        hls_server: Option<Arc<crate::hls::HlsServer>>,
+        hls_server: Option<Arc<crate::server::hls::HlsServer>>,
     ) -> Self {
         Self {
             stream_manager,
@@ -217,7 +217,7 @@ impl RtmpServer {
     async fn handle_connection(
         socket: TcpStream,
         manager: Arc<StreamManager>,
-        hls_server: Option<Arc<crate::hls::HlsServer>>,
+        hls_server: Option<Arc<crate::server::hls::HlsServer>>,
         peer_addr: std::net::SocketAddr,
     ) -> Result<()> {
         let (mut reader, writer) = socket.into_split();

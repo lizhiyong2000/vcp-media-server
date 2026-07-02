@@ -17,13 +17,13 @@ use super::play_egress::{
 use super::{RtspRequest, RtspResponse, RtspServer, RtspSession, TransportMode};
 use crate::core::dispatch::DispatchError;
 use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager, AAC_DEFAULT_CLOCK_RATE};
-use crate::webrtc::H264RtpIngest;
+use crate::server::webrtc::H264RtpIngest;
 
 pub struct RtspServerSession {
     reader: tokio::net::tcp::OwnedReadHalf,
     session: RtspSession,
     manager: Arc<StreamManager>,
-    hls_server: Option<Arc<crate::hls::HlsServer>>,
+    hls_server: Option<Arc<crate::server::hls::HlsServer>>,
     peer_addr: SocketAddr,
     rtp_ssrc: u32,
     write_tx: Sender<Vec<u8>>,
@@ -51,7 +51,7 @@ impl RtspServerSession {
     pub fn new(
         socket: TcpStream,
         manager: Arc<StreamManager>,
-        hls_server: Option<Arc<crate::hls::HlsServer>>,
+        hls_server: Option<Arc<crate::server::hls::HlsServer>>,
     ) -> Self {
         let peer_addr = socket
             .peer_addr()
@@ -188,9 +188,10 @@ impl RtspServerSession {
                             } else {
                                 CodecType::AAC
                             };
-                            let media = crate::webrtc::rtp_h264_media_payload(&buffer[..len])
-                                .map(|(p, _, _)| p)
-                                .unwrap_or(&buffer[12..len]);
+                            let media =
+                                crate::server::webrtc::rtp_h264_media_payload(&buffer[..len])
+                                    .map(|(p, _, _)| p)
+                                    .unwrap_or(&buffer[12..len]);
                             let aac_data = match super::common::strip_mpeg4_generic_aac(media) {
                                 Some(raw) if !raw.is_empty() => raw,
                                 _ => continue,
@@ -792,7 +793,7 @@ impl RtspServerSession {
             } else {
                 CodecType::AAC
             };
-            let media_payload = crate::webrtc::rtp_h264_media_payload(rtp_payload)
+            let media_payload = crate::server::webrtc::rtp_h264_media_payload(rtp_payload)
                 .map(|(p, _, _)| p)
                 .unwrap_or(&rtp_payload[12..]);
 

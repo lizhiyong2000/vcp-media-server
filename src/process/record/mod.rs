@@ -14,9 +14,9 @@ use tracing::{error, info};
 use crate::core::live_play::prepend_h264_config;
 use crate::core::{
     CodecType, DispatchError, DispatchPolicy, FlvPlayTimeline, MediaFrame, StreamManager,
-    MILLISECOND_CLOCK_RATE,
+    DEFAULT_RECORD_DIR, MILLISECOND_CLOCK_RATE,
 };
-use crate::hls::ts_muxer::TsMuxer;
+use crate::server::hls::ts_muxer::TsMuxer;
 
 const DEFAULT_SEGMENT_DURATION_SEC: u64 = 300;
 const ACTIVE_INDEX_FLUSH_INTERVAL_MS: u64 = 5_000;
@@ -34,7 +34,7 @@ impl Default for RecordConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            base_dir: PathBuf::from("./recordings"),
+            base_dir: PathBuf::from(DEFAULT_RECORD_DIR),
             default_format: RecordFormat::Ts,
             segment_duration: Duration::from_secs(DEFAULT_SEGMENT_DURATION_SEC),
             align_keyframe: true,

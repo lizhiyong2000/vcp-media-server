@@ -6,18 +6,18 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{error, info, warn};
 
-use crate::analysis::{AnalysisManager, StartAnalysisRequest, StopAnalysisRequest};
 use crate::core::{
     is_idr_frame, prime_live_play, CodecType, DispatchError, DispatchPolicy, StreamManager,
     StreamProtocol, StreamSourceMode, Track, WallclockMsTimeline,
 };
-use crate::hls::HlsServer;
-use crate::http_flv::{format_chunk, HttpFlvServer, HttpFlvSession};
-use crate::record::{RecorderManager, StartRecordRequest, StopRecordRequest};
-use crate::rtmp::RtmpPuller;
-use crate::rtsp::{RtspPuller, RtspPusher};
-use crate::snapshot::{CaptureSnapshotRequest, SnapshotManager};
-use crate::webrtc::request_publisher_keyframe;
+use crate::process::analysis::{AnalysisManager, StartAnalysisRequest, StopAnalysisRequest};
+use crate::process::record::{RecorderManager, StartRecordRequest, StopRecordRequest};
+use crate::process::snapshot::{CaptureSnapshotRequest, SnapshotManager};
+use crate::server::hls::HlsServer;
+use crate::server::http_flv::{format_chunk, HttpFlvServer, HttpFlvSession};
+use crate::server::rtmp::RtmpPuller;
+use crate::server::rtsp::{RtspPuller, RtspPusher};
+use crate::server::webrtc::request_publisher_keyframe;
 
 pub struct HttpServer {
     stream_manager: Arc<StreamManager>,
@@ -211,7 +211,7 @@ impl HttpServer {
 
             // WebRTC test page
             if path == "/webrtc/webrtc-test.html" || path == "/webrtc/" {
-                const WEBRTC_TEST_HTML: &str = include_str!("../../webrtc/webrtc-test.html");
+                const WEBRTC_TEST_HTML: &str = include_str!("../../../webrtc/webrtc-test.html");
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
                     WEBRTC_TEST_HTML.len(),

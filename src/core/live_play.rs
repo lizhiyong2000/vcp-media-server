@@ -6,10 +6,10 @@ use tracing::info;
 
 use super::dispatch::{last_playable_idr_seq, DispatchError, DispatchReader};
 use super::{CodecType, MediaFrame, StreamManager};
-use crate::webrtc::h264_util::{
+use crate::server::webrtc::h264_util::{
     contains_idr_nalu, contains_sps_or_pps_nalu, ensure_annex_b, is_parameter_set_only,
 };
-use crate::webrtc::{annex_b_with_config, request_publisher_keyframe};
+use crate::server::webrtc::{annex_b_with_config, request_publisher_keyframe};
 
 const LIVE_IDR_WAIT: Duration = Duration::from_millis(800);
 

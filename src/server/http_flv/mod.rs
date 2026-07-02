@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 use crate::core::{
     CodecType, DispatchPolicy, DispatchReader, FlvPlayTimeline, MediaFrame, Stream, StreamManager,
 };
-use crate::rtmp::session::{frame_to_rtmp_audio, frame_to_rtmp_video};
+use crate::server::rtmp::session::{frame_to_rtmp_audio, frame_to_rtmp_video};
 
 /// FLV file header (9 bytes)
 fn generate_flv_header(has_video: bool, has_audio: bool) -> Vec<u8> {

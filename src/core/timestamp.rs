@@ -369,7 +369,7 @@ mod tests {
         let mut mux_ms = 0u64;
         for i in 0..25u64 {
             let ts = base + i * 3600;
-            let (new_raw, new_mux) = crate::hls::timing::advance_video_mux_ms(
+            let (new_raw, new_mux) = crate::server::hls::timing::advance_video_mux_ms(
                 last_raw,
                 mux_ms,
                 ts,

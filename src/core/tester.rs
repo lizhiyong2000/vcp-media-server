@@ -391,12 +391,11 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = crate::core::Config::default();
-        assert_eq!(config.rtmp.port, 1935);
-        assert_eq!(config.rtsp.port, 554);
-        assert_eq!(config.webrtc.port, 9080);
-        assert_eq!(config.http.port, 8081);
-        assert_eq!(config.streams.len(), 1);
-        assert_eq!(config.streams[0].id, "live");
+        assert_eq!(config.server.rtmp.port, 1935);
+        assert_eq!(config.server.rtsp.port, 554);
+        assert_eq!(config.server.webrtc.port, 9080);
+        assert_eq!(config.server.http.port, 8081);
+        assert!(config.server.hls.as_ref().unwrap().enabled);
     }
 
     #[test]

@@ -11,8 +11,8 @@ use tokio::time::{sleep, Instant};
 use tracing::{error, info, warn};
 
 use crate::core::live_play::{is_idr_frame, is_playable_video_frame, prepend_h264_config};
-use crate::core::{CodecType, MediaFrame, StreamManager};
-use crate::webrtc::request_publisher_keyframe;
+use crate::core::{CodecType, MediaFrame, StreamManager, DEFAULT_SNAPSHOT_DIR};
+use crate::server::webrtc::request_publisher_keyframe;
 
 const DEFAULT_WAIT_KEYFRAME_MS: u64 = 1_000;
 
@@ -28,7 +28,7 @@ impl Default for SnapshotConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            base_dir: PathBuf::from("./snapshots"),
+            base_dir: PathBuf::from(DEFAULT_SNAPSHOT_DIR),
             ffmpeg_path: "ffmpeg".to_string(),
             wait_keyframe: Duration::from_millis(DEFAULT_WAIT_KEYFRAME_MS),
         }

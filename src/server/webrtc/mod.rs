@@ -26,7 +26,7 @@ use tracing::{debug, error, info, warn};
 use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::core::StreamManager;
-use crate::hls::HlsServer;
+use crate::server::hls::HlsServer;
 use peer::create_api;
 use play_relay::stop_play_relays_for_stream;
 use player::{cancel_play_relay, signal_play_relay_stop, start_play};

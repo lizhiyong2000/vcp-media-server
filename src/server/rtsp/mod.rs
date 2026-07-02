@@ -34,14 +34,14 @@ pub use session::{RtspSession, TransportMode};
 pub struct RtspServer {
     stream_manager: Arc<StreamManager>,
     port: u16,
-    hls_server: Option<Arc<crate::hls::HlsServer>>,
+    hls_server: Option<Arc<crate::server::hls::HlsServer>>,
 }
 
 impl RtspServer {
     pub fn new(
         stream_manager: Arc<StreamManager>,
         port: u16,
-        hls_server: Option<Arc<crate::hls::HlsServer>>,
+        hls_server: Option<Arc<crate::server::hls::HlsServer>>,
     ) -> Self {
         Self {
             stream_manager,
@@ -80,7 +80,7 @@ impl RtspServer {
         manager: &StreamManager,
         session: &mut RtspSession,
         peer_addr: std::net::SocketAddr,
-        hls_server: Option<Arc<crate::hls::HlsServer>>,
+        hls_server: Option<Arc<crate::server::hls::HlsServer>>,
         setup_server_ports: Option<(u16, u16)>,
     ) -> Result<String> {
         let lines: Vec<&str> = request.lines().collect();
