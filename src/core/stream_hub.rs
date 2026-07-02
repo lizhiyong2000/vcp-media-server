@@ -31,8 +31,10 @@ impl StreamHub {
             source: StreamSourceMode::Push,
             protocol: StreamProtocol::Unknown,
             pull_url: None,
+            vps: None,
             sps: None,
             pps: None,
+            hevc_decoder_config: None,
         })
     }
 
@@ -220,8 +222,10 @@ mod tests {
             source: StreamSourceMode::Pull,
             protocol: StreamProtocol::RTSP,
             pull_url: Some("rtsp://example/live".to_string()),
+            vps: None,
             sps: Some(vec![0x67, 0x42]),
             pps: Some(vec![0x68, 0xce]),
+            hevc_decoder_config: None,
         }
     }
 

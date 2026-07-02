@@ -11,7 +11,10 @@ use tracing::{debug, error, info, warn};
 use super::amf0::{self, Amf0Value};
 use super::chunk::{self, ChunkAssembler, ChunkHeader};
 use crate::core::{
-    CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, MILLISECOND_CLOCK_RATE,
+    hvcc_payload_to_annex_b, is_keyframe_annex_b, parse_enhanced_hevc_video_message,
+    parse_hevc_decoder_config_record, RTMP_PKT_CODED_FRAMES, RTMP_PKT_CODED_FRAMES_X,
+    RTMP_PKT_SEQUENCE_START, CodecType, MediaFrame, StreamManager, StreamProtocol,
+    StreamSourceMode, MILLISECOND_CLOCK_RATE,
 };
 
 #[derive(Debug, Clone)]
@@ -212,7 +215,7 @@ impl RtmpPuller {
                     }
                     manager.publish_frame(frame);
                 } else if msg.msg_type == 0x09 {
-                    extract_and_store_sps_pps(&msg.payload, &manager, &local_id);
+                    extract_and_store_video_config(&msg.payload, &manager, &local_id);
                 }
             }
         }
@@ -329,7 +332,7 @@ async fn wait_for_play_start(
                 *chunk_size = new_size;
             }
             if msg.msg_type == 0x09 {
-                extract_and_store_sps_pps(&msg.payload, manager, local_stream_id);
+                extract_and_store_video_config(&msg.payload, manager, local_stream_id);
             }
             if msg.msg_type == 0x14 || msg.msg_type == 0x11 {
                 if let Ok((cmd, args)) = amf0::parse_command(&msg.payload) {
@@ -463,7 +466,52 @@ async fn wait_for_create_stream(
     Err(anyhow!("Timeout waiting for createStream _result"))
 }
 
-fn extract_and_store_sps_pps(data: &[u8], manager: &StreamManager, stream_id: &str) {
+fn extract_and_store_video_config(data: &[u8], manager: &StreamManager, stream_id: &str) {
+    if let Some(enhanced) = parse_enhanced_hevc_video_message(data) {
+        if enhanced.packet_type == RTMP_PKT_SEQUENCE_START {
+            let (vps, sps, pps) = parse_hevc_decoder_config_record(enhanced.payload);
+            if let Some(sps_data) = sps {
+                let vps_data = vps.unwrap_or_default();
+                let pps_data = pps.unwrap_or_default();
+                info!(
+                    "[RTMP Puller] Stored Enhanced HEVC VPS ({} bytes) SPS ({} bytes) PPS ({} bytes) for stream {}",
+                    vps_data.len(),
+                    sps_data.len(),
+                    pps_data.len(),
+                    stream_id
+                );
+                manager.set_stream_hevc_params(stream_id, vps_data, sps_data, pps_data);
+            }
+        }
+        return;
+    }
+    if data.len() < 2 || data[1] != 0x00 {
+        return;
+    }
+    let codec_id = data[0] & 0x0F;
+    if codec_id == 0x0C {
+        if data.len() <= 5 {
+            return;
+        }
+        let (vps, sps, pps) = parse_hevc_decoder_config_record(&data[5..]);
+        if let Some(sps_data) = sps {
+            let vps_data = vps.unwrap_or_default();
+            let pps_data = pps.unwrap_or_default();
+            info!(
+                "[RTMP Puller] Stored HEVC VPS ({} bytes) SPS ({} bytes) PPS ({} bytes) for stream {}",
+                vps_data.len(),
+                sps_data.len(),
+                pps_data.len(),
+                stream_id
+            );
+            manager.set_stream_hevc_params(stream_id, vps_data, sps_data, pps_data);
+        }
+        return;
+    }
+    extract_and_store_h264_sps_pps(data, manager, stream_id);
+}
+
+fn extract_and_store_h264_sps_pps(data: &[u8], manager: &StreamManager, stream_id: &str) {
     if data.len() < 2 || data[1] != 0x00 || data.len() <= 13 {
         return;
     }
@@ -523,6 +571,30 @@ fn rtmp_message_to_frame(msg: &chunk::RtmpMessage, stream_id: &str) -> Option<Me
 }
 
 fn video_payload_to_frame(data: &[u8], stream_id: &str, timestamp: u32) -> Option<MediaFrame> {
+    if let Some(enhanced) = parse_enhanced_hevc_video_message(data) {
+        if enhanced.packet_type != RTMP_PKT_CODED_FRAMES
+            && enhanced.packet_type != RTMP_PKT_CODED_FRAMES_X
+        {
+            return None;
+        }
+        let annex_b = hvcc_payload_to_annex_b(enhanced.payload);
+        if annex_b.is_empty() {
+            return None;
+        }
+        let is_keyframe = enhanced.is_keyframe || is_keyframe_annex_b(CodecType::H265, &annex_b);
+        return Some(
+            MediaFrame::new(
+                stream_id.to_string(),
+                0,
+                timestamp as u64,
+                Bytes::from(annex_b),
+                is_keyframe,
+                CodecType::H265,
+            )
+            .with_clock_rate(MILLISECOND_CLOCK_RATE),
+        );
+    }
+
     if data.len() < 2 {
         return None;
     }
@@ -531,6 +603,11 @@ fn video_payload_to_frame(data: &[u8], stream_id: &str, timestamp: u32) -> Optio
         return None;
     }
 
+    let video_codec = if (data[0] & 0x0F) == 0x0C {
+        CodecType::H265
+    } else {
+        CodecType::H264
+    };
     let is_keyframe = (data[0] & 0xF0) == 0x10;
     let avcc_payload = &data[5..];
     let mut annex_b = Vec::with_capacity(avcc_payload.len());
@@ -553,6 +630,8 @@ fn video_payload_to_frame(data: &[u8], stream_id: &str, timestamp: u32) -> Optio
         return None;
     }
 
+    let is_keyframe = is_keyframe || is_keyframe_annex_b(video_codec, &annex_b);
+
     Some(
         MediaFrame::new(
             stream_id.to_string(),
@@ -560,7 +639,7 @@ fn video_payload_to_frame(data: &[u8], stream_id: &str, timestamp: u32) -> Optio
             timestamp as u64,
             Bytes::from(annex_b),
             is_keyframe,
-            CodecType::H264,
+            video_codec,
         )
         .with_clock_rate(MILLISECOND_CLOCK_RATE),
     )

@@ -20,7 +20,7 @@ use crate::core::{
     MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, StreamStatus,
     MILLISECOND_CLOCK_RATE,
 };
-use crate::server::webrtc::{annex_b_with_config, request_publisher_keyframe};
+use crate::server::webrtc::{request_publisher_keyframe};
 use chunk::RtmpMessage;
 use session::{RtmpSession, SessionState};
 
@@ -75,17 +75,34 @@ fn prepend_rtmp_video_config(
     if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
         return frame.clone();
     }
+    // Enhanced RTMP HEVC carries VPS/SPS/PPS only in the sequence header.
+    if frame.codec == CodecType::H265 {
+        let annex = crate::core::ensure_annex_b(&frame.data);
+        return MediaFrame::new(
+            frame.stream_id.clone(),
+            frame.track_id,
+            frame.timestamp,
+            bytes::Bytes::from(annex),
+            frame.is_keyframe,
+            frame.codec,
+        )
+        .with_optional_clock_rate(frame.clock_rate);
+    }
     let Some(stream) = manager.get_stream(&stream_id.to_string()) else {
         return frame.clone();
     };
-    let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) else {
-        return frame.clone();
-    };
+    let annex = crate::core::prepend_annex_b_config(
+        frame.codec,
+        stream.vps.as_deref(),
+        stream.sps.as_deref(),
+        stream.pps.as_deref(),
+        &frame.data,
+    );
     MediaFrame::new(
         frame.stream_id.clone(),
         frame.track_id,
         frame.timestamp,
-        bytes::Bytes::from(annex_b_with_config(sps, pps, &frame.data)),
+        bytes::Bytes::from(annex),
         frame.is_keyframe,
         frame.codec,
     )
@@ -436,18 +453,98 @@ impl RtmpServer {
                 if data.is_empty() {
                     return Ok(None);
                 }
+
+                if let Some(enhanced) = crate::core::parse_enhanced_hevc_video_message(data) {
+                    match enhanced.packet_type {
+                        crate::core::RTMP_PKT_SEQUENCE_START => {
+                            info!(
+                                "[RTMP] [{}] <<< VIDEO Enhanced HEVC SequenceHeader ({}bytes)",
+                                peer_addr,
+                                enhanced.payload.len()
+                            );
+                            let (vps, sps, pps) =
+                                crate::core::parse_hevc_decoder_config_record(enhanced.payload);
+                            if sps.is_some() {
+                                conn.stream_manager.set_stream_hevc_config(
+                                    &conn.stream_id,
+                                    vps.unwrap_or_default(),
+                                    sps.unwrap_or_default(),
+                                    pps.unwrap_or_default(),
+                                    Some(enhanced.payload.to_vec()),
+                                );
+                            }
+                        }
+                        crate::core::RTMP_PKT_CODED_FRAMES
+                        | crate::core::RTMP_PKT_CODED_FRAMES_X => {
+                            conn.frames_received += 1;
+                            if conn.frames_received <= 3
+                                || enhanced.is_keyframe && conn.frames_received % 30 == 0
+                            {
+                                debug!(
+                                    "[RTMP] [{}] <<< VIDEO Enhanced HEVC {} ts={} size={} prefix={:02x?} frame#{}",
+                                    peer_addr,
+                                    if enhanced.is_keyframe { "keyframe" } else { "inter" },
+                                    msg.timestamp,
+                                    enhanced.payload.len(),
+                                    &data[..data.len().min(16)],
+                                    conn.frames_received
+                                );
+                            }
+                            if conn.is_publishing {
+                                let annex_b =
+                                    crate::core::hvcc_payload_to_annex_b(enhanced.payload);
+                                if !annex_b.is_empty() {
+                                    let frame = MediaFrame::new(
+                                        conn.stream_id.clone(),
+                                        0,
+                                        msg.timestamp as u64,
+                                        Bytes::from(annex_b),
+                                        enhanced.is_keyframe,
+                                        CodecType::H265,
+                                    )
+                                    .with_clock_rate(MILLISECOND_CLOCK_RATE)
+                                    .with_rtmp_payload(Bytes::copy_from_slice(data));
+                                    conn.stream_manager.publish_frame(frame);
+                                }
+                            }
+                        }
+                        other => {
+                            debug!(
+                                "[RTMP] [{}] <<< VIDEO Enhanced HEVC unknown packet_type={} ({}bytes)",
+                                peer_addr,
+                                other,
+                                data.len()
+                            );
+                        }
+                    }
+                    return Ok(None);
+                }
+
                 let frame_type_str = video_frame_type(data[0]);
                 let codec_str = video_codec_name(data[0]);
+                let video_codec_id = data[0] & 0x0F;
                 let avc_packet_type = if data.len() > 1 { data[1] } else { 0xFF };
 
                 match avc_packet_type {
                     0x00 => {
-                        // AVC sequence header (SPS/PPS)
                         info!(
-                            "[RTMP] [{}] <<< VIDEO AVC SequenceHeader ({}+{})",
+                            "[RTMP] [{}] <<< VIDEO SequenceHeader ({}+{})",
                             peer_addr, frame_type_str, codec_str
                         );
-                        if data.len() > 13 {
+                        if video_codec_id == 0x0C {
+                            if data.len() > 13 {
+                                let (vps, sps, pps) =
+                                    crate::core::parse_hevc_decoder_config_record(&data[5..]);
+                                if sps.is_some() {
+                                    conn.stream_manager.set_stream_hevc_params(
+                                        &conn.stream_id,
+                                        vps.unwrap_or_default(),
+                                        sps.unwrap_or_default(),
+                                        pps.unwrap_or_default(),
+                                    );
+                                }
+                            }
+                        } else if data.len() > 13 {
                             let config_data = &data[5..]; // skip frame_type + avc_type + composition_time
                             if config_data.len() > 7 {
                                 let num_sps = (config_data[5] & 0x1F) as usize;
@@ -495,10 +592,14 @@ impl RtmpServer {
                         }
                     }
                     0x01 => {
-                        // Video NALU (AVC)
                         conn.frames_received += 1;
                         let is_keyframe = (data[0] & 0xF0) == 0x10;
                         let avcc_payload = &data[5..];
+                        let video_codec = if video_codec_id == 0x0C {
+                            CodecType::H265
+                        } else {
+                            CodecType::H264
+                        };
 
                         if conn.frames_received <= 3
                             || is_keyframe && conn.frames_received % 30 == 0
@@ -538,7 +639,7 @@ impl RtmpServer {
                                     msg.timestamp as u64,
                                     Bytes::from(annex_b),
                                     is_keyframe,
-                                    CodecType::H264,
+                                    video_codec,
                                 )
                                 .with_clock_rate(MILLISECOND_CLOCK_RATE);
                                 conn.stream_manager.publish_frame(frame);
@@ -943,7 +1044,31 @@ impl RtmpServer {
                         );
                         w.write_all(&response).await?;
 
-                        if let (Some(ref sps), Some(ref pps)) = (&stream.sps, &stream.pps) {
+                        if let (Some(ref vps), Some(ref sps), Some(ref pps)) =
+                            (&stream.vps, &stream.sps, &stream.pps)
+                        {
+                            if stream.vps.is_some()
+                                || stream_has_codec(&stream, CodecType::H265)
+                            {
+                                let hevc_header = if let Some(hvcc) =
+                                    &stream.hevc_decoder_config
+                                {
+                                    crate::core::build_enhanced_rtmp_hevc_sequence_header(hvcc)
+                                } else {
+                                    session::build_hevc_sequence_header(vps, sps, pps)
+                                };
+                                let header_msg = chunk::encode_message(
+                                    0x09,
+                                    0,
+                                    conn.session.server_stream_id,
+                                    &hevc_header,
+                                    conn.session.chunk_size,
+                                    chunk::CSID_VIDEO,
+                                );
+                                w.write_all(&header_msg).await?;
+                                info!("[RTMP] [{}] Sent Enhanced HEVC sequence header", peer_addr);
+                            }
+                        } else if let (Some(ref sps), Some(ref pps)) = (&stream.sps, &stream.pps) {
                             let avc_header = session::build_avc_sequence_header(sps, pps);
                             let header_msg = chunk::encode_message(
                                 0x09,
@@ -1067,22 +1192,10 @@ impl RtmpServer {
                                     if frame.codec == CodecType::AAC && frame.data.len() < 8 {
                                         continue;
                                     }
-                                    if frames_sent == 0 {
-                                        info!(
-                                        "[RTMP] [{}] >>> PREPARE first frame after={}ms: stream='{}' codec={:?} keyframe={} raw_ts={} size={} cursor={} latest_seq={}",
-                                        peer_log,
-                                        play_started_at.elapsed().as_millis(),
-                                        stream_id_for_play,
-                                        frame.codec,
-                                        frame.is_keyframe,
-                                        frame.timestamp,
-                                        frame.data.len(),
-                                        reader.cursor(),
-                                        reader.hub().latest_seq()
-                                    );
-                                    }
-                                    let data = match frame.codec {
-                                        CodecType::H264 | CodecType::H265 => {
+                                    let data = if frame.codec == CodecType::H265 {
+                                        if let Some(relay) = &frame.rtmp_payload {
+                                            relay.to_vec()
+                                        } else {
                                             session::frame_to_rtmp_video(
                                                 &prepend_rtmp_video_config(
                                                     &manager_for_play,
@@ -1091,11 +1204,36 @@ impl RtmpServer {
                                                 ),
                                             )
                                         }
-                                        CodecType::AAC => session::frame_to_rtmp_audio(&frame),
-                                        _ => continue,
+                                    } else {
+                                        match frame.codec {
+                                            CodecType::H264 => session::frame_to_rtmp_video(
+                                                &prepend_rtmp_video_config(
+                                                    &manager_for_play,
+                                                    &stream_id_for_play,
+                                                    &frame,
+                                                ),
+                                            ),
+                                            CodecType::AAC => session::frame_to_rtmp_audio(&frame),
+                                            _ => continue,
+                                        }
                                     };
                                     if data.is_empty() {
                                         continue;
+                                    }
+                                    if frames_sent == 0 {
+                                        info!(
+                                        "[RTMP] [{}] >>> PREPARE first frame after={}ms: stream='{}' codec={:?} keyframe={} raw_ts={} size={} cursor={} latest_seq={} pkt_prefix={:02x?}",
+                                        peer_log,
+                                        play_started_at.elapsed().as_millis(),
+                                        stream_id_for_play,
+                                        frame.codec,
+                                        frame.is_keyframe,
+                                        frame.timestamp,
+                                        frame.data.len(),
+                                        reader.cursor(),
+                                        reader.hub().latest_seq(),
+                                        &data[..data.len().min(24)]
+                                    );
                                     }
                                     let (msg_type, csid) = match frame.codec {
                                         CodecType::H264 | CodecType::H265 => {

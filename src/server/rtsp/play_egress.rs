@@ -3,7 +3,8 @@
 use std::time::{Duration, Instant};
 
 use crate::core::{
-    dispatch::DispatchReader, is_idr_frame, prime_live_play, CodecType, MediaFrame, StreamManager,
+    dispatch::DispatchReader, is_idr_frame, prime_live_play, prepend_video_config, CodecType,
+    MediaFrame, StreamManager, packetize_hevc_access_unit_for_rtp,
 };
 
 use super::common::{wrap_mpeg4_generic_aac_hbr, RtspCommon};
@@ -47,7 +48,7 @@ impl PlayRtpTimeline {
 }
 
 fn prepend_h264_config(manager: &StreamManager, stream_id: &str, frame: &MediaFrame) -> Vec<u8> {
-    crate::core::live_play::prepend_h264_config(manager, stream_id, frame)
+    prepend_video_config(manager, stream_id, frame)
 }
 
 pub fn is_idr(frame: &MediaFrame) -> bool {
@@ -81,6 +82,10 @@ pub fn egress_rtp_packets(
         CodecType::H264 => {
             let annex = prepend_h264_config(manager, stream_id, frame);
             RtspCommon::packetize_h264_access_unit_for_rtp(&annex, payload_type, seq, ts, ssrc)
+        }
+        CodecType::H265 => {
+            let annex = prepend_h264_config(manager, stream_id, frame);
+            packetize_hevc_access_unit_for_rtp(&annex, payload_type, seq, ts, ssrc)
         }
         CodecType::AAC => {
             if frame.data.len() < 4 {

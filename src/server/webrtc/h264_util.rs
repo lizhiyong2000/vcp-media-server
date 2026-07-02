@@ -150,6 +150,9 @@ pub fn contains_nalu_type(data: &[u8], target: u8) -> bool {
 }
 
 pub fn contains_idr_nalu(data: &[u8]) -> bool {
+    if crate::core::contains_hevc_idr(data) {
+        return true;
+    }
     contains_nalu_type(data, 5)
 }
 
@@ -179,6 +182,9 @@ pub fn is_parameter_set_only(data: &[u8]) -> bool {
 }
 
 pub fn is_keyframe_annex_b(data: &[u8]) -> bool {
+    if crate::core::contains_hevc_idr(data) {
+        return true;
+    }
     first_nalu_type(data) == Some(5) || contains_idr_nalu(data)
 }
 

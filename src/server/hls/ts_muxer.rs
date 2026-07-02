@@ -2,7 +2,7 @@
 /// Generates PAT, PMT, and PES packets for HLS segments.
 use bytes::Bytes;
 
-use crate::core::{CodecType, MediaFrame};
+use crate::core::{CodecType, MediaFrame, prepare_video_au_for_ts};
 
 /// AAC sample rate index (44100 Hz)
 const AAC_SAMPLE_RATE_INDEX: u8 = 4;
@@ -124,7 +124,12 @@ impl TsMuxer {
     }
 
     /// Generate a PMT (Program Map Table) packet
-    pub fn generate_pmt(&mut self, has_video: bool, has_audio: bool) -> Vec<u8> {
+    pub fn generate_pmt(
+        &mut self,
+        has_video: bool,
+        has_audio: bool,
+        video_codec: CodecType,
+    ) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.push(0x00); // Pointer field
         payload.push(0x02); // Table ID
@@ -158,7 +163,12 @@ impl TsMuxer {
         payload.extend_from_slice(&[0xF0, 0x00]); // Program info length = 0
 
         if has_video {
-            payload.push(0x1B); // H264
+            let stream_type = if video_codec == CodecType::H265 {
+                0x24
+            } else {
+                0x1B
+            };
+            payload.push(stream_type);
             payload.push(((VIDEO_PID >> 8) as u8) & 0x1F);
             payload.push((VIDEO_PID & 0xFF) as u8);
             payload.extend_from_slice(&[0xF0, 0x00]);
@@ -183,9 +193,14 @@ impl TsMuxer {
     }
 
     /// Generate PAT + PMT as a combined buffer
-    pub fn generate_pat_pmt(&mut self, has_video: bool, has_audio: bool) -> Vec<u8> {
+    pub fn generate_pat_pmt(
+        &mut self,
+        has_video: bool,
+        has_audio: bool,
+        video_codec: CodecType,
+    ) -> Vec<u8> {
         let mut buf = self.generate_pat();
-        buf.extend(self.generate_pmt(has_video, has_audio));
+        buf.extend(self.generate_pmt(has_video, has_audio, video_codec));
         buf
     }
 
@@ -201,7 +216,7 @@ impl TsMuxer {
         let payload = if matches!(frame.codec, CodecType::AAC) {
             wrap_aac_adts(&frame.data)
         } else if is_video {
-            prepare_h264_au_for_ts(&frame.data)
+            prepare_video_au_for_ts(frame.codec, &frame.data)
         } else {
             frame.data.to_vec()
         };

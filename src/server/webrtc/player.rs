@@ -551,7 +551,7 @@ fn store_live_nalu_config(manager: &StreamManager, stream_id: &str, data: &[u8])
         return;
     }
     for (start, end) in iter_annex_b_nal_ranges(data) {
-        manager.merge_stream_nalu_config(stream_id, &data[start..end]);
+        manager.merge_stream_nalu_config(stream_id, CodecType::H264, &data[start..end]);
     }
 }
 

@@ -61,6 +61,12 @@ fn generate_flv_tag(tag_type: u8, timestamp: u32, data: &[u8]) -> Vec<u8> {
     tag
 }
 
+/// Generate HEVC sequence header (VPS/SPS/PPS) for video
+fn generate_hevc_sequence_header(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let data = crate::core::build_rtmp_hevc_sequence_header(vps, sps, pps);
+    generate_flv_tag(0x09, 0, &data)
+}
+
 /// Generate AVC sequence header (SPS/PPS) for video
 fn generate_avc_sequence_header(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     let mut data = Vec::new();
@@ -247,13 +253,26 @@ impl HttpFlvSession {
 
         // AVC sequence header (SPS/PPS)
         if !self.sequence_header_sent {
-            if let (Some(ref sps), Some(ref pps)) = (&stream.sps, &stream.pps) {
-                if has_video {
+            if has_video {
+                if stream_has_codec(stream, CodecType::H265) {
+                    if let (Some(vps), Some(sps), Some(pps)) =
+                        (&stream.vps, &stream.sps, &stream.pps)
+                    {
+                        data.extend(generate_hevc_sequence_header(vps, sps, pps));
+                    }
+                } else if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
                     data.extend(generate_avc_sequence_header(sps, pps));
                 }
-                if has_audio {
-                    data.extend(generate_aac_sequence_header());
-                }
+            }
+            if has_audio {
+                data.extend(generate_aac_sequence_header());
+            }
+            if has_video
+                && (stream.sps.is_some()
+                    || (stream_has_codec(stream, CodecType::H265) && stream.vps.is_some()))
+            {
+                self.sequence_header_sent = true;
+            } else if !has_video && has_audio {
                 self.sequence_header_sent = true;
             }
         }
@@ -357,8 +376,10 @@ mod tests {
             source: StreamSourceMode::Push,
             protocol: StreamProtocol::WebRTC,
             pull_url: None,
+            vps: None,
             sps: Some(vec![0x67, 0x42, 0x00, 0x1e]),
             pps: Some(vec![0x68, 0xce, 0x1f, 0x20]),
+            hevc_decoder_config: None,
         }
     }
 

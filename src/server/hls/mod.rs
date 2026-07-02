@@ -325,7 +325,12 @@ impl HlsSession {
             self.segment_open_mux_ms = self.session_video_mux_ms;
             self.segment_open_mux_ms_at_split = self.session_video_mux_ms;
             let has_audio = self.session_audio_frames > 0 || frame.codec == CodecType::AAC;
-            let pat_pmt = self.muxer.generate_pat_pmt(true, has_audio);
+            let video_codec = if frame.codec == CodecType::H265 {
+                CodecType::H265
+            } else {
+                CodecType::H264
+            };
+            let pat_pmt = self.muxer.generate_pat_pmt(true, has_audio, video_codec);
             self.segment_buffer.extend(pat_pmt);
             debug!(
                 "[HLS] [{}] Open segment: open_mux_ms={} has_audio={} first_codec={:?} first_raw_ts={} keyframe={}",
@@ -469,7 +474,12 @@ impl HlsSession {
                 self.muxer.mark_segment_discontinuity();
             }
             let has_audio = self.session_audio_frames > 0;
-            let pat_pmt = self.muxer.generate_pat_pmt(true, has_audio);
+            let video_codec = if frame.codec == CodecType::H265 {
+                CodecType::H265
+            } else {
+                CodecType::H264
+            };
+            let pat_pmt = self.muxer.generate_pat_pmt(true, has_audio, video_codec);
             self.segment_buffer.extend(pat_pmt);
             self.segment_wall_start = Some(Instant::now());
             debug!(
@@ -717,10 +727,17 @@ impl HlsServer {
                     if matches!(frame.codec, CodecType::Opus | CodecType::G711) {
                         continue;
                     }
-                    if frame.codec == CodecType::H264 && is_hls_video_keyframe(&frame) {
+                    if matches!(frame.codec, CodecType::H264 | CodecType::H265)
+                        && is_hls_video_keyframe(&frame)
+                    {
                         if let Some(stream) = stream_manager.get_stream(&stream_id_owned) {
-                            if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
-                                let data = annex_b_with_config(sps, pps, &frame.data);
+                            let data = crate::core::prepend_annex_b_config(
+                                frame.codec,
+                                stream.vps.as_deref(),
+                                stream.sps.as_deref(),
+                                stream.pps.as_deref(),
+                                &frame.data,
+                            );
                                 let clock_rate = frame.clock_rate;
                                 frame = MediaFrame::new(
                                     frame.stream_id,
@@ -731,7 +748,6 @@ impl HlsServer {
                                     frame.codec,
                                 )
                                 .with_optional_clock_rate(clock_rate);
-                            }
                         }
                     }
 

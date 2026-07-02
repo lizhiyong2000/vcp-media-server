@@ -7,9 +7,10 @@ use tracing::info;
 use super::dispatch::{last_playable_idr_seq, DispatchError, DispatchReader};
 use super::{CodecType, MediaFrame, StreamManager};
 use crate::server::webrtc::h264_util::{
-    contains_idr_nalu, contains_sps_or_pps_nalu, ensure_annex_b, is_parameter_set_only,
+    contains_sps_or_pps_nalu, ensure_annex_b,
 };
-use crate::server::webrtc::{annex_b_with_config, request_publisher_keyframe};
+use crate::server::webrtc::{request_publisher_keyframe};
+use crate::core::{prepend_annex_b_config, is_keyframe_annex_b, is_parameter_set_only as param_only};
 
 const LIVE_IDR_WAIT: Duration = Duration::from_millis(800);
 
@@ -18,14 +19,22 @@ pub fn is_playable_video_frame(frame: &MediaFrame) -> bool {
         return false;
     }
     let data = ensure_annex_b(&frame.data);
-    !data.is_empty() && !is_parameter_set_only(&data)
+    !data.is_empty() && !param_only(frame.codec, &data)
 }
 
 pub fn is_idr_frame(frame: &MediaFrame) -> bool {
-    frame.is_keyframe || contains_idr_nalu(&ensure_annex_b(&frame.data))
+    frame.is_keyframe || is_keyframe_annex_b(frame.codec, &ensure_annex_b(&frame.data))
 }
 
 pub fn prepend_h264_config(
+    manager: &StreamManager,
+    stream_id: &str,
+    frame: &MediaFrame,
+) -> Vec<u8> {
+    prepend_video_config(manager, stream_id, frame)
+}
+
+pub fn prepend_video_config(
     manager: &StreamManager,
     stream_id: &str,
     frame: &MediaFrame,
@@ -34,10 +43,18 @@ pub fn prepend_h264_config(
     if !(frame.is_keyframe || is_idr_frame(frame) || contains_sps_or_pps_nalu(&au)) {
         return au;
     }
+    if frame.codec == CodecType::H265 {
+        // Enhanced RTMP players expect parameter sets in the sequence header only.
+        return au;
+    }
     if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
-        if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
-            return annex_b_with_config(sps, pps, &au);
-        }
+        return prepend_annex_b_config(
+            frame.codec,
+            stream.vps.as_deref(),
+            stream.sps.as_deref(),
+            stream.pps.as_deref(),
+            &au,
+        );
     }
     au
 }
@@ -53,7 +70,7 @@ pub fn prepare_h264_play_frame(
         frame.track_id,
         frame.timestamp,
         bytes::Bytes::from(annex),
-        true,
+        frame.is_keyframe || is_idr_frame(&frame),
         frame.codec,
     )
     .with_optional_clock_rate(frame.clock_rate)

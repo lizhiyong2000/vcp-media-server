@@ -26,6 +26,7 @@ pub struct StoredFrame {
     pub codec: CodecType,
     pub is_keyframe: bool,
     pub data: Bytes,
+    pub rtmp_payload: Option<Bytes>,
 }
 
 impl StoredFrame {
@@ -39,6 +40,7 @@ impl StoredFrame {
             self.codec,
         )
         .with_optional_clock_rate(self.clock_rate)
+        .with_rtmp_payload_opt(self.rtmp_payload.clone())
     }
 }
 
@@ -86,6 +88,7 @@ impl FrameRing {
             codec: frame.codec,
             is_keyframe: frame.is_keyframe,
             data: frame.data,
+            rtmp_payload: frame.rtmp_payload,
         };
         self.bytes_used += bytes;
         self.slots.push_back(stored);

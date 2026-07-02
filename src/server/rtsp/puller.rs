@@ -11,7 +11,7 @@ use super::common::RtspCommon;
 use super::RtspRequest;
 use crate::core::{
     CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track,
-    AAC_DEFAULT_CLOCK_RATE,
+    AAC_DEFAULT_CLOCK_RATE, VIDEO_RTP_CLOCK_RATE,
 };
 use crate::server::webrtc::H264RtpIngest;
 
@@ -98,18 +98,38 @@ impl RtspPuller {
         let _ = self.stream_manager.set_unpublished(local_stream_id);
         self.stream_manager.ensure_stream_broadcast(local_stream_id);
 
-        // Prime SPS/PPS from remote SDP when available (helps WebRTC play before first IDR).
-        use crate::server::webrtc::parse_sprop_parameter_sets;
-        let (sdp_sps, sdp_pps) = parse_sprop_parameter_sets(sdp);
-        if let (Some(sps), Some(pps)) = (sdp_sps, sdp_pps) {
-            info!(
-                "[RTSP Puller] Primed SPS/PPS from SDP stream='{}' sps={} pps={}",
-                local_stream_id,
-                sps.len(),
-                pps.len()
-            );
-            self.stream_manager
-                .set_stream_sps_pps(local_stream_id, sps, pps);
+        // Prime VPS/SPS/PPS from remote SDP when available.
+        if tracks_to_create
+            .iter()
+            .any(|track| track.codec == CodecType::H265)
+        {
+            for line in sdp.lines() {
+                if line.starts_with("a=fmtp:") {
+                    let (vps, sps, pps) = crate::core::parse_hevc_sprop_fmtp(line);
+                    if sps.is_some() {
+                        self.stream_manager.set_stream_hevc_params(
+                            local_stream_id,
+                            vps.unwrap_or_default(),
+                            sps.unwrap_or_default(),
+                            pps.unwrap_or_default(),
+                        );
+                        break;
+                    }
+                }
+            }
+        } else {
+            use crate::server::webrtc::parse_sprop_parameter_sets;
+            let (sdp_sps, sdp_pps) = parse_sprop_parameter_sets(sdp);
+            if let (Some(sps), Some(pps)) = (sdp_sps, sdp_pps) {
+                info!(
+                    "[RTSP Puller] Primed SPS/PPS from SDP stream='{}' sps={} pps={}",
+                    local_stream_id,
+                    sps.len(),
+                    pps.len()
+                );
+                self.stream_manager
+                    .set_stream_sps_pps(local_stream_id, sps, pps);
+            }
         }
 
         info!(
@@ -184,7 +204,13 @@ impl RtspPuller {
         let mut frame_count: u64 = 0;
         let mut bytes_received: u64 = 0;
         let mut last_log_time = std::time::Instant::now();
+        let video_codec = tracks
+            .iter()
+            .find(|t| t.id == 0)
+            .map(|t| t.codec)
+            .unwrap_or(CodecType::H264);
         let mut h264_ingest = H264RtpIngest::new(manager.clone(), stream_id.clone(), "RTSP-Pull");
+        let mut hevc_fu = crate::core::HevcFuReassembler::default();
 
         info!(
             "[RTSP Puller] [RTP Loop] Starting RTP receive loop for stream {}",
@@ -218,7 +244,28 @@ impl RtspPuller {
                 let track_id = channel / 2;
 
                 if track_id == 0 && rtp_payload.len() >= 12 {
-                    if h264_ingest.ingest_rtp_packet(&rtp_payload) {
+                    if video_codec == CodecType::H265 {
+                        if let Some((media, _, _)) =
+                            crate::server::webrtc::rtp_h264_media_payload(&rtp_payload)
+                        {
+                            if let Some((annex_b, is_keyframe)) = hevc_fu.depacketize(media) {
+                                let ts = u64::from(u32::from_be_bytes(
+                                    rtp_payload[4..8].try_into().unwrap_or([0; 4]),
+                                ));
+                                let frame = MediaFrame::new(
+                                    stream_id.clone(),
+                                    0,
+                                    ts,
+                                    annex_b,
+                                    is_keyframe,
+                                    CodecType::H265,
+                                )
+                                .with_clock_rate(VIDEO_RTP_CLOCK_RATE);
+                                manager.publish_frame(frame);
+                                frame_count += 1;
+                            }
+                        }
+                    } else if h264_ingest.ingest_rtp_packet(&rtp_payload) {
                         frame_count += 1;
                     }
                 } else if rtp_payload.len() >= 12 {
@@ -253,6 +300,7 @@ impl RtspPuller {
                         is_keyframe: marker,
                         codec,
                         rtp_data: None,
+                        rtmp_payload: None,
                     };
                     manager.publish_frame(frame);
                     frame_count += 1;
@@ -358,6 +406,7 @@ impl RtspPuller {
                                     is_keyframe: marker,
                                     codec: CodecType::AAC,
                                     rtp_data: None,
+                                    rtmp_payload: None,
                                 };
                                 manager.publish_frame(frame);
                                 frame_count += 1;

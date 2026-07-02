@@ -312,6 +312,7 @@ struct SegmentWriter {
     started_at_ms: u64,
     ended_at_ms: u64,
     has_video: bool,
+    video_codec: CodecType,
     has_audio: bool,
     video_frames: u64,
     audio_frames: u64,
@@ -345,6 +346,7 @@ impl SegmentWriter {
             started_at_ms,
             ended_at_ms: started_at_ms,
             has_video: task.declared_has_video,
+            video_codec: CodecType::H264,
             has_audio: task.declared_has_audio,
             video_frames: 0,
             audio_frames: 0,
@@ -369,6 +371,9 @@ impl SegmentWriter {
 
         let frame = if is_video {
             self.has_video = true;
+            if frame.codec == CodecType::H265 {
+                self.video_codec = CodecType::H265;
+            }
             self.video_frames += 1;
             if frame.is_keyframe {
                 self.keyframes += 1;
@@ -381,7 +386,9 @@ impl SegmentWriter {
         };
 
         if !self.header_written {
-            let header = self.muxer.generate_pat_pmt(self.has_video, self.has_audio);
+            let header = self
+                .muxer
+                .generate_pat_pmt(self.has_video, self.has_audio, self.video_codec);
             self.write_bytes(&header).await?;
             self.header_written = true;
         }
@@ -481,10 +488,10 @@ fn prepare_video_frame_for_record(
     stream_id: &str,
     frame: MediaFrame,
 ) -> MediaFrame {
-    if !matches!(frame.codec, CodecType::H264) {
+    if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
         return frame;
     }
-    let data = prepend_h264_config(manager, stream_id, &frame);
+    let data = crate::core::live_play::prepend_video_config(manager, stream_id, &frame);
     let prepared = MediaFrame::new(
         frame.stream_id.clone(),
         frame.track_id,

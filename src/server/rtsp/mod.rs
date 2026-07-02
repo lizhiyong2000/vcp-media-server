@@ -554,11 +554,27 @@ impl RtspServer {
             stream_id
         );
 
-        // Get SPS/PPS from stream if available
-        let (sps, pps) = if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
-            (stream.sps.clone(), stream.pps.clone())
+        // Get VPS/SPS/PPS from stream if available
+        let (vps, sps, pps) = if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
+            (stream.vps.clone(), stream.sps.clone(), stream.pps.clone())
         } else {
-            (None, None)
+            (None, None, None)
+        };
+
+        let h265_fmtp = |payload_type: u8| {
+            if let (Some(vps_data), Some(sps_data), Some(pps_data)) = (&vps, &sps, &pps) {
+                format!(
+                    "a=fmtp:{} {}\r\n",
+                    payload_type,
+                    crate::core::hevc_sprop_from_nals(vps_data, sps_data, pps_data)
+                )
+            } else {
+                warn!(
+                    "[RTSP] [{}] Building H265 SDP without VPS/SPS/PPS",
+                    stream_id
+                );
+                format!("a=fmtp:{} profile-space=0;profile-id=1;tier-flag=0;level-id=93\r\n", payload_type)
+            }
         };
 
         let h264_fmtp = |payload_type: u8| {
@@ -614,6 +630,8 @@ impl RtspServer {
 
                 if track.codec == CodecType::H264 {
                     sdp.push_str(&h264_fmtp(track.payload_type));
+                } else if track.codec == CodecType::H265 {
+                    sdp.push_str(&h265_fmtp(track.payload_type));
                 } else if track.codec == CodecType::AAC {
                     sdp.push_str(&format!("a=fmtp:{} profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;\r\n", track.payload_type));
                 }

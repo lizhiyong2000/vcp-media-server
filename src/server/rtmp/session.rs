@@ -251,6 +251,10 @@ pub fn build_on_status(code: &str, description: &str, level: &str) -> Vec<u8> {
     amf0::encode(&values)
 }
 
+pub fn build_hevc_sequence_header(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    crate::core::build_rtmp_hevc_sequence_header(vps, sps, pps)
+}
+
 /// Build AVC sequence header (SPS/PPS) as RTMP video message payload
 pub fn build_avc_sequence_header(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     let mut data = Vec::new();
@@ -322,61 +326,9 @@ pub fn build_metadata(width: u32, height: u32, stream_name: &str) -> Vec<u8> {
     amf0::encode(&values)
 }
 
-/// Convert a MediaFrame to RTMP video data
-/// frame.data is in Annex B format: [00 00 00 01][NALU][00 00 00 01][NALU]...
-/// Output is in AVCC format: [frame_type|codec][avc_packet_type][composition_time][length(4B)][NALU]...
+/// Convert a MediaFrame to RTMP video data (Annex B → AVCC/HEVC packet).
 pub fn frame_to_rtmp_video(frame: &MediaFrame) -> Vec<u8> {
-    let mut data = Vec::new();
-
-    // Frame type + codec
-    let frame_type = if frame.is_keyframe || is_keyframe_annex_b(&frame.data) {
-        0x10
-    } else {
-        0x20
-    };
-    data.push(frame_type | 0x07); // AVC
-                                  // AVC packet type: NALU = 0x01
-    data.push(0x01);
-    // Composition time offset (3 bytes)
-    data.extend_from_slice(&[0x00, 0x00, 0x00]);
-
-    // Convert Annex B to AVCC: find start codes and write length-prefixed NALUs
-    let annex_b = &frame.data;
-    let mut i = 0;
-    while i < annex_b.len() {
-        // Find next start code (0x000001 or 0x00000001)
-        let start = if i + 3 <= annex_b.len() && annex_b[i..i + 3] == [0x00, 0x00, 0x01] {
-            i += 3;
-            i
-        } else if i + 4 <= annex_b.len() && annex_b[i..i + 4] == [0x00, 0x00, 0x00, 0x01] {
-            i += 4;
-            i
-        } else {
-            i += 1;
-            continue;
-        };
-
-        // Find end of this NALU (next start code or end of data)
-        let mut end = annex_b.len();
-        let mut j = start;
-        while j + 3 <= annex_b.len() {
-            if (j + 3 <= annex_b.len() && annex_b[j..j + 3] == [0x00, 0x00, 0x01])
-                || (j + 4 <= annex_b.len() && annex_b[j..j + 4] == [0x00, 0x00, 0x00, 0x01])
-            {
-                end = j;
-                break;
-            }
-            j += 1;
-        }
-
-        // Write NALU with 4-byte length prefix (AVCC format)
-        let nalu_len = (end - start) as u32;
-        data.extend_from_slice(&nalu_len.to_be_bytes());
-        data.extend_from_slice(&annex_b[start..end]);
-        i = end;
-    }
-
-    data
+    crate::core::build_rtmp_video_from_annex_b(frame)
 }
 
 /// Convert a MediaFrame to RTMP audio data

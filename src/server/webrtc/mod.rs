@@ -13,7 +13,9 @@ mod publish_signaling;
 mod publisher;
 mod signaling;
 
+mod hevc_rtp_ingest;
 pub use h264_rtp_ingest::{rtp_h264_media_payload, H264RtpIngest};
+pub use hevc_rtp_ingest::HevcRtpIngest;
 
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};

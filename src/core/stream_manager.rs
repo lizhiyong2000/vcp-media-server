@@ -48,8 +48,10 @@ impl StreamManager {
             source,
             protocol,
             pull_url,
+            vps: None,
             sps: None,
             pps: None,
+            hevc_decoder_config: None,
         };
 
         let mut hubs = self.hubs.write();
@@ -90,8 +92,77 @@ impl StreamManager {
         }
     }
 
-    /// Merge SPS/PPS from a single NALU into stream codec config.
-    pub fn merge_stream_nalu_config(&self, stream_id: &str, nalu: &[u8]) {
+    pub fn set_stream_hevc_params(
+        &self,
+        stream_id: &str,
+        vps: Vec<u8>,
+        sps: Vec<u8>,
+        pps: Vec<u8>,
+    ) {
+        self.set_stream_hevc_config(stream_id, vps, sps, pps, None);
+    }
+
+    pub fn set_stream_hevc_config(
+        &self,
+        stream_id: &str,
+        vps: Vec<u8>,
+        sps: Vec<u8>,
+        pps: Vec<u8>,
+        hevc_decoder_config: Option<Vec<u8>>,
+    ) {
+        if let Some(hub) = self.get_hub(stream_id) {
+            hub.update_stream(|stream| {
+                stream.vps = Some(vps);
+                stream.sps = Some(sps);
+                stream.pps = Some(pps);
+                if hevc_decoder_config.is_some() {
+                    stream.hevc_decoder_config = hevc_decoder_config;
+                }
+                if let Some(track) = stream.tracks.iter_mut().find(|t| t.id == 0) {
+                    track.codec = CodecType::H265;
+                } else {
+                    stream.tracks.insert(0, Track::new(0, CodecType::H265, 96, 90_000));
+                }
+                info!(
+                    "[Core] Setting HEVC VPS/SPS/PPS for stream {}",
+                    stream_id
+                );
+            });
+        }
+    }
+
+    /// Merge VPS/SPS/PPS from a single NALU into stream codec config.
+    pub fn merge_stream_nalu_config(&self, stream_id: &str, codec: CodecType, nalu: &[u8]) {
+        if nalu.is_empty() {
+            return;
+        }
+        if let Some((vps, sps, pps)) = crate::core::merge_annex_b_nalu_config(codec, nalu) {
+            if let Some(hub) = self.get_hub(stream_id) {
+                hub.update_stream(|stream| {
+                    if let Some(v) = vps {
+                        if stream.vps.is_none() {
+                            stream.vps = Some(v);
+                        }
+                    }
+                    if let Some(s) = sps {
+                        if stream.sps.is_none() {
+                            stream.sps = Some(s);
+                        }
+                    }
+                    if let Some(p) = pps {
+                        if stream.pps.is_none() {
+                            stream.pps = Some(p);
+                        }
+                    }
+                });
+            }
+            return;
+        }
+        // H.264 fallback
+        self.merge_stream_nalu_config_h264(stream_id, nalu);
+    }
+
+    fn merge_stream_nalu_config_h264(&self, stream_id: &str, nalu: &[u8]) {
         if nalu.is_empty() {
             return;
         }
@@ -632,7 +703,7 @@ mod tests {
 
         manager.set_stream_tracks("missing", vec![Track::new(1, CodecType::AAC, 97, 44_100)]);
         manager.set_stream_sps_pps("missing", vec![0x67], vec![0x68]);
-        manager.merge_stream_nalu_config("missing", &[0x67, 0x42]);
+        manager.merge_stream_nalu_config("missing", CodecType::H264, &[0x67, 0x42]);
         manager.update_stream_status(&"missing".to_string(), StreamStatus::Publishing);
 
         assert!(manager.get_hub("missing").is_none());
@@ -650,15 +721,15 @@ mod tests {
         let manager = StreamManager::new();
         create_test_stream(&manager, "s");
 
-        manager.merge_stream_nalu_config("s", &[]);
-        manager.merge_stream_nalu_config("s", &[0x65, 0x01]);
+        manager.merge_stream_nalu_config("s", CodecType::H264, &[]);
+        manager.merge_stream_nalu_config("s", CodecType::H264, &[0x65, 0x01]);
         assert!(manager.get_stream(&"s".to_string()).unwrap().sps.is_none());
         assert!(manager.get_stream(&"s".to_string()).unwrap().pps.is_none());
 
-        manager.merge_stream_nalu_config("s", &[0x67, 0x01]);
-        manager.merge_stream_nalu_config("s", &[0x68, 0x02]);
-        manager.merge_stream_nalu_config("s", &[0x67, 0xff]);
-        manager.merge_stream_nalu_config("s", &[0x68, 0xee]);
+        manager.merge_stream_nalu_config("s", CodecType::H264, &[0x67, 0x01]);
+        manager.merge_stream_nalu_config("s", CodecType::H264, &[0x68, 0x02]);
+        manager.merge_stream_nalu_config("s", CodecType::H264, &[0x67, 0xff]);
+        manager.merge_stream_nalu_config("s", CodecType::H264, &[0x68, 0xee]);
 
         let stream = manager.get_stream(&"s".to_string()).unwrap();
         assert_eq!(stream.sps.as_deref(), Some(&[0x67, 0x01][..]));

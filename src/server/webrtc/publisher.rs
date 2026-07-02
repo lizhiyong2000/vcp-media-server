@@ -488,7 +488,7 @@ fn store_nalu_config_from_rtp(manager: &StreamManager, stream_id: &str, payload:
     }
     for n in &nalus {
         if n.nal_type == 7 || n.nal_type == 8 {
-            manager.merge_stream_nalu_config(stream_id, &n.data);
+            manager.merge_stream_nalu_config(stream_id, CodecType::H264, &n.data);
         }
     }
 }

@@ -16,8 +16,9 @@ use super::play_egress::{
 };
 use super::{RtspRequest, RtspResponse, RtspServer, RtspSession, TransportMode};
 use crate::core::dispatch::DispatchError;
-use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager, AAC_DEFAULT_CLOCK_RATE};
-use crate::server::webrtc::H264RtpIngest;
+use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager, Track, AAC_DEFAULT_CLOCK_RATE};
+use crate::core::hevc_sprop_from_nals;
+use crate::server::webrtc::{H264RtpIngest, HevcRtpIngest};
 
 pub struct RtspServerSession {
     reader: tokio::net::tcp::OwnedReadHalf,
@@ -31,10 +32,12 @@ pub struct RtspServerSession {
     udp_tracks: HashMap<u8, UdpTrackTransport>,
     udp_receiver_tracks: std::collections::HashSet<u8>,
     rtp_sender_abort: Option<tokio::task::AbortHandle>,
-    // H264 codec parameters
+    // Video codec parameters
+    vps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     sps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     pps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     h264_ingest: Option<H264RtpIngest>,
+    hevc_ingest: Option<HevcRtpIngest>,
     // Track the session state for SDP generation
     sdp_generated: Arc<parking_lot::RwLock<bool>>,
 }
@@ -75,9 +78,11 @@ impl RtspServerSession {
             udp_tracks: HashMap::new(),
             udp_receiver_tracks: std::collections::HashSet::new(),
             rtp_sender_abort: None,
+            vps_cache: Arc::new(parking_lot::RwLock::new(None)),
             sps_cache: Arc::new(parking_lot::RwLock::new(None)),
             pps_cache: Arc::new(parking_lot::RwLock::new(None)),
             h264_ingest: None,
+            hevc_ingest: None,
             sdp_generated: Arc::new(parking_lot::RwLock::new(false)),
         }
     }
@@ -150,8 +155,17 @@ impl RtspServerSession {
                 track_id, stream_id, peer_addr
             );
             let mut buffer = vec![0u8; 65535];
-            let mut h264_ingest = if track_id == 0 {
+            let mut h264_ingest = if track_id == 0 && video_codec_for_track(&session_tracks, 0) != CodecType::H265 {
                 Some(H264RtpIngest::new(
+                    manager.clone(),
+                    stream_id.clone(),
+                    "RTSP-Push-UDP",
+                ))
+            } else {
+                None
+            };
+            let mut hevc_ingest = if track_id == 0 && video_codec_for_track(&session_tracks, 0) == CodecType::H265 {
+                Some(HevcRtpIngest::new(
                     manager.clone(),
                     stream_id.clone(),
                     "RTSP-Push-UDP",
@@ -168,7 +182,9 @@ impl RtspServerSession {
                         }
 
                         if track_id == 0 {
-                            if let Some(ingest) = &mut h264_ingest {
+                            if let Some(ingest) = &mut hevc_ingest {
+                                ingest.ingest_rtp_packet(&buffer[..len]);
+                            } else if let Some(ingest) = &mut h264_ingest {
                                 ingest.ingest_rtp_packet(&buffer[..len]);
                             }
                         } else {
@@ -205,6 +221,7 @@ impl RtspServerSession {
                                 is_keyframe: marker,
                                 codec,
                                 rtp_data: Some(buffer[..len].to_vec().into()),
+                                rtmp_payload: None,
                             };
                             manager.publish_frame(frame);
                         }
@@ -742,6 +759,15 @@ impl RtspServerSession {
         nal_type == 5
     }
 
+    fn video_codec_for_track(&self, track_id: u8) -> CodecType {
+        self.session
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(|track| track.codec)
+            .unwrap_or(CodecType::H264)
+    }
+
     async fn handle_rtp_data(&mut self, data: &BytesMut, channel: u8) {
         if let Some(ref stream_id) = self.session.stream_id {
             let track_id = channel / 2;
@@ -765,15 +791,29 @@ impl RtspServerSession {
             ]);
 
             if track_id == 0 {
-                if self.h264_ingest.is_none() {
-                    self.h264_ingest = Some(H264RtpIngest::new(
-                        Arc::clone(&self.manager),
-                        stream_id.clone(),
-                        "RTSP-Push",
-                    ));
-                }
-                if let Some(ingest) = &mut self.h264_ingest {
-                    ingest.ingest_rtp_packet(rtp_payload);
+                let video_codec = self.video_codec_for_track(0);
+                if video_codec == CodecType::H265 {
+                    if self.hevc_ingest.is_none() {
+                        self.hevc_ingest = Some(HevcRtpIngest::new(
+                            Arc::clone(&self.manager),
+                            stream_id.clone(),
+                            "RTSP-Push",
+                        ));
+                    }
+                    if let Some(ingest) = &mut self.hevc_ingest {
+                        ingest.ingest_rtp_packet(rtp_payload);
+                    }
+                } else {
+                    if self.h264_ingest.is_none() {
+                        self.h264_ingest = Some(H264RtpIngest::new(
+                            Arc::clone(&self.manager),
+                            stream_id.clone(),
+                            "RTSP-Push",
+                        ));
+                    }
+                    if let Some(ingest) = &mut self.h264_ingest {
+                        ingest.ingest_rtp_packet(rtp_payload);
+                    }
                 }
                 self.sync_codec_cache_from_manager(stream_id);
                 return;
@@ -815,6 +855,7 @@ impl RtspServerSession {
                 is_keyframe: marker,
                 codec,
                 rtp_data: Some(data.to_vec().into()),
+                rtmp_payload: None,
             };
             self.manager.publish_frame(frame);
         } else {
@@ -827,6 +868,11 @@ impl RtspServerSession {
 
     fn sync_codec_cache_from_manager(&self, stream_id: &str) {
         if let Some(stream) = self.manager.get_stream(&stream_id.to_string()) {
+            if let Some(vps) = &stream.vps {
+                if self.vps_cache.read().is_none() {
+                    *self.vps_cache.write() = Some(vps.clone());
+                }
+            }
             if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
                 if self.sps_cache.read().is_none() {
                     *self.sps_cache.write() = Some(sps.clone());
@@ -1073,51 +1119,80 @@ impl RtspServerSession {
     }
 
     pub fn is_sdp_ready(&self) -> bool {
-        self.sps_cache.read().is_some() && self.pps_cache.read().is_some()
+        if self.video_codec_for_track(0) == CodecType::H265 {
+            self.vps_cache.read().is_some()
+                && self.sps_cache.read().is_some()
+                && self.pps_cache.read().is_some()
+        } else {
+            self.sps_cache.read().is_some() && self.pps_cache.read().is_some()
+        }
     }
 
     pub fn build_sdp_with_codec_params(&self, stream_id: &str) -> String {
+        let vps = self.vps_cache.read();
         let sps = self.sps_cache.read();
         let pps = self.pps_cache.read();
+        let video_codec = self.video_codec_for_track(0);
 
         let mut sdp = format!(
             "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=MediaServer Session: {}\r\nt=0 0\r\n",
             stream_id
         );
 
-        // Video track (H264)
-        sdp.push_str("m=video 0 RTP/AVP 96\r\n");
-        sdp.push_str("c=IN IP4 0.0.0.0\r\n");
-        sdp.push_str("a=rtpmap:96 H264/90000\r\n");
-        sdp.push_str("a=control:trackID=0\r\n");
+        if video_codec == CodecType::H265 {
+            sdp.push_str("m=video 0 RTP/AVP 98\r\n");
+            sdp.push_str("c=IN IP4 0.0.0.0\r\n");
+            sdp.push_str("a=rtpmap:98 H265/90000\r\n");
+            sdp.push_str("a=control:trackID=0\r\n");
 
-        if let (Some(sps_data), Some(pps_data)) = (sps.as_ref(), pps.as_ref()) {
-            // Base64 encode SPS and PPS
-            use base64::Engine;
-            let sps_b64 = base64::engine::general_purpose::STANDARD.encode(sps_data);
-            let pps_b64 = base64::engine::general_purpose::STANDARD.encode(pps_data);
-
-            // Extract profile-level-id from SPS (bytes 1-3)
-            let profile_level_id = if sps_data.len() >= 4 {
-                format!("{:02X}{:02X}{:02X}", sps_data[1], sps_data[2], sps_data[3])
+            if let (Some(vps_data), Some(sps_data), Some(pps_data)) =
+                (vps.as_ref(), sps.as_ref(), pps.as_ref())
+            {
+                sdp.push_str(&format!(
+                    "a=fmtp:98 {};profile-space=0;profile-id=1;tier-flag=0;level-id=93;interop-constraints=000000000000;tx-mode=0\r\n",
+                    hevc_sprop_from_nals(vps_data, sps_data, pps_data)
+                ));
+                info!(
+                    "[RTSP] Generated dynamic HEVC SDP with VPS ({}), SPS ({}), PPS ({})",
+                    vps_data.len(),
+                    sps_data.len(),
+                    pps_data.len()
+                );
             } else {
-                "42E01F".to_string()
-            };
-
-            sdp.push_str(&format!(
-                "a=fmtp:96 packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}\r\n",
-                profile_level_id, sps_b64, pps_b64
-            ));
-
-            info!(
-                "[RTSP] Generated dynamic SDP with SPS ({}) and PPS ({})",
-                sps_data.len(),
-                pps_data.len()
-            );
+                sdp.push_str("a=fmtp:98 profile-space=0;profile-id=1;tier-flag=0;level-id=93\r\n");
+                info!("[RTSP] Using default HEVC SDP (VPS/SPS/PPS not yet received)");
+            }
         } else {
-            // Fallback to default values
-            sdp.push_str("a=fmtp:96 packetization-mode=1;profile-level-id=42E01F;sprop-parameter-sets=Z0LAHukBQBbsAAADAAQAAAMABAAAAwHNgYI=\r\n");
-            info!("[RTSP] Using default SDP (SPS/PPS not yet received)");
+            sdp.push_str("m=video 0 RTP/AVP 96\r\n");
+            sdp.push_str("c=IN IP4 0.0.0.0\r\n");
+            sdp.push_str("a=rtpmap:96 H264/90000\r\n");
+            sdp.push_str("a=control:trackID=0\r\n");
+
+            if let (Some(sps_data), Some(pps_data)) = (sps.as_ref(), pps.as_ref()) {
+                use base64::Engine;
+                let sps_b64 = base64::engine::general_purpose::STANDARD.encode(sps_data);
+                let pps_b64 = base64::engine::general_purpose::STANDARD.encode(pps_data);
+
+                let profile_level_id = if sps_data.len() >= 4 {
+                    format!("{:02X}{:02X}{:02X}", sps_data[1], sps_data[2], sps_data[3])
+                } else {
+                    "42E01F".to_string()
+                };
+
+                sdp.push_str(&format!(
+                    "a=fmtp:96 packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}\r\n",
+                    profile_level_id, sps_b64, pps_b64
+                ));
+
+                info!(
+                    "[RTSP] Generated dynamic SDP with SPS ({}) and PPS ({})",
+                    sps_data.len(),
+                    pps_data.len()
+                );
+            } else {
+                sdp.push_str("a=fmtp:96 packetization-mode=1;profile-level-id=42E01F;sprop-parameter-sets=Z0LAHukBQBbsAAADAAQAAAMABAAAAwHNgYI=\r\n");
+                info!("[RTSP] Using default SDP (SPS/PPS not yet received)");
+            }
         }
 
         // Audio track (AAC)
@@ -1140,4 +1215,12 @@ impl RtspServerSession {
             .map(|s| s.trim().parse::<usize>().unwrap_or(0))
             .unwrap_or(0)
     }
+}
+
+fn video_codec_for_track(tracks: &[Track], track_id: u8) -> CodecType {
+    tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .map(|track| track.codec)
+        .unwrap_or(CodecType::H264)
 }
