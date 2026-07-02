@@ -159,6 +159,10 @@ impl StreamHub {
         self.ring.read().latest_idr_frame()
     }
 
+    pub fn latest_idr_seq(&self) -> Option<u64> {
+        self.ring.read().latest_idr_seq()
+    }
+
     pub fn latest_idr_bytes(&self) -> Option<(Vec<u8>, u64)> {
         self.ring
             .read()

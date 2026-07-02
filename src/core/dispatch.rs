@@ -12,8 +12,10 @@ use crate::webrtc::{h264_util::is_keyframe_annex_b, request_publisher_keyframe};
 
 /// Max frames per batch for sequential muxers (HLS); keeps pace with live ingest.
 const MAX_SEQUENTIAL_BATCH: u64 = 96;
-/// HLS: snap to latest IDR when this many frames behind (~3s @ 25fps).
-const MAX_LAG_HLS: u64 = 75;
+/// WebRTC play: only snap to live edge when this many frames behind (~1.5s @ 30fps).
+const WEBRTC_LAG_SNAP_THRESHOLD: u64 = 45;
+/// Reuse an existing IDR only when it is close to live edge; otherwise wait for a fresh one.
+const PRIME_EXISTING_IDR_MAX_LAG: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchPolicy {
@@ -23,7 +25,7 @@ pub enum DispatchPolicy {
     SequentialFromIdr,
     /// WebRTC play: IDR start, then coalesce video like live.
     WebRtcPlay,
-    /// HLS: live edge, one frame at a time, no coalesce (preserves every access unit).
+    /// Live playback from edge, sequential after subscribe, no coalesce.
     LiveSequential,
 }
 
@@ -91,19 +93,36 @@ impl DispatchReader {
         manager: &StreamManager,
         stream_id: &str,
     ) -> Option<MediaFrame> {
+        let baseline_latest = self.hub.latest_seq();
         request_publisher_keyframe(stream_id);
         let deadline = Instant::now() + Duration::from_millis(800);
 
         while Instant::now() < deadline {
-            if let Some(idr) = self.hub.latest_idr_frame() {
-                if is_playable_idr(&idr) {
-                    self.cursor = self.hub.snap(SnapMode::LatestIdr);
-                    self.primed = true;
+            if let Some(idr_seq) = self.hub.latest_idr_seq() {
+                let fresh_after_request = idr_seq > baseline_latest;
+                let close_to_live =
+                    baseline_latest.saturating_sub(idr_seq) <= PRIME_EXISTING_IDR_MAX_LAG;
+                if fresh_after_request || close_to_live {
+                    if let Some(idr) = self.hub.get(idr_seq).filter(is_playable_idr) {
+                        self.cursor = idr_seq;
+                        self.primed = true;
+                        info!(
+                            "[Dispatch] [{}] primed IDR ts={} seq={} fresh={} live_lag={}",
+                            stream_id,
+                            idr.timestamp,
+                            self.cursor,
+                            fresh_after_request,
+                            self.hub.latest_seq().saturating_sub(idr_seq)
+                        );
+                        return Some(idr);
+                    }
+                } else {
                     info!(
-                        "[Dispatch] [{}] primed IDR ts={} seq={}",
-                        stream_id, idr.timestamp, self.cursor
+                        "[Dispatch] [{}] latest IDR seq={} is {} frames behind live; waiting for fresh IDR",
+                        stream_id,
+                        idr_seq,
+                        baseline_latest.saturating_sub(idr_seq)
                     );
-                    return Some(idr);
                 }
             }
             if self.wait_new_frames(deadline).await.is_err() {
@@ -111,10 +130,19 @@ impl DispatchReader {
             }
         }
 
-        if let Some(idr) = self.hub.latest_idr_frame() {
-            self.cursor = self.hub.snap(SnapMode::LatestIdr);
-            self.primed = true;
-            return Some(idr);
+        if let Some(idr_seq) = self.hub.latest_idr_seq() {
+            if let Some(idr) = self.hub.get(idr_seq).filter(is_playable_idr) {
+                self.cursor = idr_seq;
+                self.primed = true;
+                info!(
+                    "[Dispatch] [{}] primed fallback IDR ts={} seq={} live_lag={}",
+                    stream_id,
+                    idr.timestamp,
+                    self.cursor,
+                    self.hub.latest_seq().saturating_sub(idr_seq)
+                );
+                return Some(idr);
+            }
         }
 
         // Merge SPS/PPS from stream metadata when ring IDR lacks config
@@ -159,9 +187,7 @@ impl DispatchReader {
         let lag = latest.saturating_sub(self.cursor);
 
         match self.policy {
-            DispatchPolicy::LiveCoalesce
-            | DispatchPolicy::WebRtcPlay
-            | DispatchPolicy::LiveSequential => {
+            DispatchPolicy::LiveCoalesce => {
                 if lag > 0 {
                     if lag > 1 {
                         info!(
@@ -175,18 +201,19 @@ impl DispatchReader {
                     latest = self.hub.latest_seq();
                 }
             }
-            // SequentialFromIdr: never snap on small lag; jump to IDR if ring falls far behind.
-            DispatchPolicy::SequentialFromIdr if lag > MAX_LAG_HLS => {
+            DispatchPolicy::WebRtcPlay if lag > WEBRTC_LAG_SNAP_THRESHOLD => {
                 info!(
-                    "[Dispatch] [{}] HLS lag {} frames — snap to latest IDR",
+                    "[Dispatch] [{}] WebRTC lag {} frames — snap to edge",
                     self.stream_id, lag
                 );
                 request_publisher_keyframe(&self.stream_id);
-                self.pending_muxer_resync = true;
-                self.snap_to_latest_idr();
+                self.pending_live_snap = true;
+                self.snap_to_live_edge();
                 latest = self.hub.latest_seq();
             }
-            DispatchPolicy::SequentialFromIdr => {}
+            DispatchPolicy::WebRtcPlay => {}
+            // Sequential readers preserve every frame while data remains in the ring.
+            DispatchPolicy::LiveSequential | DispatchPolicy::SequentialFromIdr => {}
         }
 
         if self.cursor > latest {
@@ -209,6 +236,9 @@ impl DispatchReader {
                         "[Dispatch] [{}] ring gap at seq {} (oldest {}) — jump to IDR",
                         self.stream_id, self.cursor, oldest
                     );
+                    request_publisher_keyframe(&self.stream_id);
+                    self.pending_muxer_resync = true;
+                    self.pending_live_snap = true;
                     self.cursor = self.hub.snap(SnapMode::LatestIdr).max(oldest);
                     let latest = self.hub.latest_seq();
                     if self.cursor <= latest {
@@ -374,7 +404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequential_from_idr_delivers_all_frames_under_lag_threshold() {
+    async fn sequential_from_idr_delivers_all_buffered_frames_without_lag_snap() {
         let hub = StreamHub::new("s");
         let base = 2_648_000_000u64;
         let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::SequentialFromIdr);
@@ -389,8 +419,7 @@ mod tests {
             let batch = reader.recv_batch().await.unwrap();
             assert!(
                 !reader.take_muxer_resync(),
-                "must not snap on lag < {} frames",
-                MAX_LAG_HLS
+                "must not snap while requested frames are still buffered"
             );
             if batch.is_empty() {
                 break;
@@ -400,7 +429,7 @@ mod tests {
 
         assert_eq!(
             delivered, 50,
-            "SequentialFromIdr should deliver every frame when lag is below snap threshold"
+            "SequentialFromIdr should deliver every buffered frame"
         );
     }
 
@@ -424,7 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequential_from_idr_snaps_only_when_lag_exceeds_threshold() {
+    async fn sequential_from_idr_does_not_snap_large_lag_when_ring_has_data() {
         let hub = StreamHub::new("s");
         let base = 2_648_000_000u64;
         for gop in 0..4 {
@@ -436,13 +465,132 @@ mod tests {
 
         let batch = reader.recv_batch().await.unwrap();
         assert!(
-            batch.len() < 100,
-            "lag snap should drop frames when lag > {MAX_LAG_HLS}, delivered all {}",
+            batch.len() == 96,
+            "large buffered lag should be drained sequentially in capped batches, got {}",
             batch.len()
         );
         assert!(
-            reader.take_muxer_resync(),
-            "large lag should flag muxer resync for discontinuity"
+            !reader.take_muxer_resync(),
+            "large buffered lag should not flag muxer resync"
         );
+    }
+
+    #[tokio::test]
+    async fn live_sequential_preserves_buffered_frames_after_subscribe() {
+        let hub = StreamHub::new("s");
+        let base = 2_648_000_000u64;
+        publish_gop(&hub, 0, base);
+
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::LiveSequential);
+        publish_gop(&hub, 1, base);
+
+        let batch = reader.recv_batch().await.unwrap();
+        assert!(
+            batch.len() > 1,
+            "LiveSequential should drain accumulated live frames instead of snapping to edge"
+        );
+        assert!(
+            !reader.take_live_snap(),
+            "LiveSequential should not report a live snap when frames are still buffered"
+        );
+    }
+
+    #[tokio::test]
+    async fn prime_from_idr_waits_for_fresh_idr_when_existing_idr_is_stale() {
+        let hub = StreamHub::new("s");
+        let base = 2_648_000_000u64;
+        hub.publish(MediaFrame::new(
+            "s".into(),
+            0,
+            base,
+            annex_b_idr(),
+            true,
+            CodecType::H264,
+        ));
+        for i in 1..=40u64 {
+            hub.publish(MediaFrame::new(
+                "s".into(),
+                0,
+                base + i * 3600,
+                annex_b_p(),
+                false,
+                CodecType::H264,
+            ));
+        }
+
+        let hub_for_publish = hub.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            hub_for_publish.publish(MediaFrame::new(
+                "s".into(),
+                0,
+                base + 41 * 3600,
+                annex_b_idr(),
+                true,
+                CodecType::H264,
+            ));
+        });
+
+        let manager = StreamManager::new();
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::WebRtcPlay);
+        let idr = reader
+            .prime_from_idr(&manager, "s")
+            .await
+            .expect("fresh IDR should be primed");
+
+        assert_eq!(idr.timestamp, base + 41 * 3600);
+        assert_eq!(
+            reader.cursor(),
+            41,
+            "cursor should start at the fresh IDR seq"
+        );
+    }
+
+    #[tokio::test]
+    async fn webrtc_play_preserves_frames_under_lag_threshold() {
+        let hub = StreamHub::new("s");
+        let base = 2_648_000_000u64;
+        publish_gop(&hub, 0, base);
+
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::WebRtcPlay);
+        reader.cursor = 0;
+
+        let mut delivered = 0usize;
+        for _ in 0..20 {
+            let batch = reader.recv_batch().await.unwrap();
+            assert!(
+                !reader.take_live_snap(),
+                "WebRTC play must not snap when lag is below threshold"
+            );
+            if batch.is_empty() {
+                break;
+            }
+            delivered += batch.len();
+        }
+
+        assert_eq!(
+            delivered, 20,
+            "WebRTC play should drain buffered frames sequentially without per-frame snap"
+        );
+    }
+
+    #[tokio::test]
+    async fn webrtc_play_snaps_when_lag_exceeds_threshold() {
+        let hub = StreamHub::new("s");
+        let base = 2_648_000_000u64;
+        for gop in 0..4 {
+            publish_gop(&hub, gop, base);
+        }
+
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::WebRtcPlay);
+        reader.cursor = 0;
+
+        let batch = reader.recv_batch().await.unwrap();
+        assert!(
+            batch.len() < 100,
+            "WebRTC play should snap when lag > {WEBRTC_LAG_SNAP_THRESHOLD}, delivered {}",
+            batch.len()
+        );
+        assert!(reader.take_live_snap(), "large lag should flag live snap");
     }
 }

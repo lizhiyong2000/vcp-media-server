@@ -13,9 +13,8 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 
 use super::h264_util::{
     contains_idr_nalu, contains_sps_or_pps_nalu, describe_annex_b, duration_from_rtp_timestamps,
-    ensure_annex_b, extract_sps_pps, is_parameter_set_only, is_rtp_stale_in_gop,
-    is_rtp_timeline_reset, is_rtp_timestamp_before, iter_annex_b_nal_ranges,
-    looks_like_h265_misread_as_h264,
+    ensure_annex_b, extract_sps_pps, is_parameter_set_only, is_rtp_timeline_reset,
+    iter_annex_b_nal_ranges, looks_like_h265_misread_as_h264,
 };
 use super::outbound_h264::{annex_b_with_config, OutboundH264Track};
 use super::peer::{new_peer_connection, wire_pc_debug};
@@ -262,13 +261,11 @@ async fn relay_stream_to_track(
             stream_id
         );
     }
-    reader.snap_to_live_edge();
 
     let mut rtp_sent: u64 = 0;
     let mut received: u64 = 0;
     let mut skipped: u64 = 0;
     let mut streaming = false;
-    let mut pace_next = Instant::now();
     let mut last_sent_ts: Option<u64> = None;
     let mut wait_start = Instant::now();
     let mut last_keyframe_request = Instant::now();
@@ -304,7 +301,6 @@ async fn relay_stream_to_track(
                         n, stream_id
                     );
                     streaming = false;
-                    pace_next = Instant::now();
                     wait_start = Instant::now();
                     last_sent_ts = None;
                     request_publisher_keyframe(&stream_id);
@@ -353,10 +349,6 @@ async fn relay_stream_to_track(
 
         if streaming {
             if let Some(prev) = last_sent_ts {
-                if is_rtp_stale_in_gop(frame.timestamp, prev) {
-                    skipped += 1;
-                    continue;
-                }
                 if is_rtp_timeline_reset(frame.timestamp, prev) {
                     if is_idr || frame.is_keyframe {
                         info!(
@@ -415,26 +407,16 @@ async fn relay_stream_to_track(
             sample_data = prepend_stream_config(&manager, &stream_id, &sample_data);
         }
 
-        let duration = duration_from_rtp_timestamps(last_sent_ts, frame.timestamp);
-        let catch_up = coalesced > 0;
-        if !catch_up {
-            let now = Instant::now();
-            if pace_next > now {
-                tokio::select! {
-                    biased;
-                    _ = stop_rx.changed() => {
-                        if stop_requested(&stop_rx) {
-                            info!("[WebRTC] Play relay stop during pace stream='{}'", stream_id);
-                            break;
-                        }
-                    }
-                    _ = tokio::time::sleep(pace_next - now) => {}
-                }
-            }
-            pace_next = Instant::now() + duration;
+        let lag = reader
+            .hub()
+            .latest_seq()
+            .saturating_sub(reader.cursor());
+        let catch_up = lag > 2 || coalesced > 0;
+        let duration = if catch_up {
+            Duration::from_millis(1)
         } else {
-            pace_next = Instant::now();
-        }
+            duration_from_rtp_timestamps(last_sent_ts, frame.timestamp)
+        };
         if stop_requested(&stop_rx) {
             break;
         }

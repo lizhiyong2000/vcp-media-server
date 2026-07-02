@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use webrtc::rtp::codecs::h264::H264Packet;
 use webrtc::rtp::packet::Packet;
 use webrtc::rtp::packetizer::Depacketizer;
@@ -23,6 +23,7 @@ pub struct H264RtpIngest {
     manager: Arc<StreamManager>,
     depacketizer: H264Packet,
     batch: AccessUnitBatch,
+    expected_seq: Option<u16>,
     units: u64,
     label: &'static str,
 }
@@ -41,6 +42,7 @@ impl H264RtpIngest {
             manager,
             depacketizer: H264Packet::default(),
             batch: AccessUnitBatch::default(),
+            expected_seq: None,
             units: 0,
             label,
         }
@@ -48,10 +50,13 @@ impl H264RtpIngest {
 
     /// Parse a full RTP packet (header + payload), ingest H264, publish on marker.
     pub fn ingest_rtp_packet(&mut self, rtp: &[u8]) -> bool {
-        let Some((payload, ts, marker)) = rtp_h264_media_payload(rtp) else {
+        let Some(info) = rtp_h264_packet_info(rtp) else {
             return false;
         };
-        self.ingest_payload(payload, ts, marker)
+        if !self.accept_sequence(info.sequence_number, info.payload) {
+            return false;
+        }
+        self.ingest_payload(info.payload, info.timestamp, info.marker)
     }
 
     /// Ingest H264 RTP payload with timestamp and marker bit.
@@ -152,14 +157,58 @@ impl H264RtpIngest {
         self.batch.is_keyframe = false;
         true
     }
+
+    fn accept_sequence(&mut self, seq: u16, payload: &[u8]) -> bool {
+        let expected_seq = self.expected_seq;
+        let gap = expected_seq
+            .map(|expected| seq != expected)
+            .unwrap_or(false);
+        self.expected_seq = Some(seq.wrapping_add(1));
+
+        if !gap {
+            return true;
+        }
+
+        warn!(
+            "[{}] RTP sequence gap stream='{}' expected={:?} got={} payload={}",
+            self.label,
+            self.stream_id,
+            expected_seq,
+            seq,
+            describe_rtp_payload(payload)
+        );
+        self.discard_partial_access_unit();
+
+        // A continuation/end FU-A after a gap cannot be reconstructed safely.
+        !is_fu_a_continuation(payload)
+    }
+
+    fn discard_partial_access_unit(&mut self) {
+        self.depacketizer = H264Packet::default();
+        self.batch.parts.clear();
+        self.batch.is_keyframe = false;
+    }
+}
+
+struct RtpH264PacketInfo<'a> {
+    payload: &'a [u8],
+    timestamp: u32,
+    marker: bool,
+    sequence_number: u16,
 }
 
 /// Strip RTP header (and CSRC / extensions) → (payload, timestamp, marker).
 pub fn rtp_h264_media_payload(rtp: &[u8]) -> Option<(&[u8], u32, bool)> {
+    let info = rtp_h264_packet_info(rtp)?;
+    Some((info.payload, info.timestamp, info.marker))
+}
+
+fn rtp_h264_packet_info(rtp: &[u8]) -> Option<RtpH264PacketInfo<'_>> {
     if rtp.len() < 12 {
         return None;
     }
     let marker = (rtp[1] & 0x80) != 0;
+    let sequence_number = u16::from_be_bytes(rtp[2..4].try_into().ok()?);
     let timestamp = u32::from_be_bytes(rtp[4..8].try_into().ok()?);
     let extension = (rtp[0] >> 4) & 0x01;
     let csrc_count = (rtp[0] & 0x0F) as usize;
@@ -177,7 +226,20 @@ pub fn rtp_h264_media_payload(rtp: &[u8]) -> Option<(&[u8], u32, bool)> {
     if offset >= rtp.len() {
         return None;
     }
-    Some((&rtp[offset..], timestamp, marker))
+    Some(RtpH264PacketInfo {
+        payload: &rtp[offset..],
+        timestamp,
+        marker,
+        sequence_number,
+    })
+}
+
+fn is_fu_a_continuation(payload: &[u8]) -> bool {
+    if payload.len() < 2 || (payload[0] & 0x1F) != 28 {
+        return false;
+    }
+    let start = (payload[1] & 0x80) != 0;
+    !start
 }
 
 fn store_nalu_config_from_rtp(manager: &StreamManager, stream_id: &str, payload: &[u8]) {
@@ -248,4 +310,94 @@ fn h264_rtp_to_annex_b(
         is_keyframe,
         CodecType::H264,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{StreamManager, StreamProtocol, StreamSourceMode};
+
+    fn rtp_packet(seq: u16, timestamp: u32, marker: bool, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + payload.len());
+        out.push(0x80);
+        out.push(if marker { 0x80 | 96 } else { 96 });
+        out.extend_from_slice(&seq.to_be_bytes());
+        out.extend_from_slice(&timestamp.to_be_bytes());
+        out.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn manager_with_stream() -> Arc<StreamManager> {
+        let manager = Arc::new(StreamManager::new());
+        manager.create_stream("s", StreamSourceMode::Push, StreamProtocol::RTSP, None);
+        manager
+    }
+
+    fn fu_a_start_idr(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x7c, 0x85];
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn fu_a_mid_idr(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x7c, 0x05];
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn fu_a_end_idr(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x7c, 0x45];
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn sequence_gap_drops_incomplete_fu_a_access_unit_and_recovers() {
+        let manager = manager_with_stream();
+        let mut ingest = H264RtpIngest::new(manager.clone(), "s".to_string(), "test");
+
+        assert!(!ingest.ingest_rtp_packet(&rtp_packet(
+            1,
+            90_000,
+            false,
+            &fu_a_start_idr(&[0x88, 0x99])
+        )));
+        assert!(!ingest.ingest_rtp_packet(&rtp_packet(
+            3,
+            90_000,
+            true,
+            &fu_a_end_idr(&[0xaa, 0xbb])
+        )));
+        assert!(manager.get_hub("s").expect("stream hub").is_empty());
+
+        assert!(ingest.ingest_rtp_packet(&rtp_packet(4, 93_600, true, &[0x65, 0x88, 0x84])));
+        let hub = manager
+            .get_hub("s")
+            .expect("complete packet should publish");
+        let frame = hub.get(0).expect("published frame");
+        assert!(frame.is_keyframe);
+        assert_eq!(frame.timestamp, 93_600);
+    }
+
+    #[test]
+    fn complete_fu_a_access_unit_publishes_once() {
+        let manager = manager_with_stream();
+        let mut ingest = H264RtpIngest::new(manager.clone(), "s".to_string(), "test");
+
+        assert!(!ingest.ingest_rtp_packet(&rtp_packet(
+            10,
+            90_000,
+            false,
+            &fu_a_start_idr(&[0x88])
+        )));
+        assert!(!ingest.ingest_rtp_packet(&rtp_packet(11, 90_000, false, &fu_a_mid_idr(&[0x99]))));
+        assert!(ingest.ingest_rtp_packet(&rtp_packet(12, 90_000, true, &fu_a_end_idr(&[0xaa]))));
+
+        let hub = manager.get_hub("s").expect("complete FU-A should publish");
+        assert_eq!(hub.latest_seq(), 0);
+        let frame = hub.get(0).expect("published frame");
+        assert!(frame.is_keyframe);
+        assert_eq!(frame.timestamp, 90_000);
+    }
 }
