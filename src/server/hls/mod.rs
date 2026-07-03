@@ -28,6 +28,7 @@ use self::timing::{
 };
 /// PAT/PMT only; segments smaller than this are not committed.
 const MIN_SEGMENT_BYTES: usize = 512;
+const MAX_AUDIO_VIDEO_LAG_MS: u64 = 200;
 
 fn is_hls_video_keyframe(frame: &MediaFrame) -> bool {
     if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
@@ -228,7 +229,9 @@ impl HlsSession {
                 // ffplay default sync uses audio as master. AAC must not lead the video mux
                 // timeline (PCR / video PES timestamps) or playback stalls waiting for video.
                 let video_edge = self.session_video_mux_ms;
-                let min_audio_ms = self.segment_open_mux_ms_at_split;
+                let min_audio_ms = self
+                    .segment_open_mux_ms_at_split
+                    .max(video_edge.saturating_sub(MAX_AUDIO_VIDEO_LAG_MS));
                 let clamped = pts.clamp(min_audio_ms, video_edge);
                 self.session_audio_mux_ms = clamped;
                 debug!(

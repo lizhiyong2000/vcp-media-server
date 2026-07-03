@@ -22,6 +22,7 @@ Rust 实现的轻量级流媒体服务，以 `StreamManager` 为媒体中枢，�
 
 - 统一 `StreamManager`：多协议写入、多协议读出，按 `stream_id` 隔离
 - H264 Annex B / RTP 解析，SPS/PPS 提取与 SDP fmtp 注入
+- H265 / HEVC Annex B / RTP 解析，VPS/SPS/PPS 提取与跨协议参数集透传
 - WebRTC 低延迟播放：跳至 live 边缘、帧合并、IDR 起播
 - HLS 按需切片：首次请求 m3u8 时启动 MPEG-TS 分段
 
@@ -29,11 +30,11 @@ Rust 实现的轻量级流媒体服务，以 `StreamManager` 为媒体中枢，�
 
 | 协议 | 端口 | 接入（发布） | 分发（播放） | 编码 | 状态 |
 |------|------|--------------|--------------|------|------|
-| RTMP | 1935 | publish | play | H264 | 已支持 |
-| RTSP | 554 | ANNOUNCE + RECORD（TCP / UDP） | DESCRIBE + PLAY（TCP / UDP） | H264 | 已支持 |
-| HTTP-FLV | 8081 | — | `GET /flv/<stream_id>` | H264 | 已支持 |
-| HLS | 8081 | — | `GET /hls/<stream_id>/live.m3u8` | H264 | 已支持 |
-| WebRTC | 9080 | WebSocket 信令 publish | WebSocket 信令 play | H264 | 已支持 |
+| RTMP | 1935 | publish | play | H264 / H265 | 已支持 |
+| RTSP | 554 | ANNOUNCE + RECORD（TCP / UDP） | DESCRIBE + PLAY（TCP / UDP） | H264 / H265 | 已支持 |
+| HTTP-FLV | 8081 | — | `GET /flv/<stream_id>` | H264 / H265 | 已支持 |
+| HLS | 8081 | — | `GET /hls/<stream_id>/live.m3u8` | H264 / H265 | 已支持 |
+| WebRTC | 9080 | WebSocket 信令 publish | WebSocket 信令 play | H264 / H265 | 已支持 |
 | GB28181 | 5060（规划） | SIP 注册 · PS over RTP 接入 | 国标级联输出 | H264 / H265（规划） | 规划中 |
 
 **地址示例**
@@ -55,7 +56,7 @@ Rust 实现的轻量级流媒体服务，以 `StreamManager` 为媒体中枢，�
 |------|------|------|
 | RTMP 推流 | ffmpeg / OBS 等客户端 publish | 已支持 |
 | RTSP 推流 | ffmpeg ANNOUNCE + RECORD，TCP / UDP | 已支持 |
-| WebRTC 推流 | 浏览器经 WebSocket 信令发布 | 已支持 |
+| WebRTC 推流 | 浏览器经 WebSocket 信令发布，测试页可选择 H264 或 H265/HEVC | 已支持 |
 | RTMP 拉流 | HTTP API 从远端 RTMP 拉取并本地 relay | 已支持 |
 | RTSP 拉流 | HTTP API 从远端 RTSP 拉取，支持 `?transport=udp` | 已支持 |
 | RTSP 推流转发 | HTTP API 向远端 RTSP 地址推流 | 已支持 |
@@ -76,10 +77,18 @@ Rust 实现的轻量级流媒体服务，以 `StreamManager` 为媒体中枢，�
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | H264 透传 | RTMP / RTSP / FLV / HLS / WebRTC 全链路 | 已支持 |
+| H265 / HEVC 透传 | RTMP / RTSP / FLV / HLS / WebRTC 全链路，支持 VPS/SPS/PPS 参数集传播 | 已支持 |
 | AAC 音频 | RTMP / RTSP / FLV / HLS 伴音 | 已支持 |
-| H265 / HEVC | VPS/SPS/PPS、RTSP/RTMP/HLS 全链路支持 | 规划中 |
+| Opus 音频 | WebRTC 推流音频接入 | 已支持 |
 | 视频转码 | 分辨率 / 码率 / 编码格式转换，输出衍生流（如 `live_sd`） | 规划中 |
 | 滤镜 | 水印、帧率控制等 | 规划中 |
+
+**H265 / HEVC 注意事项**
+
+- RTMP H265 使用 Enhanced RTMP HEVC 标签；ffmpeg / ffplay 推拉 H265 RTMP 时通常需要 `-rtmp_enhanced_codecs hvc1`。
+- RTSP H265 同时识别 `H265/90000` 和 `HEVC/90000` SDP 表达。
+- HLS H265 使用 MPEG-TS HEVC stream type `0x24`，关键帧会携带 VPS/SPS/PPS 以保证独立解码。
+- WebRTC H265 推流/播放依赖浏览器和系统能力；测试页会检测 `video/H265` 或 `video/HEVC` codec capability，不支持时会提示失败。
 
 ### 媒体处理
 

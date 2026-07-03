@@ -12,7 +12,7 @@ grep -E "Publishing|AVC SequenceHeader|play stream=|SEND.*H264" logs/media-serve
 grep -E "ANNOUNCE|RECORD|DESCRIBE|PLAY|Pull-UDP|First access" logs/media-server.log.*
 
 # WebRTC
-grep -E "WebRTC|Publish request|Play request|First published|First played" logs/media-server.log.*
+grep -E "WebRTC|Publish request|Play request|First published|First HEVC|First played" logs/media-server.log.*
 
 # 错误
 grep -Ei "StreamNotFound|not found|Connection error|failed" logs/media-server.log.*
@@ -51,8 +51,9 @@ lsof -i :9080    # WebRTC
 
 ### WebRTC 黑屏
 
-- 确认 `stream_id` 一致且已有 H264 关键帧
+- 确认 `stream_id` 一致且已有 H264/H265 关键帧
 - 跨协议播放等待 IDR：`[WebRTC] Play streaming started`
+- H265 推流/播放需浏览器支持 `video/H265` 或 `video/HEVC`
 
 ## API 检查
 

@@ -10,6 +10,7 @@ use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::track::track_remote::TrackRemote;
 
 use super::h264_util::{describe_annex_b, is_keyframe_annex_b, is_parameter_set_only};
+use super::hevc_rtp_ingest::HevcRtpIngest;
 use super::peer::{new_peer_connection, wire_pc_debug};
 use super::publish_signaling::{latest_keyframe_request_age_ms, register_publish_pli};
 use super::rtp_h264::{
@@ -20,8 +21,8 @@ use super::rtp_h264::{
 use super::sdp_h264::parse_sprop_parameter_sets;
 use super::signaling::ServerSignal;
 use crate::core::{
-    CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track,
-    VIDEO_RTP_CLOCK_RATE,
+    parse_hevc_sprop_fmtp, CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode,
+    Track, VIDEO_RTP_CLOCK_RATE,
 };
 use webrtc::api::API;
 
@@ -64,6 +65,16 @@ pub async fn start_publish(
             pps.len()
         );
         manager.set_stream_sps_pps(&stream_id, sps, pps);
+    }
+    if let Some((vps, sps, pps)) = parse_offer_hevc_sprop_parameter_sets(&offer_sdp) {
+        info!(
+            "[WebRTC] Publish primed HEVC VPS/SPS/PPS from offer SDP stream='{}' vps={} sps={} pps={}",
+            stream_id,
+            vps.len(),
+            sps.len(),
+            pps.len()
+        );
+        manager.set_stream_hevc_params(&stream_id, vps, sps, pps);
     }
 
     let manager_track = manager.clone();
@@ -165,6 +176,10 @@ fn parse_offer_tracks(sdp: &str) -> Vec<Track> {
             let codec_name = parts.next().unwrap_or("").to_ascii_lowercase();
             let codec = if media == "video" && codec_name.contains("h264") {
                 CodecType::H264
+            } else if media == "video"
+                && (codec_name.contains("h265") || codec_name.contains("hevc"))
+            {
+                CodecType::H265
             } else if media == "audio" && codec_name.contains("opus") {
                 CodecType::Opus
             } else if media == "audio" && codec_name.contains("mp4a") {
@@ -193,6 +208,20 @@ fn parse_offer_tracks(sdp: &str) -> Vec<Track> {
         tracks.push(Track::new(0, CodecType::H264, 96, 90_000));
     }
     tracks
+}
+
+fn parse_offer_hevc_sprop_parameter_sets(sdp: &str) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    for line in sdp.lines() {
+        let line = line.trim();
+        if !line.starts_with("a=fmtp:") {
+            continue;
+        }
+        let (vps, sps, pps) = parse_hevc_sprop_fmtp(line);
+        if let (Some(vps), Some(sps), Some(pps)) = (vps, sps, pps) {
+            return Some((vps, sps, pps));
+        }
+    }
+    None
 }
 
 async fn cleanup_failed_publish_setup(
@@ -229,22 +258,86 @@ async fn read_track_to_stream(
 
     if kind == RTPCodecType::Video {
         let mime = codec.capability.mime_type.to_lowercase();
-        if !mime.contains("h264") {
+        if mime.contains("h265") || mime.contains("hevc") {
+            register_publish_pli(&stream_id, pc, track.ssrc());
+            read_hevc_track(manager, stream_id, track).await
+        } else if mime.contains("h264") {
+            register_publish_pli(&stream_id, pc, track.ssrc());
+            read_h264_track(manager, stream_id, track).await
+        } else {
             warn!(
-                "[WebRTC] Incoming video codec is '{}' (expected H264). \
-                 WebRTC relay only supports H264; playback will fail. \
-                 Force H264 in the browser via setCodecPreferences.",
-                codec.capability.mime_type
+                "[WebRTC] Unsupported incoming video codec '{}' for stream='{}'",
+                codec.capability.mime_type, stream_id
             );
+            Ok(())
         }
-        register_publish_pli(&stream_id, pc, track.ssrc());
-        read_h264_track(manager, stream_id, track).await
     } else if kind == RTPCodecType::Audio {
         read_audio_track(manager, stream_id, track).await
     } else {
         warn!("[WebRTC] Unsupported track kind {:?}", kind);
         Ok(())
     }
+}
+
+async fn read_hevc_track(
+    manager: Arc<StreamManager>,
+    stream_id: String,
+    track: Arc<TrackRemote>,
+) -> Result<()> {
+    let mut ingest = HevcRtpIngest::new(manager.clone(), stream_id.clone(), "WebRTC");
+    let mut packets: u64 = 0;
+    let mut access_units: u64 = 0;
+    let mut empty_payloads: u64 = 0;
+    let mut expected_seq: Option<u16> = None;
+
+    while let Ok((pkt, _attrs)) = track.read_rtp().await {
+        if packets == 0 {
+            info!(
+                "[WebRTC] First HEVC RTP packet stream='{}' pt={} seq={} ts={} payload={}B hex={}",
+                stream_id,
+                pkt.header.payload_type,
+                pkt.header.sequence_number,
+                pkt.header.timestamp,
+                pkt.payload.len(),
+                hex_prefix(&pkt.payload, 16)
+            );
+        }
+        packets += 1;
+
+        if pkt.payload.is_empty() {
+            empty_payloads += 1;
+            continue;
+        }
+
+        let expected = expected_seq;
+        let seq_gap = expected
+            .map(|expected| pkt.header.sequence_number != expected)
+            .unwrap_or(false);
+        expected_seq = Some(pkt.header.sequence_number.wrapping_add(1));
+        if seq_gap {
+            warn!(
+                "[WebRTC] HEVC RTP sequence gap stream='{}' expected={:?} got={} ts={} payload={}B",
+                stream_id,
+                expected,
+                pkt.header.sequence_number,
+                pkt.header.timestamp,
+                pkt.payload.len()
+            );
+            ingest = HevcRtpIngest::new(manager.clone(), stream_id.clone(), "WebRTC");
+        }
+
+        if ingest.ingest_payload(&pkt.payload, pkt.header.timestamp, pkt.header.marker) {
+            access_units += 1;
+        }
+    }
+
+    let _ = manager.set_unpublished(&stream_id);
+    super::end_publish_media(&manager, &stream_id);
+    info!(
+        "[WebRTC] HEVC publish track ended stream='{}' packets={} access_units={} empty={}",
+        stream_id, packets, access_units, empty_payloads
+    );
+    Ok(())
 }
 
 async fn read_h264_track(
@@ -622,5 +715,46 @@ mod tests {
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0].codec, CodecType::H264);
         assert_eq!(tracks[1].codec, CodecType::Opus);
+    }
+
+    #[test]
+    fn parse_offer_tracks_accepts_h265_aliases() {
+        let h265_sdp = "v=0\r\n\
+                        m=video 9 UDP/TLS/RTP/SAVPF 127\r\n\
+                        a=rtpmap:127 H265/90000\r\n";
+        let hevc_sdp = "v=0\r\n\
+                        m=video 9 UDP/TLS/RTP/SAVPF 126\r\n\
+                        a=rtpmap:126 HEVC/90000\r\n";
+
+        let h265_tracks = parse_offer_tracks(h265_sdp);
+        let hevc_tracks = parse_offer_tracks(hevc_sdp);
+
+        assert_eq!(h265_tracks.len(), 1);
+        assert_eq!(h265_tracks[0].codec, CodecType::H265);
+        assert_eq!(h265_tracks[0].payload_type, 127);
+        assert_eq!(hevc_tracks.len(), 1);
+        assert_eq!(hevc_tracks[0].codec, CodecType::H265);
+        assert_eq!(hevc_tracks[0].payload_type, 126);
+    }
+
+    #[test]
+    fn parse_offer_hevc_sprop_parameter_sets_from_fmtp() {
+        let vps = [0x40, 0x01, 0x0c, 0x01];
+        let sps = [0x42, 0x01, 0x01, 0x60];
+        let pps = [0x44, 0x01, 0xc0, 0x73];
+        let fmtp = crate::core::hevc_sprop_from_nals(&vps, &sps, &pps);
+        let sdp = format!(
+            "v=0\r\n\
+             m=video 9 UDP/TLS/RTP/SAVPF 127\r\n\
+             a=rtpmap:127 H265/90000\r\n\
+             a=fmtp:127 {}\r\n",
+            fmtp
+        );
+
+        let parsed = parse_offer_hevc_sprop_parameter_sets(&sdp).expect("hevc sprop");
+
+        assert_eq!(parsed.0, vps);
+        assert_eq!(parsed.1, sps);
+        assert_eq!(parsed.2, pps);
     }
 }

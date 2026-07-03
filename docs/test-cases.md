@@ -14,7 +14,7 @@
 | 维度 | 说明 |
 |------|------|
 | 编码 | H264+AAC、H265+AAC |
-| 发布 | RTMP 推流、RTMP API 拉流、RTSP TCP/UDP 推流、RTSP API 拉流、WebRTC 推流（仅 H264） |
+| 发布 | RTMP 推流、RTMP API 拉流、RTSP TCP/UDP 推流、RTSP API 拉流、WebRTC 推流 |
 | 播放 | RTMP、RTSP、HTTP-FLV、HLS、WebRTC — 五种格式均须可播 |
 | 转码 | **不在本手册范围** |
 
@@ -35,6 +35,7 @@
 | TC-H265-PUB-04 | H265 | RTSP UDP 推流 | `h265_rtsp_udp` |
 | TC-H265-PUB-05 | H265 | RTSP API 拉流（TCP） | `h265_pull_rtsp` |
 | TC-H265-PUB-06 | H265 | RTSP API 拉流（UDP） | `h265_pull_udp` |
+| TC-H265-PUB-07 | H265 | WebRTC 推流 | `h265_webrtc` |
 
 ## 覆盖矩阵
 
@@ -50,7 +51,7 @@
 | RTSP API 拉流 UDP | ✓ | ✓ | ✓ | ✓ | ✓ |
 | WebRTC 推流 | ✓ | ✓ | ✓ | ✓ | ✓ |
 
-**H265** — 6 种发布 × 5 种播放 = 30 项验证（无 WebRTC 推流，浏览器尚不支持 H265 采集）
+**H265** — 7 种发布 × 5 种播放 = 35 项验证（WebRTC 推流/播放依赖浏览器 `video/H265` 或 `video/HEVC` 能力）
 
 | 发布 ↓ \ 播放 → | RTMP | RTSP | HTTP-FLV | HLS | WebRTC |
 |-----------------|------|------|----------|-----|--------|
@@ -60,6 +61,7 @@
 | RTSP UDP 推流 | ✓ | ✓ | ✓ | ✓ | ✓ |
 | RTSP API 拉流 TCP | ✓ | ✓ | ✓ | ✓ | ✓ |
 | RTSP API 拉流 UDP | ✓ | ✓ | ✓ | ✓ | ✓ |
+| WebRTC 推流 | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 ---
 
@@ -193,7 +195,8 @@ curl -X POST http://127.0.0.1:8081/api/rtsp/pull \
 #### WebRTC 推流
 
 1. 浏览器打开 `http://127.0.0.1:8081/webrtc/webrtc-test.html`
-2. `stream_id` 填 `{stream_id}`，点击「连接信令」→「开始推流」，允许摄像头/麦克风
+2. 选择视频编码 H264 或 H265/HEVC
+3. `stream_id` 填 `{stream_id}`，点击「连接信令」→「开始推流」，允许摄像头/麦克风
 
 ---
 
@@ -388,6 +391,7 @@ ffmpeg -rtmp_enhanced_codecs hvc1 -i rtmp://127.0.0.1:1935/live/$STREAM -t 5 -f 
 | TC-H265-PUB-04 | [RTSP UDP 推流](#rtsp-udp-推流-1) | `h265_rtsp_udp` | — | `[RTSP-Push-UDP] HEVC access unit` |
 | TC-H265-PUB-05 | [RTSP API 拉流（TCP）](#rtsp-api-拉流tcp-1) | `h265_pull_rtsp` | `h265_src_rtsp` | `[RTSP Puller] SUCCESS`、HEVC VPS/SPS/PPS |
 | TC-H265-PUB-06 | [RTSP API 拉流（UDP）](#rtsp-api-拉流udp-1) | `h265_pull_udp` | `h265_src_rtsp` | `[RTSP Puller] Transport: UDP`、HEVC 首帧 relay |
+| TC-H265-PUB-07 | [WebRTC 推流](#webrtc-推流) | `h265_webrtc` | — | `Publish: prefer H265/HEVC`、`First HEVC RTP packet` |
 
 **示例 — TC-H265-PUB-01：**
 
@@ -413,5 +417,5 @@ ffmpeg -rtmp_enhanced_codecs hvc1 -i rtmp://127.0.0.1:1935/live/$STREAM -t 5 -f 
 | H265 RTMP 推流失败 | ffmpeg ≥6 加 `-rtmp_enhanced_codecs hvc1`（勿用 `-tag:v hvc1`） |
 | H265 RTMP 播放黑屏 | ffplay 也须 `-rtmp_enhanced_codecs hvc1` |
 | H265 FLV/HLS 异常 | 检查 VPS/SPS/PPS 是否写入；HLS 视频流类型应为 `0x24` |
-| H265 WebRTC 无法播放 | 客户端 SDP 须含 HEVC/H265；多数 Chrome 不支持，优先验证 RTMP/RTSP/FLV/HLS |
+| H265 WebRTC 推流/播放失败 | 浏览器须支持 `video/H265` 或 `video/HEVC`；不支持时测试页会提示失败 |
 | 端口占用 | `lsof -i :1935` / `:554` / `:8081` / `:9080` |

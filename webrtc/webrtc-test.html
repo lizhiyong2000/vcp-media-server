@@ -5,16 +5,26 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>vcp-media-server WebRTC Test</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+    body { font-family: system-ui, sans-serif; max-width: 1120px; margin: 2rem auto; padding: 0 1rem; }
     h1 { font-size: 1.4rem; }
-    fieldset { margin-bottom: 1rem; }
+    fieldset { margin-bottom: 1rem; box-sizing: border-box; }
     label { display: block; margin: 0.4rem 0 0.2rem; }
-    input[type=text] { width: 100%; box-sizing: border-box; padding: 0.4rem; }
+    input[type=text], select { width: 100%; box-sizing: border-box; padding: 0.4rem; }
     button { margin: 0.3rem 0.3rem 0.3rem 0; padding: 0.4rem 0.8rem; }
-    video { width: 100%; max-width: 640px; background: #111; margin-top: 0.5rem; }
+    video { width: 100%; height: 100%; background: #111; object-fit: contain; display: block; }
     #log { background: #f4f4f4; padding: 0.5rem; height: 160px; overflow: auto; font-size: 0.85rem; white-space: pre-wrap; }
-    .row { display: flex; gap: 1rem; flex-wrap: wrap; }
-    .col { flex: 1; min-width: 280px; }
+    .row { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 1rem; align-items: stretch; }
+    .col { min-width: 0; }
+    .media-panel { height: 100%; display: flex; flex-direction: column; }
+    .panel-controls { min-height: 76px; display: grid; grid-template-columns: repeat(2, minmax(130px, 1fr)) auto auto; gap: 0.5rem; align-items: end; }
+    .panel-controls label { margin-top: 0; }
+    .control-field { min-width: 0; }
+    .video-box { margin-top: 0.5rem; aspect-ratio: 4 / 3; width: 100%; background: #111; }
+    @media (max-width: 760px) {
+      .row { grid-template-columns: 1fr; }
+      .panel-controls { grid-template-columns: 1fr; min-height: 0; }
+      button { width: 100%; margin-right: 0; }
+    }
   </style>
 </head>
 <body>
@@ -33,19 +43,49 @@
 
   <div class="row">
     <div class="col">
-      <fieldset>
+      <fieldset class="media-panel">
         <legend>推流 (Publish)</legend>
-        <button id="btnPublish" disabled>开始推流</button>
-        <button id="btnStopPublish" disabled>停止推流</button>
-        <video id="localVideo" autoplay muted playsinline></video>
+        <div class="panel-controls">
+            <div class="control-field">
+              <label for="publishSource">推流源</label>
+              <select id="publishSource">
+                <option value="camera">摄像头</option>
+                <option value="testsrc">测试信号</option>
+              </select>
+            </div>
+          <div class="control-field">
+            <label for="publishCodec">推流编码</label>
+            <select id="publishCodec">
+              <option value="h264">H264</option>
+              <option value="h265">H265 / HEVC</option>
+            </select>
+          </div>
+          <button id="btnPublish" disabled>开始推流</button>
+          <button id="btnStopPublish" disabled>停止推流</button>
+        </div>
+        <div class="video-box">
+          <video id="localVideo" autoplay muted playsinline></video>
+        </div>
       </fieldset>
     </div>
     <div class="col">
-      <fieldset>
+      <fieldset class="media-panel">
         <legend>播放 (Play)</legend>
-        <button id="btnPlay" disabled>开始播放</button>
-        <button id="btnStopPlay" disabled>停止播放</button>
-        <video id="remoteVideo" autoplay muted playsinline controls></video>
+        <div class="panel-controls">
+          <div class="control-field">
+            <label>播放源</label>
+            <input type="text" value="同一 stream_id" disabled>
+          </div>
+            <div class="control-field">
+              <label>播放模式</label>
+              <input type="text" value="实时播放" disabled>
+            </div>
+          <button id="btnPlay" disabled>开始播放</button>
+          <button id="btnStopPlay" disabled>停止播放</button>
+        </div>
+        <div class="video-box">
+          <video id="remoteVideo" autoplay muted playsinline controls></video>
+        </div>
       </fieldset>
     </div>
   </div>
@@ -77,6 +117,139 @@
     let publishVideoTrackRef = null;
     let keyframeRequestChain = Promise.resolve();
     let playGeneration = 0;
+      let testSignalCanvas = null;
+      let testSignalAnimationId = null;
+
+      function stopTestSignal() {
+        if (testSignalAnimationId) {
+          cancelAnimationFrame(testSignalAnimationId);
+          testSignalAnimationId = null;
+        }
+        testSignalCanvas = null;
+      }
+
+      function pad2(v) {
+        return String(v).padStart(2, '0');
+      }
+
+      function formatElapsed(ms) {
+        const total = Math.floor(ms / 1000);
+        const h = Math.floor(total / 3600);
+        const m = Math.floor((total % 3600) / 60);
+        const s = total % 60;
+        return `${pad2(h)}:${pad2(m)}:${pad2(s)}`;
+      }
+
+      function drawTestSignal(ctx, width, height, startedAt, frame) {
+        const elapsed = performance.now() - startedAt;
+        const colors = ['#ffffff', '#ffff00', '#00ffff', '#00ff00', '#ff00ff', '#ff0000', '#0000ff', '#111111'];
+        const barWidth = width / colors.length;
+
+        ctx.fillStyle = '#101010';
+        ctx.fillRect(0, 0, width, height);
+        for (let i = 0; i < colors.length; i += 1) {
+          ctx.fillStyle = colors[i];
+          ctx.fillRect(i * barWidth, 0, Math.ceil(barWidth), Math.floor(height * 0.62));
+        }
+
+        ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+        ctx.lineWidth = 1;
+        for (let x = 0; x <= width; x += 40) {
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, height);
+          ctx.stroke();
+        }
+        for (let y = 0; y <= height; y += 40) {
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(width, y);
+          ctx.stroke();
+        }
+
+        const lowerTop = Math.floor(height * 0.62);
+        const graySteps = 8;
+        for (let i = 0; i < graySteps; i += 1) {
+          const v = Math.floor((255 * i) / (graySteps - 1));
+          ctx.fillStyle = `rgb(${v},${v},${v})`;
+          ctx.fillRect(i * (width / graySteps), lowerTop, Math.ceil(width / graySteps), height - lowerTop);
+        }
+
+        const boxW = Math.floor(width * 0.72);
+        const boxH = Math.floor(height * 0.32);
+        const boxX = Math.floor((width - boxW) / 2);
+        const boxY = Math.floor(height * 0.34);
+        ctx.fillStyle = 'rgba(0,0,0,0.72)';
+        ctx.fillRect(boxX, boxY, boxW, boxH);
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(boxX, boxY, boxW, boxH);
+
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 34px system-ui, sans-serif';
+        ctx.fillText('VCP MEDIA SERVER TEST', width / 2, boxY + 46);
+        ctx.font = 'bold 58px ui-monospace, SFMono-Regular, Menlo, monospace';
+        ctx.fillText(formatElapsed(elapsed), width / 2, boxY + 118);
+
+        const now = new Date();
+        ctx.font = '24px ui-monospace, SFMono-Regular, Menlo, monospace';
+        ctx.fillStyle = '#00ff90';
+        ctx.fillText(
+          `${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}  frame=${frame}`,
+          width / 2,
+          boxY + 158
+        );
+
+        const sweepX = Math.floor((elapsed / 20) % width);
+        ctx.strokeStyle = '#ff2d2d';
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.moveTo(sweepX, 0);
+        ctx.lineTo(sweepX, height);
+        ctx.stroke();
+      }
+
+      function createTestSignalStream() {
+        const width = 640;
+        const height = 480;
+        const fps = 25;
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx || typeof canvas.captureStream !== 'function') {
+          throw new Error('当前浏览器不支持 Canvas captureStream 测试信号');
+        }
+
+        stopTestSignal();
+        testSignalCanvas = canvas;
+        const startedAt = performance.now();
+        let frame = 0;
+        const render = () => {
+          drawTestSignal(ctx, width, height, startedAt, frame);
+          frame += 1;
+          testSignalAnimationId = requestAnimationFrame(render);
+        };
+        render();
+
+        const stream = canvas.captureStream(fps);
+        const videoTrack = stream.getVideoTracks()[0];
+        if (videoTrack) videoTrack.contentHint = 'motion';
+        return stream;
+      }
+
+      async function createPublishStream() {
+        if ($('publishSource').value === 'testsrc') {
+          log('Publish source: 测试信号 640x480@25fps');
+          return createTestSignalStream();
+        }
+        log('Publish source: 摄像头 640x480@25fps');
+        return navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, frameRate: 25 },
+          audio: false,
+        });
+      }
 
     function publishVideoSender() {
       if (publishVideoSenderRef) return publishVideoSenderRef;
@@ -225,6 +398,7 @@
         try { publishPc.close(); } catch (_) {}
         publishPc = null;
       }
+        stopTestSignal();
       if (localStream) {
         localStream.getTracks().forEach((t) => t.stop());
         localStream = null;
@@ -312,6 +486,28 @@
         return m === 'video/rtx' || m === 'video/red' || m === 'video/ulpfec' || m === 'video/flexfec-03';
       });
       return [...h264, ...aux];
+    }
+
+    function h265CodecPreferences() {
+      const caps = RTCRtpSender.getCapabilities('video');
+      if (!caps) return [];
+      const h265 = caps.codecs.filter((c) => {
+        const m = c.mimeType.toLowerCase();
+        return m === 'video/h265' || m === 'video/hevc';
+      });
+      const aux = caps.codecs.filter((c) => {
+        const m = c.mimeType.toLowerCase();
+        return m === 'video/rtx' || m === 'video/red' || m === 'video/ulpfec' || m === 'video/flexfec-03';
+      });
+      return [...h265, ...aux];
+    }
+
+    function selectedPublishCodecPreferences() {
+      const codec = $('publishCodec').value;
+      if (codec === 'h265') {
+        return { codec, label: 'H265/HEVC', prefs: h265CodecPreferences() };
+      }
+      return { codec, label: 'H264', prefs: h264CodecPreferences() };
     }
 
     let pendingServerIce = [];
@@ -437,10 +633,7 @@
       const streamId = $('streamId').value.trim();
       if (!streamId) return log('请填写 stream_id');
       try {
-        localStream = await navigator.mediaDevices.getUserMedia({
-          video: { width: 640, height: 480, frameRate: 25 },
-          audio: false,
-        });
+          localStream = await createPublishStream();
         $('localVideo').srcObject = localStream;
         publishPc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
         wireIce(publishPc, 'publish');
@@ -457,10 +650,19 @@
         publishVideoTrackRef = videoTrack;
         const pubTr = publishPc.addTransceiver(videoTrack, { direction: 'sendonly' });
         publishVideoSenderRef = pubTr.sender;
-        const h264Prefs = h264CodecPreferences();
-        if (h264Prefs.length) {
-          pubTr.setCodecPreferences(h264Prefs);
-          log('Publish: prefer H264 (' + h264Prefs.filter(c => c.mimeType.includes('H264')).length + ' codecs)');
+        const { codec, label, prefs } = selectedPublishCodecPreferences();
+        if (prefs.length) {
+          pubTr.setCodecPreferences(prefs);
+          const primaryCount = prefs.filter((c) => {
+            const m = c.mimeType.toLowerCase();
+            return codec === 'h265'
+              ? (m === 'video/h265' || m === 'video/hevc')
+              : m === 'video/h264';
+          }).length;
+          log('Publish: prefer ' + label + ' (' + primaryCount + ' codecs)');
+        } else {
+          resetPublishState('推流失败: 当前浏览器不支持 ' + label);
+          return;
         }
         const offer = await publishPc.createOffer({
           offerToReceiveAudio: false,
