@@ -10,8 +10,11 @@ use tokio::process::Command;
 use tokio::time::{sleep, Instant};
 use tracing::{error, info, warn};
 
-use crate::core::live_play::{is_idr_frame, is_playable_video_frame, prepend_h264_config};
-use crate::core::{CodecType, MediaFrame, StreamManager, DEFAULT_SNAPSHOT_DIR};
+use crate::core::live_play::{is_idr_frame, is_playable_video_frame};
+use crate::core::{
+    ensure_annex_b, prepend_annex_b_config_if_needed, CodecType, MediaFrame, StreamManager,
+    DEFAULT_SNAPSHOT_DIR,
+};
 use crate::server::webrtc::request_publisher_keyframe;
 
 const DEFAULT_WAIT_KEYFRAME_MS: u64 = 1_000;
@@ -130,10 +133,12 @@ impl SnapshotManager {
     async fn capture_job(&self, id: String, req: CaptureSnapshotRequest) -> Result<()> {
         self.update_status(&id, "running");
         let frame = self.wait_latest_idr(&req.stream_id).await?;
-        if frame.codec != CodecType::H264 {
-            return Err(anyhow!("snapshot only supports H264 stream for now"));
+        if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
+            return Err(anyhow!("snapshot only supports H264/H265 video stream"));
         }
-        let prepared = prepare_h264_snapshot_frame(&self.stream_manager, &req.stream_id, frame);
+        let input_format = ffmpeg_raw_video_format(frame.codec)?;
+        let input_extension = raw_video_extension(frame.codec)?;
+        let prepared = prepare_video_snapshot_frame(&self.stream_manager, &req.stream_id, frame);
         let now = now_ms();
         let dir = self
             .config
@@ -144,11 +149,11 @@ impl SnapshotManager {
             .await
             .with_context(|| format!("create {}", dir.display()))?;
 
-        let h264_path = dir.join(format!("{id}.h264"));
+        let raw_path = dir.join(format!("{id}.{input_extension}"));
         let image_path = dir.join(format!("{id}.jpg"));
-        tokio::fs::write(&h264_path, &prepared.data)
+        tokio::fs::write(&raw_path, &prepared.data)
             .await
-            .with_context(|| format!("write {}", h264_path.display()))?;
+            .with_context(|| format!("write {}", raw_path.display()))?;
 
         let output = Command::new(&self.config.ffmpeg_path)
             .arg("-hide_banner")
@@ -156,9 +161,9 @@ impl SnapshotManager {
             .arg("error")
             .arg("-y")
             .arg("-f")
-            .arg("h264")
+            .arg(input_format)
             .arg("-i")
-            .arg(&h264_path)
+            .arg(&raw_path)
             .arg("-frames:v")
             .arg("1")
             .arg("-q:v")
@@ -167,7 +172,7 @@ impl SnapshotManager {
             .output()
             .await
             .with_context(|| format!("run {}", self.config.ffmpeg_path))?;
-        let _ = tokio::fs::remove_file(&h264_path).await;
+        let _ = tokio::fs::remove_file(&raw_path).await;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!("ffmpeg snapshot failed: {}", stderr.trim()));
@@ -206,18 +211,18 @@ impl SnapshotManager {
             }
             sleep(Duration::from_millis(50)).await;
         }
-        Err(anyhow!("no playable H264 keyframe available"))
+        Err(anyhow!("no playable H264/H265 keyframe available"))
     }
 
     fn latest_snapshot_frame(&self, stream_id: &str) -> Option<MediaFrame> {
         let hub = self.stream_manager.get_hub(stream_id)?;
         let frame = hub.latest_idr_frame()?;
-        if frame.codec != CodecType::H264 {
+        if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
             warn!(
                 "[Snapshot] unsupported codec stream='{}' codec={:?}",
                 stream_id, frame.codec
             );
-            return Some(frame);
+            return None;
         }
         if is_playable_video_frame(&frame) && is_idr_frame(&frame) {
             Some(frame)
@@ -264,12 +269,40 @@ impl SnapshotManager {
     }
 }
 
-fn prepare_h264_snapshot_frame(
+fn ffmpeg_raw_video_format(codec: CodecType) -> Result<&'static str> {
+    match codec {
+        CodecType::H264 => Ok("h264"),
+        CodecType::H265 => Ok("hevc"),
+        _ => Err(anyhow!("unsupported snapshot video codec: {:?}", codec)),
+    }
+}
+
+fn raw_video_extension(codec: CodecType) -> Result<&'static str> {
+    match codec {
+        CodecType::H264 => Ok("h264"),
+        CodecType::H265 => Ok("h265"),
+        _ => Err(anyhow!("unsupported snapshot video codec: {:?}", codec)),
+    }
+}
+
+fn prepare_video_snapshot_frame(
     manager: &StreamManager,
     stream_id: &str,
     frame: MediaFrame,
 ) -> MediaFrame {
-    let data = prepend_h264_config(manager, stream_id, &frame);
+    let au = ensure_annex_b(&frame.data);
+    let data = manager
+        .get_stream(&stream_id.to_string())
+        .map(|stream| {
+            prepend_annex_b_config_if_needed(
+                frame.codec,
+                stream.vps.as_deref(),
+                stream.sps.as_deref(),
+                stream.pps.as_deref(),
+                &au,
+            )
+        })
+        .unwrap_or(au);
     let prepared = MediaFrame::new(
         frame.stream_id,
         frame.track_id,
@@ -352,12 +385,62 @@ mod tests {
         )
         .with_clock_rate(VIDEO_RTP_CLOCK_RATE);
 
-        let prepared = prepare_h264_snapshot_frame(&manager, "s", frame);
+        let prepared = prepare_video_snapshot_frame(&manager, "s", frame);
 
         assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x67]));
         assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x68]));
         assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x65]));
         assert_eq!(prepared.clock_rate, Some(VIDEO_RTP_CLOCK_RATE));
+    }
+
+    #[test]
+    fn h265_snapshot_frame_prepends_vps_sps_pps() {
+        let manager = StreamManager::new();
+        manager.create_stream("s", StreamSourceMode::Push, StreamProtocol::WebRTC, None);
+        manager.set_stream_hevc_params(
+            "s",
+            vec![0x40, 0x01, 0x0c, 0x01],
+            vec![0x42, 0x01, 0x01, 0x60],
+            vec![0x44, 0x01, 0xc0, 0xf1],
+        );
+        let frame = MediaFrame::new(
+            "s".to_string(),
+            0,
+            90_000,
+            Bytes::from_static(&[0, 0, 0, 1, 0x26, 0x01, 0xaa]),
+            true,
+            CodecType::H265,
+        )
+        .with_clock_rate(VIDEO_RTP_CLOCK_RATE);
+
+        let prepared = prepare_video_snapshot_frame(&manager, "s", frame);
+
+        assert!(prepared
+            .data
+            .windows(8)
+            .any(|w| w == [0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01]));
+        assert!(prepared
+            .data
+            .windows(8)
+            .any(|w| w == [0, 0, 0, 1, 0x42, 0x01, 0x01, 0x60]));
+        assert!(prepared
+            .data
+            .windows(8)
+            .any(|w| w == [0, 0, 0, 1, 0x44, 0x01, 0xc0, 0xf1]));
+        assert!(prepared
+            .data
+            .windows(7)
+            .any(|w| w == [0, 0, 0, 1, 0x26, 0x01, 0xaa]));
+        assert_eq!(prepared.codec, CodecType::H265);
+        assert_eq!(prepared.clock_rate, Some(VIDEO_RTP_CLOCK_RATE));
+    }
+
+    #[test]
+    fn h265_snapshot_uses_hevc_raw_demuxer() {
+        assert_eq!(ffmpeg_raw_video_format(CodecType::H264).unwrap(), "h264");
+        assert_eq!(raw_video_extension(CodecType::H264).unwrap(), "h264");
+        assert_eq!(ffmpeg_raw_video_format(CodecType::H265).unwrap(), "hevc");
+        assert_eq!(raw_video_extension(CodecType::H265).unwrap(), "h265");
     }
 
     #[tokio::test]

@@ -11,10 +11,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use crate::core::live_play::prepend_h264_config;
 use crate::core::{
-    CodecType, DispatchError, DispatchPolicy, FlvPlayTimeline, MediaFrame, StreamManager,
-    DEFAULT_RECORD_DIR, MILLISECOND_CLOCK_RATE,
+    prepend_annex_b_config_if_needed, CodecType, DispatchError, DispatchPolicy, FlvPlayTimeline,
+    MediaFrame, StreamManager, DEFAULT_RECORD_DIR, MILLISECOND_CLOCK_RATE,
 };
 use crate::server::hls::ts_muxer::TsMuxer;
 
@@ -75,6 +74,7 @@ pub struct RecordingEntry {
     pub path: String,
     pub bytes: u64,
     pub video_frames: u64,
+    pub video_codec: Option<String>,
     pub audio_frames: u64,
     pub keyframes: u64,
     pub status: String,
@@ -175,6 +175,14 @@ impl RecorderManager {
                 .tracks
                 .iter()
                 .any(|track| matches!(track.codec, CodecType::H264 | CodecType::H265));
+        let declared_video_codec = stream
+            .tracks
+            .iter()
+            .find_map(|track| match track.codec {
+                CodecType::H264 | CodecType::H265 => Some(track.codec),
+                _ => None,
+            })
+            .unwrap_or(CodecType::H264);
         let declared_has_audio = stream.tracks.is_empty()
             || stream
                 .tracks
@@ -200,6 +208,7 @@ impl RecorderManager {
             segment_duration,
             align_keyframe,
             declared_has_video,
+            declared_video_codec,
             declared_has_audio,
             index: self.index.clone(),
             stop_rx,
@@ -253,6 +262,7 @@ struct RecordTask {
     segment_duration: Duration,
     align_keyframe: bool,
     declared_has_video: bool,
+    declared_video_codec: CodecType,
     declared_has_audio: bool,
     index: Arc<RwLock<Vec<RecordingEntry>>>,
     stop_rx: watch::Receiver<bool>,
@@ -346,7 +356,7 @@ impl SegmentWriter {
             started_at_ms,
             ended_at_ms: started_at_ms,
             has_video: task.declared_has_video,
-            video_codec: CodecType::H264,
+            video_codec: task.declared_video_codec,
             has_audio: task.declared_has_audio,
             video_frames: 0,
             audio_frames: 0,
@@ -371,9 +381,7 @@ impl SegmentWriter {
 
         let frame = if is_video {
             self.has_video = true;
-            if frame.codec == CodecType::H265 {
-                self.video_codec = CodecType::H265;
-            }
+            self.video_codec = frame.codec;
             self.video_frames += 1;
             if frame.is_keyframe {
                 self.keyframes += 1;
@@ -463,6 +471,7 @@ impl SegmentWriter {
             path: self.path.to_string_lossy().to_string(),
             bytes: self.bytes,
             video_frames: self.video_frames,
+            video_codec: self.has_video.then(|| video_codec_name(self.video_codec)),
             audio_frames: self.audio_frames,
             keyframes: self.keyframes,
             status: status.to_string(),
@@ -483,6 +492,15 @@ fn should_rotate(writer: &SegmentWriter, task: &RecordTask, frame: &MediaFrame) 
     matches!(frame.codec, CodecType::H264 | CodecType::H265) && frame.is_keyframe
 }
 
+fn video_codec_name(codec: CodecType) -> String {
+    match codec {
+        CodecType::H265 => "h265",
+        CodecType::H264 => "h264",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
 fn prepare_video_frame_for_record(
     manager: &StreamManager,
     stream_id: &str,
@@ -491,7 +509,19 @@ fn prepare_video_frame_for_record(
     if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
         return frame;
     }
-    let data = crate::core::live_play::prepend_video_config(manager, stream_id, &frame);
+    let au = crate::core::ensure_annex_b(&frame.data);
+    let data = manager
+        .get_stream(&stream_id.to_string())
+        .map(|stream| {
+            prepend_annex_b_config_if_needed(
+                frame.codec,
+                stream.vps.as_deref(),
+                stream.sps.as_deref(),
+                stream.pps.as_deref(),
+                &au,
+            )
+        })
+        .unwrap_or(au);
     let prepared = MediaFrame::new(
         frame.stream_id.clone(),
         frame.track_id,
@@ -577,7 +607,7 @@ impl FrameTimestampExt for MediaFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{StreamProtocol, StreamSourceMode, VIDEO_RTP_CLOCK_RATE};
+    use crate::core::{StreamProtocol, StreamSourceMode, Track, VIDEO_RTP_CLOCK_RATE};
 
     #[test]
     fn parses_ts_format_aliases() {
@@ -624,6 +654,105 @@ mod tests {
     }
 
     #[test]
+    fn record_h265_keyframe_prepends_vps_sps_pps() {
+        let manager = StreamManager::new();
+        manager.create_stream("s", StreamSourceMode::Push, StreamProtocol::WebRTC, None);
+        manager.set_stream_hevc_params(
+            "s",
+            vec![0x40, 0x01, 0x0c, 0x01],
+            vec![0x42, 0x01, 0x01, 0x60],
+            vec![0x44, 0x01, 0xc0, 0xf1],
+        );
+        let frame = MediaFrame::new(
+            "s".to_string(),
+            0,
+            90_000,
+            Bytes::from_static(&[0, 0, 0, 1, 0x26, 0x01, 0xaa]),
+            true,
+            CodecType::H265,
+        )
+        .with_clock_rate(VIDEO_RTP_CLOCK_RATE);
+
+        let prepared = prepare_video_frame_for_record(&manager, "s", frame);
+
+        assert!(prepared
+            .data
+            .windows(8)
+            .any(|w| w == [0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01]));
+        assert!(prepared
+            .data
+            .windows(8)
+            .any(|w| w == [0, 0, 0, 1, 0x42, 0x01, 0x01, 0x60]));
+        assert!(prepared
+            .data
+            .windows(8)
+            .any(|w| w == [0, 0, 0, 1, 0x44, 0x01, 0xc0, 0xf1]));
+        assert!(prepared
+            .data
+            .windows(7)
+            .any(|w| w == [0, 0, 0, 1, 0x26, 0x01, 0xaa]));
+        assert_eq!(prepared.codec, CodecType::H265);
+        assert_eq!(prepared.clock_rate, Some(VIDEO_RTP_CLOCK_RATE));
+    }
+
+    #[tokio::test]
+    async fn h265_recording_writes_hevc_pmt_even_when_audio_arrives_first() {
+        let manager = Arc::new(StreamManager::new());
+        manager.create_stream("s", StreamSourceMode::Push, StreamProtocol::WebRTC, None);
+        manager.set_stream_tracks(
+            "s",
+            vec![
+                Track::new(0, CodecType::H265, 96, VIDEO_RTP_CLOCK_RATE),
+                Track::new(1, CodecType::AAC, 97, 44_100),
+            ],
+        );
+
+        let base_dir = std::env::temp_dir().join(format!("vcp_record_h265_test_{}", now_ms()));
+        let index = Arc::new(RwLock::new(Vec::new()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let task = RecordTask {
+            stream_manager: manager,
+            stream_id: "s".to_string(),
+            session_id: "rec_h265".to_string(),
+            format: RecordFormat::Ts,
+            base_dir: base_dir.clone(),
+            segment_duration: Duration::from_secs(300),
+            align_keyframe: true,
+            declared_has_video: true,
+            declared_video_codec: CodecType::H265,
+            declared_has_audio: true,
+            index,
+            stop_rx,
+        };
+        let mut writer = SegmentWriter::new(&task).unwrap();
+        let audio = MediaFrame::new(
+            "s".to_string(),
+            1,
+            0,
+            Bytes::from_static(&[0x21, 0x10, 0x04, 0x60]),
+            false,
+            CodecType::AAC,
+        )
+        .with_clock_rate(44_100);
+
+        writer.write_frame(&task, audio).await.unwrap();
+        writer.file.flush().await.unwrap();
+        let data = tokio::fs::read(&writer.path).await.unwrap();
+        let pmt = data.get(188..376).expect("PAT and PMT TS packets");
+
+        assert!(
+            pmt.windows(5).any(|w| w == [0x24, 0x01, 0x00, 0xF0, 0x00]),
+            "PMT should declare HEVC stream_type 0x24 for video PID"
+        );
+        assert_eq!(
+            writer.build_entry("recording").video_codec.as_deref(),
+            Some("h265")
+        );
+
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
     fn index_upsert_updates_existing_entry() {
         let index = Arc::new(RwLock::new(Vec::new()));
         let mut entry = RecordingEntry {
@@ -637,6 +766,7 @@ mod tests {
             path: "seg1.ts".to_string(),
             bytes: 0,
             video_frames: 0,
+            video_codec: Some("h265".to_string()),
             audio_frames: 0,
             keyframes: 0,
             status: "recording".to_string(),
