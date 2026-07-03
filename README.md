@@ -118,13 +118,36 @@ cargo build
 ./target/debug/vcp-media-server
 ```
 
-**跨协议自动化回归：**
+**单元测试：**
 
 ```bash
-scripts/cross_protocol_regression.sh
+cargo test
 ```
 
-默认覆盖 H264/H265 的 RTMP、RTSP TCP、RTSP UDP、RTMP API 拉流、RTSP API 拉流 TCP/UDP 发布，并验证 RTMP、RTSP、HTTP-FLV、HLS 播放。WebRTC 推流/播放依赖浏览器和系统 codec 能力，仍通过 `webrtc/webrtc-test.html` 做浏览器端验证。
+**集成测试（跨协议回归）：**
+
+```bash
+# 运行所有集成测试
+cargo test --test integration_tests
+
+# 运行特定测试模块
+cargo test --test integration_tests h264
+cargo test --test integration_tests h265
+
+# 运行跨协议矩阵测试
+cargo test --test integration_tests codec_matrix
+```
+
+集成测试覆盖：
+
+| 测试维度 | 覆盖范围 |
+|----------|----------|
+| 视频编码 | H264, H265 |
+| 发布方式 | RTMP 推流模拟, RTSP 发布模拟, API Push |
+| 播放方式 | RTMP, RTSP, HTTP-FLV, HLS |
+| 跨协议 | 任一发布方式 → 所有播放方式 |
+
+WebRTC 推流/播放依赖浏览器和系统 codec 能力，通过 `webrtc/webrtc-test.html` 做浏览器端验证。
 
 ## 待办清单
 
