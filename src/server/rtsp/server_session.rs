@@ -1,6 +1,6 @@
 use anyhow::Result;
 use bytes::BytesMut;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,13 +11,13 @@ use tracing::{debug, error, info, warn};
 use super::common::{
     extract_track_id, extract_transport, format_rtsp_message, is_udp_transport, RtspCommon,
 };
-use super::play_egress::{
-    egress_rtp_packets, is_idr, prime_rtsp_play, recv_coalesced_play_frame, PlayRtpTimeline,
-};
+use super::play_egress::{egress_rtp_packets, is_idr, prime_rtsp_play, PlayRtpTimeline};
 use super::{RtspRequest, RtspResponse, RtspServer, RtspSession, TransportMode};
 use crate::core::dispatch::DispatchError;
-use crate::core::{CodecType, DispatchPolicy, MediaFrame, StreamManager, Track, AAC_DEFAULT_CLOCK_RATE};
 use crate::core::hevc_sprop_from_nals;
+use crate::core::{
+    CodecType, DispatchPolicy, MediaFrame, StreamManager, Track, AAC_DEFAULT_CLOCK_RATE,
+};
 use crate::server::webrtc::{H264RtpIngest, HevcRtpIngest};
 
 pub struct RtspServerSession {
@@ -155,24 +155,26 @@ impl RtspServerSession {
                 track_id, stream_id, peer_addr
             );
             let mut buffer = vec![0u8; 65535];
-            let mut h264_ingest = if track_id == 0 && video_codec_for_track(&session_tracks, 0) != CodecType::H265 {
-                Some(H264RtpIngest::new(
-                    manager.clone(),
-                    stream_id.clone(),
-                    "RTSP-Push-UDP",
-                ))
-            } else {
-                None
-            };
-            let mut hevc_ingest = if track_id == 0 && video_codec_for_track(&session_tracks, 0) == CodecType::H265 {
-                Some(HevcRtpIngest::new(
-                    manager.clone(),
-                    stream_id.clone(),
-                    "RTSP-Push-UDP",
-                ))
-            } else {
-                None
-            };
+            let mut h264_ingest =
+                if track_id == 0 && video_codec_for_track(&session_tracks, 0) != CodecType::H265 {
+                    Some(H264RtpIngest::new(
+                        manager.clone(),
+                        stream_id.clone(),
+                        "RTSP-Push-UDP",
+                    ))
+                } else {
+                    None
+                };
+            let mut hevc_ingest =
+                if track_id == 0 && video_codec_for_track(&session_tracks, 0) == CodecType::H265 {
+                    Some(HevcRtpIngest::new(
+                        manager.clone(),
+                        stream_id.clone(),
+                        "RTSP-Push-UDP",
+                    ))
+                } else {
+                    None
+                };
 
             loop {
                 match RtspCommon::receive_rtp_over_udp(&rtp_socket, &mut buffer).await {
@@ -221,7 +223,6 @@ impl RtspServerSession {
                                 is_keyframe: marker,
                                 codec,
                                 rtp_data: Some(buffer[..len].to_vec().into()),
-                                rtmp_payload: None,
                             };
                             manager.publish_frame(frame);
                         }
@@ -855,7 +856,6 @@ impl RtspServerSession {
                 is_keyframe: marker,
                 codec,
                 rtp_data: Some(data.to_vec().into()),
-                rtmp_payload: None,
             };
             self.manager.publish_frame(frame);
         } else {
@@ -1004,7 +1004,7 @@ impl RtspServerSession {
 
             manager.ensure_stream_hub(&stream_id);
             if let Some(mut reader) =
-                manager.dispatch_subscribe(&stream_id, DispatchPolicy::LiveCoalesce)
+                manager.dispatch_subscribe(&stream_id, DispatchPolicy::LiveSequential)
             {
                 info!(
                     "[RTSP] [{}] Successfully subscribed to stream hub",
@@ -1018,14 +1018,21 @@ impl RtspServerSession {
                     std::collections::HashMap::new();
                 let mut pending: Option<MediaFrame> =
                     prime_rtsp_play(&mut reader, &manager, &stream_id).await;
+                let mut pending_batch: VecDeque<MediaFrame> = VecDeque::new();
                 let mut await_video_idr = pending.is_none();
 
                 'rtp: loop {
                     let frame = if let Some(f) = pending.take() {
                         f
+                    } else if let Some(f) = pending_batch.pop_front() {
+                        f
                     } else {
-                        match recv_coalesced_play_frame(&mut reader).await {
-                            Ok(f) => f,
+                        match reader.recv_batch().await {
+                            Ok(frames) if !frames.is_empty() => {
+                                pending_batch = frames.into();
+                                continue;
+                            }
+                            Ok(_) => continue,
                             Err(DispatchError::Closed) => break 'rtp,
                         }
                     };

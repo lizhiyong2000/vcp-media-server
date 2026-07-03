@@ -121,12 +121,11 @@ impl StreamManager {
                 if let Some(track) = stream.tracks.iter_mut().find(|t| t.id == 0) {
                     track.codec = CodecType::H265;
                 } else {
-                    stream.tracks.insert(0, Track::new(0, CodecType::H265, 96, 90_000));
+                    stream
+                        .tracks
+                        .insert(0, Track::new(0, CodecType::H265, 96, 90_000));
                 }
-                info!(
-                    "[Core] Setting HEVC VPS/SPS/PPS for stream {}",
-                    stream_id
-                );
+                info!("[Core] Setting HEVC VPS/SPS/PPS for stream {}", stream_id);
             });
         }
     }

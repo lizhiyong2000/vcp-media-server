@@ -386,9 +386,9 @@ impl SegmentWriter {
         };
 
         if !self.header_written {
-            let header = self
-                .muxer
-                .generate_pat_pmt(self.has_video, self.has_audio, self.video_codec);
+            let header =
+                self.muxer
+                    .generate_pat_pmt(self.has_video, self.has_audio, self.video_codec);
             self.write_bytes(&header).await?;
             self.header_written = true;
         }

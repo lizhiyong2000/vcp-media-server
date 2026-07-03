@@ -11,10 +11,27 @@ use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+};
+
+pub const MIME_TYPE_H265: &str = "video/H265";
 
 pub fn create_api() -> Result<Arc<API>> {
     let mut media_engine = MediaEngine::default();
     media_engine.register_default_codecs()?;
+    media_engine.register_codec(
+        RTCRtpCodecParameters {
+            capability: RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H265.to_owned(),
+                clock_rate: 90_000,
+                ..Default::default()
+            },
+            payload_type: 127,
+            ..Default::default()
+        },
+        RTPCodecType::Video,
+    )?;
 
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media_engine)?;

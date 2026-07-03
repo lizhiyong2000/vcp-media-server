@@ -6,11 +6,11 @@ use tracing::info;
 
 use super::dispatch::{last_playable_idr_seq, DispatchError, DispatchReader};
 use super::{CodecType, MediaFrame, StreamManager};
-use crate::server::webrtc::h264_util::{
-    contains_sps_or_pps_nalu, ensure_annex_b,
+use crate::core::{
+    is_keyframe_annex_b, is_parameter_set_only as param_only, prepend_annex_b_config,
 };
-use crate::server::webrtc::{request_publisher_keyframe};
-use crate::core::{prepend_annex_b_config, is_keyframe_annex_b, is_parameter_set_only as param_only};
+use crate::server::webrtc::h264_util::{contains_sps_or_pps_nalu, ensure_annex_b};
+use crate::server::webrtc::request_publisher_keyframe;
 
 const LIVE_IDR_WAIT: Duration = Duration::from_millis(800);
 
@@ -23,6 +23,9 @@ pub fn is_playable_video_frame(frame: &MediaFrame) -> bool {
 }
 
 pub fn is_idr_frame(frame: &MediaFrame) -> bool {
+    if frame.codec == CodecType::H265 {
+        return is_keyframe_annex_b(frame.codec, &ensure_annex_b(&frame.data));
+    }
     frame.is_keyframe || is_keyframe_annex_b(frame.codec, &ensure_annex_b(&frame.data))
 }
 
@@ -109,6 +112,9 @@ pub async fn prime_live_play(
                         idr.timestamp,
                         idr.data.len()
                     );
+                    if let Some(idr_seq) = reader.hub().latest_idr_seq() {
+                        reader.begin_video_catchup_after_idr(idr_seq, reader.hub().latest_seq());
+                    }
                     return Some(prepare_h264_play_frame(manager, stream_id, idr.clone()));
                 }
             }
@@ -156,5 +162,57 @@ pub async fn recv_coalesced_play_frame(
         {
             return Ok(frame);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{DispatchPolicy, StreamHub};
+    use bytes::Bytes;
+
+    fn hevc_idr(ts: u64) -> MediaFrame {
+        MediaFrame::new(
+            "s".into(),
+            0,
+            ts,
+            Bytes::from_static(&[0, 0, 0, 1, 0x26, 0x01, 0xaf]),
+            true,
+            CodecType::H265,
+        )
+    }
+
+    fn hevc_p(ts: u64) -> MediaFrame {
+        MediaFrame::new(
+            "s".into(),
+            0,
+            ts,
+            Bytes::from_static(&[0, 0, 0, 1, 0x02, 0x01, 0xaf]),
+            false,
+            CodecType::H265,
+        )
+    }
+
+    #[tokio::test]
+    async fn prime_live_play_preserves_h265_frames_after_idr_in_same_batch() {
+        let hub = StreamHub::new("s");
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::LiveSequential);
+        let manager = StreamManager::new();
+
+        let publisher = hub.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            publisher.publish(hevc_idr(1));
+            publisher.publish(hevc_p(2));
+        });
+
+        let idr = prime_live_play(&mut reader, &manager, "s", "TEST")
+            .await
+            .expect("prime should return fresh H265 IDR");
+        assert_eq!(idr.timestamp, 1);
+
+        let batch = reader.recv_batch().await.expect("reader remains open");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].timestamp, 2);
     }
 }

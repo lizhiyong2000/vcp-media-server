@@ -2,7 +2,7 @@
 /// Generates PAT, PMT, and PES packets for HLS segments.
 use bytes::Bytes;
 
-use crate::core::{CodecType, MediaFrame, prepare_video_au_for_ts};
+use crate::core::{prepare_video_au_for_ts, CodecType, MediaFrame};
 
 /// AAC sample rate index (44100 Hz)
 const AAC_SAMPLE_RATE_INDEX: u8 = 4;

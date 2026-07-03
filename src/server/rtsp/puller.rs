@@ -300,7 +300,6 @@ impl RtspPuller {
                         is_keyframe: marker,
                         codec,
                         rtp_data: None,
-                        rtmp_payload: None,
                     };
                     manager.publish_frame(frame);
                     frame_count += 1;
@@ -406,7 +405,6 @@ impl RtspPuller {
                                     is_keyframe: marker,
                                     codec: CodecType::AAC,
                                     rtp_data: None,
-                                    rtmp_payload: None,
                                 };
                                 manager.publish_frame(frame);
                                 frame_count += 1;

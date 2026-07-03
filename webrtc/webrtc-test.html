@@ -495,10 +495,9 @@
         const thisPc = playPc;
         wireIce(playPc, 'play');
         const playTr = playPc.addTransceiver('video', { direction: 'recvonly' });
-        const h264Prefs = h264CodecPreferences();
-        if (h264Prefs.length) {
-          playTr.setCodecPreferences(h264Prefs);
-          log('Play: prefer H264');
+        const playCaps = RTCRtpReceiver.getCapabilities('video');
+        if (playCaps?.codecs?.length) {
+          log('Play: receiver codecs=' + playCaps.codecs.map((c) => c.mimeType).join(','));
         }
         const remoteStream = new MediaStream();
         $('remoteVideo').srcObject = remoteStream;

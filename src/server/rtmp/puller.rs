@@ -12,9 +12,9 @@ use super::amf0::{self, Amf0Value};
 use super::chunk::{self, ChunkAssembler, ChunkHeader};
 use crate::core::{
     hvcc_payload_to_annex_b, is_keyframe_annex_b, parse_enhanced_hevc_video_message,
-    parse_hevc_decoder_config_record, RTMP_PKT_CODED_FRAMES, RTMP_PKT_CODED_FRAMES_X,
-    RTMP_PKT_SEQUENCE_START, CodecType, MediaFrame, StreamManager, StreamProtocol,
-    StreamSourceMode, MILLISECOND_CLOCK_RATE,
+    parse_hevc_decoder_config_record, CodecType, MediaFrame, StreamManager, StreamProtocol,
+    StreamSourceMode, MILLISECOND_CLOCK_RATE, RTMP_PKT_CODED_FRAMES, RTMP_PKT_CODED_FRAMES_X,
+    RTMP_PKT_SEQUENCE_START,
 };
 
 #[derive(Debug, Clone)]
@@ -581,7 +581,7 @@ fn video_payload_to_frame(data: &[u8], stream_id: &str, timestamp: u32) -> Optio
         if annex_b.is_empty() {
             return None;
         }
-        let is_keyframe = enhanced.is_keyframe || is_keyframe_annex_b(CodecType::H265, &annex_b);
+        let is_keyframe = is_keyframe_annex_b(CodecType::H265, &annex_b);
         return Some(
             MediaFrame::new(
                 stream_id.to_string(),

@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 
-use super::{CodecType, MediaFrame, StreamId, TrackId};
+use super::{is_keyframe_annex_b, CodecType, MediaFrame, StreamId, TrackId};
 
 pub const DEFAULT_CAPACITY_FRAMES: usize = 512;
 pub const DEFAULT_CAPACITY_BYTES: usize = 32 * 1024 * 1024;
@@ -26,7 +26,6 @@ pub struct StoredFrame {
     pub codec: CodecType,
     pub is_keyframe: bool,
     pub data: Bytes,
-    pub rtmp_payload: Option<Bytes>,
 }
 
 impl StoredFrame {
@@ -40,7 +39,6 @@ impl StoredFrame {
             self.codec,
         )
         .with_optional_clock_rate(self.clock_rate)
-        .with_rtmp_payload_opt(self.rtmp_payload.clone())
     }
 }
 
@@ -88,7 +86,6 @@ impl FrameRing {
             codec: frame.codec,
             is_keyframe: frame.is_keyframe,
             data: frame.data,
-            rtmp_payload: frame.rtmp_payload,
         };
         self.bytes_used += bytes;
         self.slots.push_back(stored);
@@ -200,29 +197,13 @@ pub fn is_video_keyframe(frame: &MediaFrame) -> bool {
     if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
         return false;
     }
+    if frame.codec == CodecType::H265 {
+        return is_keyframe_annex_b(frame.codec, &frame.data);
+    }
     if frame.is_keyframe {
         return true;
     }
-    annex_b_contains_idr(&frame.data)
-}
-
-fn annex_b_contains_idr(data: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 4 < data.len() {
-        let (start_len, nal_off) = if data[i..].starts_with(&[0, 0, 0, 1]) {
-            (4, i + 4)
-        } else if i + 3 < data.len() && data[i..i + 3] == [0, 0, 1] {
-            (3, i + 3)
-        } else {
-            i += 1;
-            continue;
-        };
-        if nal_off < data.len() && (data[nal_off] & 0x1F) == 5 {
-            return true;
-        }
-        i += start_len;
-    }
-    false
+    is_keyframe_annex_b(frame.codec, &frame.data)
 }
 
 pub fn is_playable_video(frame: &MediaFrame) -> bool {
@@ -246,6 +227,28 @@ mod tests {
         )
     }
 
+    fn hevc_idr_frame(seq_ts: u64, key: bool) -> MediaFrame {
+        MediaFrame::new(
+            "s1".into(),
+            0,
+            seq_ts,
+            Bytes::from(vec![0, 0, 0, 1, 0x26, 0x01, 0xaf]),
+            key,
+            CodecType::H265,
+        )
+    }
+
+    fn hevc_cra_frame(seq_ts: u64, key: bool) -> MediaFrame {
+        MediaFrame::new(
+            "s1".into(),
+            0,
+            seq_ts,
+            Bytes::from(vec![0, 0, 0, 1, 0x2a, 0x01, 0xaf]),
+            key,
+            CodecType::H265,
+        )
+    }
+
     #[test]
     fn push_assigns_monotonic_seq() {
         let mut ring = FrameRing::new();
@@ -262,6 +265,24 @@ mod tests {
         ring.push(video_frame(3, true));
         ring.push(video_frame(4, false));
         assert_eq!(ring.snap(SnapMode::LatestIdr), 2);
+    }
+
+    #[test]
+    fn h265_idr_is_detected_even_when_frame_flag_is_missing() {
+        let mut ring = FrameRing::new();
+        ring.push(video_frame(1, true));
+        let seq = ring.push(hevc_idr_frame(2, false));
+
+        assert_eq!(ring.latest_idr_seq(), Some(seq));
+    }
+
+    #[test]
+    fn h265_cra_is_treated_as_keyframe_even_when_only_bitstream_indicates_it() {
+        let mut ring = FrameRing::new();
+        ring.push(video_frame(1, true));
+        let cra_seq = ring.push(hevc_cra_frame(2, false));
+
+        assert_eq!(ring.latest_idr_seq(), Some(cra_seq));
     }
 
     #[test]

@@ -8,8 +8,8 @@ use tracing::info;
 use super::frame_ring::{is_playable_video, is_video_keyframe, SnapMode};
 use super::stream_hub::StreamHub;
 use super::timestamp::media_frame_timestamp_delta_ms;
-use super::{CodecType, MediaFrame, StreamManager};
-use crate::server::webrtc::{h264_util::is_keyframe_annex_b, request_publisher_keyframe};
+use super::{is_keyframe_annex_b, CodecType, MediaFrame, StreamManager};
+use crate::server::webrtc::request_publisher_keyframe;
 
 /// Max frames per batch for sequential muxers (HLS); keeps pace with live ingest.
 const MAX_SEQUENTIAL_BATCH: u64 = 96;
@@ -484,7 +484,13 @@ impl DispatchReader {
 }
 
 fn is_playable_idr(frame: &MediaFrame) -> bool {
-    is_playable_video(frame) && (frame.is_keyframe || is_keyframe_annex_b(&frame.data))
+    if !is_playable_video(frame) {
+        return false;
+    }
+    if frame.codec == CodecType::H265 {
+        return is_keyframe_annex_b(frame.codec, &frame.data);
+    }
+    frame.is_keyframe || is_keyframe_annex_b(frame.codec, &frame.data)
 }
 
 pub fn last_playable_idr_seq(hub: &StreamHub, from_seq: u64, to_seq: u64) -> Option<u64> {

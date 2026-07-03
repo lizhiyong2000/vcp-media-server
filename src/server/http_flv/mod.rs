@@ -127,6 +127,16 @@ fn stream_has_codec(stream: &Stream, codec: CodecType) -> bool {
     stream.tracks.iter().any(|track| track.codec == codec)
 }
 
+pub fn stream_has_video_sequence_header(stream: &Stream) -> bool {
+    if stream_has_codec(stream, CodecType::H265) {
+        stream.vps.is_some() && stream.sps.is_some() && stream.pps.is_some()
+    } else if stream_has_codec(stream, CodecType::H264) {
+        stream.sps.is_some() && stream.pps.is_some()
+    } else {
+        false
+    }
+}
+
 /// Generate onMetaData script tag
 fn generate_metadata_tag(stream_id: &str, has_video: bool, has_audio: bool) -> Vec<u8> {
     let mut data = Vec::new();
@@ -267,10 +277,7 @@ impl HttpFlvSession {
             if has_audio {
                 data.extend(generate_aac_sequence_header());
             }
-            if has_video
-                && (stream.sps.is_some()
-                    || (stream_has_codec(stream, CodecType::H265) && stream.vps.is_some()))
-            {
+            if has_video && stream_has_video_sequence_header(stream) {
                 self.sequence_header_sent = true;
             } else if !has_video && has_audio {
                 self.sequence_header_sent = true;
@@ -414,6 +421,44 @@ mod tests {
         assert!(
             data.windows(4).any(|w| w == [0x08, 0x00, 0x00, 0x04]),
             "AAC sequence tag should be present when stream has AAC"
+        );
+    }
+
+    #[test]
+    fn h265_stream_requires_vps_sps_pps_before_sequence_header_is_complete() {
+        let mut stream =
+            publishing_stream_with_tracks(vec![Track::new(0, CodecType::H265, 96, 90_000)]);
+        stream.vps = None;
+        stream.sps = Some(vec![0x42, 0x01, 0x01, 0x60]);
+        stream.pps = Some(vec![0x44, 0x01, 0xc0, 0x73]);
+        let mut session = HttpFlvSession::new("h265");
+
+        let data = session.generate_initial_data(&stream);
+
+        assert!(!stream_has_video_sequence_header(&stream));
+        assert!(session.needs_sequence_headers());
+        assert!(
+            !data.windows(4).any(|w| w == crate::core::HEVC_FOURCC),
+            "HEVC sequence header must not be emitted without VPS/SPS/PPS"
+        );
+    }
+
+    #[test]
+    fn h265_initial_data_contains_enhanced_hevc_sequence_header() {
+        let mut stream =
+            publishing_stream_with_tracks(vec![Track::new(0, CodecType::H265, 96, 90_000)]);
+        stream.vps = Some(vec![0x40, 0x01, 0x0c, 0x01]);
+        stream.sps = Some(vec![0x42, 0x01, 0x01, 0x60]);
+        stream.pps = Some(vec![0x44, 0x01, 0xc0, 0x73]);
+        let mut session = HttpFlvSession::new("h265");
+
+        let data = session.generate_initial_data(&stream);
+
+        assert!(stream_has_video_sequence_header(&stream));
+        assert!(!session.needs_sequence_headers());
+        assert!(
+            data.windows(4).any(|w| w == crate::core::HEVC_FOURCC),
+            "HEVC sequence header should carry hvc1 FourCC"
         );
     }
 }

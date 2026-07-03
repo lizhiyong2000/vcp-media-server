@@ -573,7 +573,10 @@ impl RtspServer {
                     "[RTSP] [{}] Building H265 SDP without VPS/SPS/PPS",
                     stream_id
                 );
-                format!("a=fmtp:{} profile-space=0;profile-id=1;tier-flag=0;level-id=93\r\n", payload_type)
+                format!(
+                    "a=fmtp:{} profile-space=0;profile-id=1;tier-flag=0;level-id=93\r\n",
+                    payload_type
+                )
             }
         };
 

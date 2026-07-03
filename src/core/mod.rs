@@ -37,14 +37,15 @@ pub use timestamp::{
     AAC_DEFAULT_CLOCK_RATE, MILLISECOND_CLOCK_RATE, VIDEO_RTP_CLOCK_RATE,
 };
 pub use video_codec::{
-    build_enhanced_rtmp_hevc_sequence_header, build_rtmp_hevc_sequence_header, build_rtmp_video_from_annex_b, contains_hevc_idr,
-    contains_h264_idr, ensure_annex_b, extract_hevc_param_sets, extract_h264_sps_pps, hevc_sprop_from_nals,
-    hvcc_payload_to_annex_b, is_enhanced_rtmp_video, is_keyframe_annex_b, is_parameter_set_only,
-    merge_annex_b_nalu_config, packetize_hevc_access_unit_for_rtp,
-    parse_enhanced_hevc_video_message, parse_hevc_decoder_config_record, parse_hevc_sprop_fmtp,
-    prepend_annex_b_config, prepare_video_au_for_ts, HevcFuReassembler, H265_NAL_PPS,
-    H265_NAL_SPS, H265_NAL_VPS, FLV_IS_EX_HEADER, FLV_FRAME_KEY, FLV_FRAME_INTER, HEVC_FOURCC,
-    RTMP_PKT_CODED_FRAMES, RTMP_PKT_CODED_FRAMES_X, RTMP_PKT_SEQUENCE_START,
+    build_enhanced_rtmp_hevc_sequence_header, build_rtmp_hevc_sequence_header,
+    build_rtmp_video_from_annex_b, contains_h264_idr, contains_hevc_idr, ensure_annex_b,
+    extract_h264_sps_pps, extract_hevc_param_sets, hevc_sprop_from_nals, hvcc_payload_to_annex_b,
+    is_enhanced_rtmp_video, is_keyframe_annex_b, is_parameter_set_only, merge_annex_b_nalu_config,
+    packetize_hevc_access_unit_for_rtp, parse_enhanced_hevc_video_message,
+    parse_hevc_decoder_config_record, parse_hevc_sprop_fmtp, prepare_video_au_for_ts,
+    prepend_annex_b_config, HevcFuReassembler, FLV_FRAME_INTER, FLV_FRAME_KEY, FLV_IS_EX_HEADER,
+    H265_NAL_PPS, H265_NAL_SPS, H265_NAL_VPS, HEVC_FOURCC, RTMP_PKT_CODED_FRAMES,
+    RTMP_PKT_CODED_FRAMES_X, RTMP_PKT_SEQUENCE_START,
 };
 
 pub type StreamId = String;
@@ -355,8 +356,6 @@ pub struct MediaFrame {
     pub is_keyframe: bool,
     pub codec: CodecType,
     pub rtp_data: Option<Bytes>,
-    /// Original RTMP video/audio tag body for bit-exact relay (Enhanced RTMP HEVC).
-    pub rtmp_payload: Option<Bytes>,
 }
 
 impl MediaFrame {
@@ -377,7 +376,6 @@ impl MediaFrame {
             is_keyframe,
             codec,
             rtp_data: None,
-            rtmp_payload: None,
         }
     }
 
@@ -393,16 +391,6 @@ impl MediaFrame {
 
     pub fn with_rtp_data(mut self, rtp_data: Bytes) -> Self {
         self.rtp_data = Some(rtp_data);
-        self
-    }
-
-    pub fn with_rtmp_payload(mut self, rtmp_payload: Bytes) -> Self {
-        self.rtmp_payload = Some(rtmp_payload);
-        self
-    }
-
-    pub fn with_rtmp_payload_opt(mut self, rtmp_payload: Option<Bytes>) -> Self {
-        self.rtmp_payload = rtmp_payload;
         self
     }
 }

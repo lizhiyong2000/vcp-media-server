@@ -20,7 +20,7 @@ use crate::core::{
     MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, StreamStatus,
     MILLISECOND_CLOCK_RATE,
 };
-use crate::server::webrtc::{request_publisher_keyframe};
+use crate::server::webrtc::request_publisher_keyframe;
 use chunk::RtmpMessage;
 use session::{RtmpSession, SessionState};
 
@@ -494,16 +494,17 @@ impl RtmpServer {
                                 let annex_b =
                                     crate::core::hvcc_payload_to_annex_b(enhanced.payload);
                                 if !annex_b.is_empty() {
+                                    let is_keyframe =
+                                        crate::core::is_keyframe_annex_b(CodecType::H265, &annex_b);
                                     let frame = MediaFrame::new(
                                         conn.stream_id.clone(),
                                         0,
                                         msg.timestamp as u64,
                                         Bytes::from(annex_b),
-                                        enhanced.is_keyframe,
+                                        is_keyframe,
                                         CodecType::H265,
                                     )
-                                    .with_clock_rate(MILLISECOND_CLOCK_RATE)
-                                    .with_rtmp_payload(Bytes::copy_from_slice(data));
+                                    .with_clock_rate(MILLISECOND_CLOCK_RATE);
                                     conn.stream_manager.publish_frame(frame);
                                 }
                             }
@@ -1015,7 +1016,7 @@ impl RtmpServer {
                     );
                     if let Some(mut reader) = conn
                         .stream_manager
-                        .dispatch_subscribe(&play_stream_id, DispatchPolicy::LiveCoalesce)
+                        .dispatch_subscribe(&play_stream_id, DispatchPolicy::LiveSequential)
                     {
                         info!(
                             "[RTMP] [{}] PLAY subscribe stream='{}' latest_seq={} latest_idr={:?}",
@@ -1047,12 +1048,8 @@ impl RtmpServer {
                         if let (Some(ref vps), Some(ref sps), Some(ref pps)) =
                             (&stream.vps, &stream.sps, &stream.pps)
                         {
-                            if stream.vps.is_some()
-                                || stream_has_codec(&stream, CodecType::H265)
-                            {
-                                let hevc_header = if let Some(hvcc) =
-                                    &stream.hevc_decoder_config
-                                {
+                            if stream.vps.is_some() || stream_has_codec(&stream, CodecType::H265) {
+                                let hevc_header = if let Some(hvcc) = &stream.hevc_decoder_config {
                                     crate::core::build_enhanced_rtmp_hevc_sequence_header(hvcc)
                                 } else {
                                     session::build_hevc_sequence_header(vps, sps, pps)
@@ -1192,10 +1189,8 @@ impl RtmpServer {
                                     if frame.codec == CodecType::AAC && frame.data.len() < 8 {
                                         continue;
                                     }
-                                    let data = if frame.codec == CodecType::H265 {
-                                        if let Some(relay) = &frame.rtmp_payload {
-                                            relay.to_vec()
-                                        } else {
+                                    let data = match frame.codec {
+                                        CodecType::H264 | CodecType::H265 => {
                                             session::frame_to_rtmp_video(
                                                 &prepend_rtmp_video_config(
                                                     &manager_for_play,
@@ -1204,18 +1199,8 @@ impl RtmpServer {
                                                 ),
                                             )
                                         }
-                                    } else {
-                                        match frame.codec {
-                                            CodecType::H264 => session::frame_to_rtmp_video(
-                                                &prepend_rtmp_video_config(
-                                                    &manager_for_play,
-                                                    &stream_id_for_play,
-                                                    &frame,
-                                                ),
-                                            ),
-                                            CodecType::AAC => session::frame_to_rtmp_audio(&frame),
-                                            _ => continue,
-                                        }
+                                        CodecType::AAC => session::frame_to_rtmp_audio(&frame),
+                                        _ => continue,
                                     };
                                     if data.is_empty() {
                                         continue;
@@ -1565,6 +1550,21 @@ mod tests {
         Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x88, 0x84])
     }
 
+    fn annex_b_hevc_idr() -> Bytes {
+        Bytes::from_static(&[0, 0, 0, 1, 0x26, 0x01, 0xaf, 0x09])
+    }
+
+    fn annex_b_hevc_cra() -> Bytes {
+        Bytes::from_static(&[0, 0, 0, 1, 0x2a, 0x01, 0xaf, 0x09])
+    }
+
+    fn annex_b_hevc_config_and_idr() -> Bytes {
+        Bytes::from_static(&[
+            0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01, 0, 0, 0, 1, 0x42, 0x01, 0x01, 0x60, 0, 0, 0, 1,
+            0x44, 0x01, 0xc0, 0x73, 0, 0, 0, 1, 0x26, 0x01, 0xaf, 0x09,
+        ])
+    }
+
     #[test]
     fn prepend_rtmp_video_config_adds_sps_pps_to_keyframe() {
         let manager = StreamManager::new();
@@ -1579,5 +1579,71 @@ mod tests {
         assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x65]));
         assert_eq!(prepared.timestamp, frame.timestamp);
         assert!(prepared.is_keyframe);
+    }
+
+    #[test]
+    fn h265_frame_to_rtmp_video_uses_enhanced_hevc_tag() {
+        let frame = MediaFrame::new(
+            "s".into(),
+            0,
+            90_000,
+            annex_b_hevc_idr(),
+            true,
+            CodecType::H265,
+        );
+
+        let data = session::frame_to_rtmp_video(&frame);
+
+        assert_eq!(
+            data[0],
+            crate::core::FLV_IS_EX_HEADER
+                | crate::core::FLV_FRAME_KEY
+                | crate::core::RTMP_PKT_CODED_FRAMES
+        );
+        assert_eq!(&data[1..5], &crate::core::HEVC_FOURCC);
+        assert_eq!(&data[5..8], &[0, 0, 0]);
+        assert!(crate::core::parse_enhanced_hevc_video_message(&data).is_some());
+    }
+
+    #[test]
+    fn h265_frame_to_rtmp_video_marks_cra_as_keyframe() {
+        let frame = MediaFrame::new(
+            "s".into(),
+            0,
+            90_000,
+            annex_b_hevc_cra(),
+            true,
+            CodecType::H265,
+        );
+
+        let data = session::frame_to_rtmp_video(&frame);
+
+        assert_eq!(
+            data[0],
+            crate::core::FLV_IS_EX_HEADER
+                | crate::core::FLV_FRAME_KEY
+                | crate::core::RTMP_PKT_CODED_FRAMES
+        );
+    }
+
+    #[test]
+    fn h265_frame_to_rtmp_video_filters_parameter_sets_from_media_frame() {
+        let frame = MediaFrame::new(
+            "s".into(),
+            0,
+            90_000,
+            annex_b_hevc_config_and_idr(),
+            true,
+            CodecType::H265,
+        );
+
+        let data = session::frame_to_rtmp_video(&frame);
+        let parsed = crate::core::parse_enhanced_hevc_video_message(&data).expect("hevc frame");
+        let annex_b = crate::core::hvcc_payload_to_annex_b(parsed.payload);
+
+        assert!(crate::core::contains_hevc_idr(&annex_b));
+        assert!(!annex_b.windows(5).any(|w| w == [0, 0, 0, 1, 0x40]));
+        assert!(!annex_b.windows(5).any(|w| w == [0, 0, 0, 1, 0x42]));
+        assert!(!annex_b.windows(5).any(|w| w == [0, 0, 0, 1, 0x44]));
     }
 }

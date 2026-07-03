@@ -14,7 +14,9 @@ use crate::process::analysis::{AnalysisManager, StartAnalysisRequest, StopAnalys
 use crate::process::record::{RecorderManager, StartRecordRequest, StopRecordRequest};
 use crate::process::snapshot::{CaptureSnapshotRequest, SnapshotManager};
 use crate::server::hls::HlsServer;
-use crate::server::http_flv::{format_chunk, HttpFlvServer, HttpFlvSession};
+use crate::server::http_flv::{
+    format_chunk, stream_has_video_sequence_header, HttpFlvServer, HttpFlvSession,
+};
 use crate::server::rtmp::RtmpPuller;
 use crate::server::rtsp::{RtspPuller, RtspPusher};
 use crate::server::webrtc::request_publisher_keyframe;
@@ -243,7 +245,7 @@ impl HttpServer {
                             manager.get_hub(stream_id).and_then(|hub| hub.latest_idr_seq())
                         );
                         let mut reader = match manager
-                            .dispatch_subscribe(stream_id, DispatchPolicy::LiveCoalesce)
+                            .dispatch_subscribe(stream_id, DispatchPolicy::LiveSequential)
                         {
                             Some(r) => r,
                             None => {
@@ -255,12 +257,13 @@ impl HttpServer {
                             }
                         };
 
-                        // Wait for SPS/PPS before responding so players can probe codecs
+                        // Wait for video parameter sets before responding so players can probe codecs.
+                        // H265 needs VPS/SPS/PPS; H264 needs SPS/PPS.
                         let deadline = Instant::now() + Duration::from_secs(5);
-                        while stream.sps.is_none() || stream.pps.is_none() {
+                        while !stream_has_video_sequence_header(&stream) {
                             if Instant::now() >= deadline {
                                 warn!(
-                                    "[HTTP-FLV] [{}] stream not ready after={}ms: waiting for SPS/PPS",
+                                    "[HTTP-FLV] [{}] stream not ready after={}ms: waiting for video sequence header",
                                     stream_id,
                                     play_started_at.elapsed().as_millis()
                                 );

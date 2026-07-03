@@ -95,8 +95,7 @@ impl HevcRtpIngest {
         for part in &self.batch.parts {
             combined.extend_from_slice(part);
         }
-        let is_keyframe =
-            self.batch.is_keyframe || is_keyframe_annex_b(CodecType::H265, &combined);
+        let is_keyframe = self.batch.is_keyframe || is_keyframe_annex_b(CodecType::H265, &combined);
         if is_parameter_set_only(CodecType::H265, &combined) {
             self.batch.parts.clear();
             self.batch.is_keyframe = false;

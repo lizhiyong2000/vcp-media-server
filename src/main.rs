@@ -331,8 +331,7 @@ async fn main() -> Result<()> {
     info!("  HTTP:  http://localhost:{}", config.server.http.port);
     info!(
         "  HLS:   http://localhost:{}/hls/<stream_id>/live.m3u8 (dir: {})",
-        config.server.http.port,
-        hls_config.output_dir
+        config.server.http.port, hls_config.output_dir
     );
     if record_config.enabled {
         info!(

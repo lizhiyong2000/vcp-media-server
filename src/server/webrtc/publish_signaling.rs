@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 
@@ -103,18 +103,23 @@ pub fn request_publisher_keyframe(stream_id: &str) -> bool {
     static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
     let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let started_at = Instant::now();
-    let (tx, pli_tx) = {
+    let Some((tx, pli_tx)) = ({
         let mut map = map().lock();
-        let entry = map.entry(stream_id.to_string()).or_insert_with(|| Entry {
-            tx: None,
-            pli_tx: None,
-            last_request: None,
-        });
+        let entry = map.get_mut(stream_id);
+        let Some(entry) = entry else {
+            debug!(
+                "[WebRTC] keyframe_request id={} skipped stream='{}' reason=no_webrtc_publisher",
+                request_id, stream_id
+            );
+            return false;
+        };
         entry.last_request = Some(KeyframeRequestRecord {
             id: request_id,
             at: Instant::now(),
         });
-        (entry.tx.clone(), entry.pli_tx.clone())
+        Some((entry.tx.clone(), entry.pli_tx.clone()))
+    }) else {
+        return false;
     };
     let mut pli_queued = false;
     let mut signaling_sent = false;
@@ -143,8 +148,8 @@ pub fn request_publisher_keyframe(stream_id: &str) -> bool {
     }
 
     let Some(tx) = tx else {
-        warn!(
-            "[WebRTC] keyframe_request id={} no publish signaling for stream='{}' — is the publisher page connected?",
+        debug!(
+            "[WebRTC] keyframe_request id={} no signaling channel for stream='{}'",
             request_id, stream_id
         );
         info!(
@@ -189,4 +194,33 @@ pub fn latest_keyframe_request_age_ms(stream_id: &str) -> Option<(u64, u128)> {
         .get(stream_id)
         .and_then(|entry| entry.last_request)
         .map(|record| (record.id, record.at.elapsed().as_millis()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyframe_request_without_webrtc_publisher_does_not_create_entry() {
+        let stream_id = "no_webrtc_publisher_stream";
+        map().lock().remove(stream_id);
+
+        assert!(!request_publisher_keyframe(stream_id));
+        assert!(latest_keyframe_request_age_ms(stream_id).is_none());
+    }
+
+    #[test]
+    fn keyframe_request_with_signaling_sends_need_keyframe() {
+        let stream_id = "webrtc_signaling_stream";
+        map().lock().remove(stream_id);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        register_publish_signaling(stream_id, tx);
+
+        assert!(request_publisher_keyframe(stream_id));
+        assert!(latest_keyframe_request_age_ms(stream_id).is_some());
+        assert!(matches!(rx.try_recv(), Ok(ServerSignal::NeedKeyframe)));
+
+        unregister_publish_signaling(stream_id);
+    }
 }

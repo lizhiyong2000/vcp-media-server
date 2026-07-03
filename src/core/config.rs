@@ -258,8 +258,14 @@ max_files = 5
         .unwrap();
 
         assert_eq!(config.hls_output_dir(), "/data/hls");
-        assert_eq!(config.record_output_dir(), PathBuf::from("/data/recordings"));
-        assert_eq!(config.snapshot_output_dir(), PathBuf::from("/data/snapshots"));
+        assert_eq!(
+            config.record_output_dir(),
+            PathBuf::from("/data/recordings")
+        );
+        assert_eq!(
+            config.snapshot_output_dir(),
+            PathBuf::from("/data/snapshots")
+        );
     }
 
     #[test]
@@ -295,8 +301,14 @@ max_files = 5
         .unwrap();
 
         assert_eq!(config.hls_output_dir(), "/custom/hls");
-        assert_eq!(config.record_output_dir(), PathBuf::from("/custom/recordings"));
-        assert_eq!(config.snapshot_output_dir(), PathBuf::from("/custom/snapshots"));
+        assert_eq!(
+            config.record_output_dir(),
+            PathBuf::from("/custom/recordings")
+        );
+        assert_eq!(
+            config.snapshot_output_dir(),
+            PathBuf::from("/custom/snapshots")
+        );
     }
 
     #[test]
