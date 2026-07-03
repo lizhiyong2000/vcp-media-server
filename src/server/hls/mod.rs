@@ -225,12 +225,11 @@ impl HlsSession {
                 };
                 self.session_last_raw_audio = Some(frame.timestamp);
 
-                // RTSP AAC packetization is not guaranteed to be one AAC frame per RTP packet.
-                // Keep audio close enough to the video live edge so TS demuxers do not infer a
-                // huge program duration from divergent audio/video PTS ranges.
-                let min_audio_ms = self.session_video_mux_ms.saturating_sub(200);
-                let max_audio_ms = self.session_video_mux_ms.saturating_add(100);
-                let clamped = pts.clamp(min_audio_ms, max_audio_ms);
+                // ffplay default sync uses audio as master. AAC must not lead the video mux
+                // timeline (PCR / video PES timestamps) or playback stalls waiting for video.
+                let video_edge = self.session_video_mux_ms;
+                let min_audio_ms = self.segment_open_mux_ms_at_split;
+                let clamped = pts.clamp(min_audio_ms, video_edge);
                 self.session_audio_mux_ms = clamped;
                 debug!(
                     "[HLS] [{}] AAC PTS map: raw_ts={} prev_raw_ts={:?} prev_mux_ms={} ideal_mux_ms={} clamped_mux_ms={} video_mux_ms={} segment_open_ms={} segment_last_video_ms={}",
@@ -276,12 +275,12 @@ impl HlsSession {
     }
 
     fn prepare_frame_for_mux(&mut self, frame: &MediaFrame) -> MediaFrame {
-        let ts = self.mux_timestamp_ms(frame);
+        let mux_ms = self.mux_timestamp_ms(frame);
         let key = is_hls_video_keyframe(frame);
         MediaFrame::new(
             frame.stream_id.clone(),
             frame.track_id,
-            ts,
+            mux_ms,
             frame.data.clone(),
             key,
             frame.codec,
@@ -498,12 +497,14 @@ impl HlsSession {
                 frame.timestamp,
                 is_hls_video_keyframe(frame)
             );
-            // Prime PCR to the keyframe PTS before the first PES (avoids DTS 0 at segment open).
+            // Prime PCR to the keyframe mux time before the first PES.
             let mux_frame = self.prepare_frame_for_mux(frame);
             self.segment_last_mux_ms = mux_frame.timestamp;
             self.segment_last_idr_mux_ms = mux_frame.timestamp;
             self.muxer.update_pcr(mux_frame.timestamp);
-            let ts_data = self.muxer.frame_to_ts(&mux_frame);
+            let ts_data = self
+                .muxer
+                .frame_to_ts_with_timing(&mux_frame, mux_frame.timestamp, None);
             debug!(
                 "[HLS] [{}] Mux split keyframe: raw_ts={} mux_ms={} ts_bytes={} segment_last_video_ms={}",
                 self.stream_id,
@@ -524,7 +525,9 @@ impl HlsSession {
             }
         }
         self.muxer.update_pcr(mux_frame.timestamp);
-        let ts_data = self.muxer.frame_to_ts(&mux_frame);
+        let ts_data = self
+            .muxer
+            .frame_to_ts_with_timing(&mux_frame, mux_frame.timestamp, None);
         debug!(
             "[HLS] [{}] Mux frame: codec={:?} raw_ts={} mux_ms={} keyframe={} ts_bytes={} segment_last_video_ms={} buffer_before={}",
             self.stream_id,
@@ -693,6 +696,17 @@ impl HlsServer {
             );
             let mut frame_count: u64 = 0;
 
+            let (segment_tx, mut segment_rx) = tokio::sync::mpsc::unbounded_channel();
+            {
+                let writer_sessions = sessions_clone.clone();
+                let writer_stream_id = stream_id_owned.clone();
+                tokio::spawn(async move {
+                    while let Some(commit) = segment_rx.recv().await {
+                        commit_hls_segment(&writer_stream_id, &writer_sessions, commit).await;
+                    }
+                });
+            }
+
             reader.finish_prime();
             request_publisher_keyframe(&stream_id_owned);
 
@@ -776,60 +790,19 @@ impl HlsServer {
                         }
                     };
 
-                    // Write segment to disk outside of lock
+                    // Queue segment commit so mux keeps pace with ingest.
                     if let Some((data, filename, duration, seq, pdt, discontinuity, output_dir)) =
                         segment_to_write
                     {
-                        let filepath = output_dir.join(&filename);
-                        let tmp_path = output_dir.join(format!("{}.part", filename));
-                        let write_ok = if let Err(e) = fs::write(&tmp_path, &data).await {
-                            error!("[HLS] [{}] Failed to write segment: {}", stream_id_owned, e);
-                            false
-                        } else if let Err(e) = fs::rename(&tmp_path, &filepath).await {
-                            error!(
-                                "[HLS] [{}] Failed to finalize segment: {}",
-                                stream_id_owned, e
-                            );
-                            let _ = fs::remove_file(&tmp_path).await;
-                            false
-                        } else {
-                            debug!(
-                                "[HLS] [{}] Wrote segment: {} ({:.2}s, {} bytes)",
-                                stream_id_owned,
-                                filename,
-                                duration,
-                                data.len()
-                            );
-                            true
-                        };
-
-                        if write_ok {
-                            info!(
-                                "[HLS] [{}] Committed segment {} ({:.2}s, {} bytes)",
-                                stream_id_owned,
-                                filename,
-                                duration,
-                                data.len()
-                            );
-                            let playlist_update = {
-                                let sessions = sessions_clone.read();
-                                sessions.get(&stream_id_owned).map(|s| {
-                                    let mut sess = s.write();
-                                    sess.playlist.add_segment(duration, seq, pdt, discontinuity);
-                                    let prune =
-                                        seq.saturating_sub(sess.playlist.max_segments() as u64 + 2);
-                                    (sess.get_playlist(), prune)
-                                })
-                            };
-                            if let Some((content, prune_before)) = playlist_update {
-                                let m3u8_path = output_dir.join("live.m3u8");
-                                let tmp = output_dir.join("live.m3u8.part");
-                                if fs::write(&tmp, &content).await.is_ok() {
-                                    let _ = fs::rename(&tmp, &m3u8_path).await;
-                                }
-                                prune_old_segments(&output_dir, prune_before).await;
-                            }
-                        }
+                        let _ = segment_tx.send(SegmentCommit {
+                            data,
+                            filename,
+                            duration,
+                            seq,
+                            pdt,
+                            discontinuity,
+                            output_dir,
+                        });
                     }
 
                     if frame_count % 100 == 0 {
@@ -930,6 +903,78 @@ impl HlsServer {
     /// Get the output directory for HLS files
     pub fn output_dir(&self) -> &str {
         &self.config.output_dir
+    }
+}
+
+struct SegmentCommit {
+    data: Vec<u8>,
+    filename: String,
+    duration: f64,
+    seq: u64,
+    pdt: SystemTime,
+    discontinuity: bool,
+    output_dir: PathBuf,
+}
+
+async fn commit_hls_segment(
+    stream_id: &str,
+    sessions: &Arc<RwLock<HashMap<String, Arc<RwLock<HlsSession>>>>>,
+    commit: SegmentCommit,
+) {
+    let filepath = commit.output_dir.join(&commit.filename);
+    let tmp_path = commit.output_dir.join(format!("{}.part", commit.filename));
+    let write_ok = if let Err(e) = fs::write(&tmp_path, &commit.data).await {
+        error!("[HLS] [{}] Failed to write segment: {}", stream_id, e);
+        false
+    } else if let Err(e) = fs::rename(&tmp_path, &filepath).await {
+        error!("[HLS] [{}] Failed to finalize segment: {}", stream_id, e);
+        let _ = fs::remove_file(&tmp_path).await;
+        false
+    } else {
+        debug!(
+            "[HLS] [{}] Wrote segment: {} ({:.2}s, {} bytes)",
+            stream_id,
+            commit.filename,
+            commit.duration,
+            commit.data.len()
+        );
+        true
+    };
+
+    if !write_ok {
+        return;
+    }
+
+    info!(
+        "[HLS] [{}] Committed segment {} ({:.2}s, {} bytes)",
+        stream_id,
+        commit.filename,
+        commit.duration,
+        commit.data.len()
+    );
+    let playlist_update = {
+        let sessions = sessions.read();
+        sessions.get(stream_id).map(|s| {
+            let mut sess = s.write();
+            sess.playlist.add_segment(
+                commit.duration,
+                commit.seq,
+                commit.pdt,
+                commit.discontinuity,
+            );
+            let prune = commit
+                .seq
+                .saturating_sub(sess.playlist.max_segments() as u64 + 2);
+            (sess.get_playlist(), prune)
+        })
+    };
+    if let Some((content, prune_before)) = playlist_update {
+        let m3u8_path = commit.output_dir.join("live.m3u8");
+        let tmp = commit.output_dir.join("live.m3u8.part");
+        if fs::write(&tmp, &content).await.is_ok() {
+            let _ = fs::rename(&tmp, &m3u8_path).await;
+        }
+        prune_old_segments(&commit.output_dir, prune_before).await;
     }
 }
 
@@ -1189,6 +1234,51 @@ mod playback_tests {
         );
         assert!(session.on_frame(&idr).unwrap().is_none());
         assert!(session.on_frame(&p).unwrap().is_none());
+    }
+
+    #[test]
+    fn h265_reordered_rtp_maps_to_monotonic_mux_timeline() {
+        let config = temp_hls_config("h265_mux");
+        let mut session = HlsSession::new("t", &config).unwrap();
+        let raw = [
+            RTP_BASE,
+            RTP_BASE + 4 * FRAME_TICKS,
+            RTP_BASE + 2 * FRAME_TICKS,
+            RTP_BASE + FRAME_TICKS,
+            RTP_BASE + 3 * FRAME_TICKS,
+        ];
+        let mut mux_ms = Vec::new();
+
+        for (idx, ts) in raw.into_iter().enumerate() {
+            let frame = h265_frame(ts, idx == 0).with_clock_rate(crate::core::VIDEO_RTP_CLOCK_RATE);
+            mux_ms.push(session.prepare_frame_for_mux(&frame).timestamp);
+        }
+
+        assert_eq!(mux_ms, vec![0, 40, 80, 120, 160]);
+    }
+
+    #[test]
+    fn h265_interleaved_audio_never_runs_ahead_of_video_mux() {
+        let config = temp_hls_config("h265_av");
+        let mut session = HlsSession::new("t", &config).unwrap();
+        let mut audio_ts = 1_424_000_000u64;
+
+        for i in 0..50u64 {
+            let video = h265_frame(RTP_BASE + i * FRAME_TICKS, i % 25 == 0)
+                .with_clock_rate(crate::core::VIDEO_RTP_CLOCK_RATE);
+            let video_mux = session.prepare_frame_for_mux(&video);
+
+            let audio = rtsp_aac_frame(audio_ts).with_clock_rate(44_100);
+            audio_ts += 1024;
+            let audio_mux = session.prepare_frame_for_mux(&audio);
+
+            assert!(
+                audio_mux.timestamp <= video_mux.timestamp,
+                "AAC mux {} must not lead HEVC mux {} at frame {i}",
+                audio_mux.timestamp,
+                video_mux.timestamp
+            );
+        }
     }
 
     #[test]

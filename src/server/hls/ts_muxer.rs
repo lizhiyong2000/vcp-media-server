@@ -206,6 +206,16 @@ impl TsMuxer {
 
     /// Wrap a media frame into PES packets inside TS packets
     pub fn frame_to_ts(&mut self, frame: &MediaFrame) -> Vec<u8> {
+        self.frame_to_ts_with_timing(frame, frame.timestamp, None)
+    }
+
+    /// Wrap a media frame using separate presentation/decode timestamps.
+    pub fn frame_to_ts_with_timing(
+        &mut self,
+        frame: &MediaFrame,
+        pts_ms: u64,
+        dts_ms: Option<u64>,
+    ) -> Vec<u8> {
         let pid = match frame.codec {
             CodecType::H264 | CodecType::H265 => VIDEO_PID,
             CodecType::AAC | CodecType::Opus | CodecType::G711 => AUDIO_PID,
@@ -226,13 +236,13 @@ impl TsMuxer {
         let frame_for_pes = MediaFrame::new(
             frame.stream_id.clone(),
             frame.track_id,
-            frame.timestamp,
+            pts_ms,
             Bytes::from(payload),
             frame.is_keyframe,
             frame.codec,
         );
         let frame_for_pes = frame_for_pes.with_optional_clock_rate(frame.clock_rate);
-        let pes = build_pes(&frame_for_pes, is_video);
+        let pes = build_pes(&frame_for_pes, is_video, dts_ms);
 
         let cc = if is_video {
             &mut self.continuity_counter_video
@@ -285,7 +295,7 @@ fn starts_with_aud(data: &[u8]) -> bool {
 }
 
 /// Build a PES (Packetized Elementary Stream) packet
-fn build_pes(frame: &MediaFrame, is_video: bool) -> Vec<u8> {
+fn build_pes(frame: &MediaFrame, is_video: bool, dts_ms: Option<u64>) -> Vec<u8> {
     let mut pes = Vec::new();
     pes.push(0x00);
     pes.push(0x00);
@@ -295,10 +305,16 @@ fn build_pes(frame: &MediaFrame, is_video: bool) -> Vec<u8> {
     pes.push(stream_id);
 
     // PES_packet_length covers the 3-byte fixed header (flags + pes_header_data_length)
-    // plus optional fields (PTS = 5 bytes) and elementary-stream payload.
+    // plus optional fields (PTS = 5 bytes, optional DTS = 5 bytes) and elementary-stream payload.
     const PES_FIXED_HEADER_LEN: usize = 3;
-    const PTS_FIELD_LEN: usize = 5;
-    let pes_body_len = PES_FIXED_HEADER_LEN + PTS_FIELD_LEN + frame.data.len();
+    const TS_FIELD_LEN: usize = 5;
+    let has_dts = is_video && dts_ms.is_some_and(|dts| dts != frame.timestamp);
+    let optional_len = if has_dts {
+        TS_FIELD_LEN * 2
+    } else {
+        TS_FIELD_LEN
+    };
+    let pes_body_len = PES_FIXED_HEADER_LEN + optional_len + frame.data.len();
 
     if pes_body_len <= 0xFFFF {
         pes.push(((pes_body_len >> 8) & 0xFF) as u8);
@@ -314,10 +330,15 @@ fn build_pes(frame: &MediaFrame, is_video: bool) -> Vec<u8> {
         flags1 |= 0x04; // data_alignment_indicator
     }
     pes.push(flags1);
-    pes.push(0x80); // '10' + PTS only
-    pes.push(PTS_FIELD_LEN as u8);
+    pes.push(if has_dts { 0xC0 } else { 0x80 }); // PTS/DTS or PTS only
+    pes.push(optional_len as u8);
 
-    write_pes_timestamp(&mut pes, 0x20, frame.timestamp);
+    if let Some(dts) = dts_ms.filter(|dts| has_dts && *dts != frame.timestamp) {
+        write_pes_timestamp(&mut pes, 0x30, frame.timestamp);
+        write_pes_timestamp(&mut pes, 0x10, dts);
+    } else {
+        write_pes_timestamp(&mut pes, 0x20, frame.timestamp);
+    }
     pes.extend_from_slice(&frame.data);
     pes
 }
@@ -559,7 +580,7 @@ mod tests {
             false,
             CodecType::H264,
         );
-        let pes = build_pes(&frame, true);
+        let pes = build_pes(&frame, true, None);
         assert_eq!(&pes[0..3], &[0x00, 0x00, 0x01]);
         assert_eq!(pes[3], 0xE0);
         let declared = ((pes[4] as usize) << 8) | pes[5] as usize;
@@ -569,6 +590,25 @@ mod tests {
         assert_eq!(pes[7], 0x80);
         assert_eq!(pes[8], 5);
         assert_eq!(&pes[14..], &payload[..]);
+    }
+
+    #[test]
+    fn pes_packet_can_carry_distinct_pts_and_dts() {
+        let payload = vec![0xABu8; 20];
+        let frame = MediaFrame::new(
+            "s".into(),
+            0,
+            1120,
+            Bytes::from(payload.clone()),
+            false,
+            CodecType::H265,
+        );
+        let pes = build_pes(&frame, true, Some(1000));
+        let declared = ((pes[4] as usize) << 8) | pes[5] as usize;
+        assert_eq!(declared, pes[6..].len());
+        assert_eq!(pes[7], 0xC0);
+        assert_eq!(pes[8], 10);
+        assert_eq!(&pes[19..], &payload[..]);
     }
 
     #[test]
