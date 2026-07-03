@@ -29,7 +29,7 @@ pub use messages::{RtspRequest, RtspResponse};
 pub use puller::RtspPuller;
 pub use pusher::RtspPusher;
 pub use server_session::RtspServerSession;
-pub use session::{RtspSession, TransportMode};
+pub use session::{InterleavedChannel, RtspSession, TransportMode};
 
 pub struct RtspServer {
     stream_manager: Arc<StreamManager>,
@@ -172,10 +172,12 @@ impl RtspServer {
                     session.transport_mode = TransportMode::Udp;
                 }
 
-                if let Some((client_port, server_port)) = transport.client_port {
-                    session
-                        .interleaved_channels
-                        .push((client_port, server_port));
+                if let Some((rtp_channel, rtcp_channel)) = transport.client_port {
+                    session.interleaved_channels.push(InterleavedChannel {
+                        track_id: track_id as u8,
+                        rtp_channel: rtp_channel as u8,
+                        rtcp_channel: rtcp_channel as u8,
+                    });
                 }
 
                 let session_id = session.session_id.as_ref().unwrap();
@@ -307,11 +309,13 @@ impl RtspServer {
                 session.sps = sps.clone();
                 session.pps = pps.clone();
 
-                let tracks_to_create = if tracks.is_empty() {
+                let announced_tracks = if tracks.is_empty() {
                     crate::core::default_live_tracks()
                 } else {
                     tracks
                 };
+                session.tracks = announced_tracks.clone();
+                let tracks_to_create = normalize_announced_tracks_for_publish(&announced_tracks);
 
                 info!(
                     "[RTSP] [{}] ANNOUNCE creating stream with {} tracks",
@@ -341,7 +345,32 @@ impl RtspServer {
                 manager.set_stream_tracks(&stream_id, tracks_to_create.clone());
 
                 // Must set SPS/PPS after create_stream (stream must exist in manager).
-                if let (Some(sps_data), Some(pps_data)) = (&sps, &pps) {
+                let has_h265_track = tracks_to_create
+                    .iter()
+                    .any(|track| track.codec == CodecType::H265);
+                if has_h265_track {
+                    if let Some((vps_data, sps_data, pps_data)) = parse_hevc_params_from_sdp(body) {
+                        manager.set_stream_hevc_params(
+                            &stream_id,
+                            vps_data.clone(),
+                            sps_data.clone(),
+                            pps_data.clone(),
+                        );
+                        info!(
+                            "[RTSP] [{}] ANNOUNCE HEVC VPS/SPS/PPS saved to stream {} (vps={} sps={} pps={})",
+                            peer_addr,
+                            stream_id,
+                            vps_data.len(),
+                            sps_data.len(),
+                            pps_data.len()
+                        );
+                    } else {
+                        warn!(
+                            "[RTSP] [{}] ANNOUNCE H265 stream {} has no complete VPS/SPS/PPS in SDP; waiting for RTP parameter sets",
+                            peer_addr, stream_id
+                        );
+                    }
+                } else if let (Some(sps_data), Some(pps_data)) = (&sps, &pps) {
                     manager.set_stream_sps_pps(&stream_id, sps_data.clone(), pps_data.clone());
                     info!(
                         "[RTSP] [{}] ANNOUNCE SPS/PPS saved to stream {}",
@@ -704,7 +733,19 @@ impl RtspServer {
                     let payload_type: u8 = parts[3].parse().unwrap_or(96);
 
                     let codec = if media_type == "video" {
-                        CodecType::H264
+                        let payload_codec = sdp.lines().find_map(|line| {
+                            let line = line.trim();
+                            if !line.starts_with(&format!("a=rtpmap:{} ", payload_type)) {
+                                return None;
+                            }
+                            line.split_whitespace()
+                                .nth(1)
+                                .and_then(|codec| codec.split('/').next())
+                        });
+                        match payload_codec.map(|codec| codec.to_ascii_lowercase()) {
+                            Some(codec) if codec == "h265" || codec == "hevc" => CodecType::H265,
+                            _ => CodecType::H264,
+                        }
                     } else if media_type == "audio" {
                         CodecType::AAC
                     } else {
@@ -728,6 +769,52 @@ impl RtspServer {
 
         tracks
     }
+}
+
+fn normalize_announced_tracks_for_publish(tracks: &[Track]) -> Vec<Track> {
+    let mut normalized = Vec::new();
+    if let Some(video) = tracks
+        .iter()
+        .find(|track| matches!(track.codec, CodecType::H264 | CodecType::H265))
+    {
+        normalized.push(Track::new(
+            0,
+            video.codec,
+            video.payload_type,
+            video.clock_rate,
+        ));
+    }
+    if let Some(audio) = tracks
+        .iter()
+        .find(|track| !matches!(track.codec, CodecType::H264 | CodecType::H265))
+    {
+        normalized.push(Track::new(
+            1,
+            audio.codec,
+            audio.payload_type,
+            audio.clock_rate,
+        ));
+    }
+    if normalized.is_empty() {
+        crate::core::default_live_tracks()
+    } else {
+        normalized
+    }
+}
+
+fn parse_hevc_params_from_sdp(sdp: &str) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    for line in sdp.lines() {
+        if !line.starts_with("a=fmtp:") {
+            continue;
+        }
+        let (vps, sps, pps) = crate::core::parse_hevc_sprop_fmtp(line);
+        if let (Some(vps), Some(sps), Some(pps)) = (vps, sps, pps) {
+            if !vps.is_empty() && !sps.is_empty() && !pps.is_empty() {
+                return Some((vps, sps, pps));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -780,6 +867,61 @@ mod tests {
 
         assert!(rtp_info.contains("trackID=0"));
         assert!(!rtp_info.contains("trackID=1"));
+    }
+
+    #[test]
+    fn announce_sdp_hevc_alias_is_parsed_as_h265() {
+        let sdp = "v=0\r\n\
+                   m=video 0 RTP/AVP 96\r\n\
+                   a=rtpmap:96 HEVC/90000\r\n\
+                   a=control:trackID=0\r\n\
+                   m=audio 0 RTP/AVP 97\r\n\
+                   a=rtpmap:97 mpeg4-generic/44100/2\r\n";
+
+        let (tracks, _, _) = RtspCommon::parse_sdp_with_sps_pps(sdp);
+
+        assert_eq!(tracks[0].codec, CodecType::H265);
+        assert_eq!(tracks[0].payload_type, 96);
+        assert_eq!(tracks[0].clock_rate, 90_000);
+        assert_eq!(tracks[1].codec, CodecType::AAC);
+    }
+
+    #[test]
+    fn announce_tracks_are_normalized_to_video_zero_audio_one() {
+        let announced = vec![
+            Track::new(0, CodecType::AAC, 97, 44_100),
+            Track::new(1, CodecType::H265, 96, 90_000),
+        ];
+
+        let normalized = normalize_announced_tracks_for_publish(&announced);
+
+        assert_eq!(normalized[0].id, 0);
+        assert_eq!(normalized[0].codec, CodecType::H265);
+        assert_eq!(normalized[0].payload_type, 96);
+        assert_eq!(normalized[1].id, 1);
+        assert_eq!(normalized[1].codec, CodecType::AAC);
+        assert_eq!(normalized[1].payload_type, 97);
+    }
+
+    #[test]
+    fn announce_sdp_extracts_complete_hevc_params() {
+        let vps = vec![0x40, 0x01, 0x0c, 0x01];
+        let sps = vec![0x42, 0x01, 0x01, 0x60];
+        let pps = vec![0x44, 0x01, 0xc0, 0x73];
+        let fmtp = crate::core::hevc_sprop_from_nals(&vps, &sps, &pps);
+        let sdp = format!(
+            "v=0\r\n\
+             m=video 0 RTP/AVP 96\r\n\
+             a=rtpmap:96 HEVC/90000\r\n\
+             a=fmtp:96 {}\r\n",
+            fmtp
+        );
+
+        let params = parse_hevc_params_from_sdp(&sdp).unwrap();
+
+        assert_eq!(params.0, vps);
+        assert_eq!(params.1, sps);
+        assert_eq!(params.2, pps);
     }
 }
 

@@ -17,11 +17,10 @@ use self::m3u8::M3u8Generator;
 use self::ts_muxer::TsMuxer;
 use crate::core::dispatch::DispatchError;
 use crate::core::{
-    CodecType, DispatchPolicy, MediaFrame, StreamManager, DEFAULT_HLS_DIR, MILLISECOND_CLOCK_RATE,
+    is_keyframe_annex_b, prepend_annex_b_config_if_needed, CodecType, DispatchPolicy, MediaFrame,
+    StreamManager, DEFAULT_HLS_DIR, MILLISECOND_CLOCK_RATE,
 };
-use crate::server::webrtc::{
-    annex_b_with_config, h264_util::is_keyframe_annex_b, request_publisher_keyframe,
-};
+use crate::server::webrtc::{annex_b_with_config, request_publisher_keyframe};
 
 use self::timing::{
     closed_segment_secs as timing_closed_segment_secs, live_pdt, should_split_segment,
@@ -31,8 +30,13 @@ use self::timing::{
 const MIN_SEGMENT_BYTES: usize = 512;
 
 fn is_hls_video_keyframe(frame: &MediaFrame) -> bool {
-    matches!(frame.codec, CodecType::H264 | CodecType::H265)
-        && (frame.is_keyframe || is_keyframe_annex_b(&frame.data))
+    if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
+        return false;
+    }
+    if frame.codec == CodecType::H265 {
+        return is_keyframe_annex_b(frame.codec, &frame.data);
+    }
+    frame.is_keyframe || is_keyframe_annex_b(frame.codec, &frame.data)
 }
 
 fn audio_timestamp_delta_ms(prev: u64, curr: u64, clock_rate: Option<u32>) -> u64 {
@@ -53,7 +57,7 @@ impl Default for HlsConfig {
         Self {
             enabled: true,
             segment_duration: 1.0,
-            max_segments: 1,
+            max_segments: 3,
             output_dir: DEFAULT_HLS_DIR.to_string(),
         }
     }
@@ -273,12 +277,13 @@ impl HlsSession {
 
     fn prepare_frame_for_mux(&mut self, frame: &MediaFrame) -> MediaFrame {
         let ts = self.mux_timestamp_ms(frame);
+        let key = is_hls_video_keyframe(frame);
         MediaFrame::new(
             frame.stream_id.clone(),
             frame.track_id,
             ts,
             frame.data.clone(),
-            frame.is_keyframe,
+            key,
             frame.codec,
         )
         .with_clock_rate(MILLISECOND_CLOCK_RATE)
@@ -676,8 +681,6 @@ impl HlsServer {
             }
         };
 
-        const HLS_MUX_LAG_SNAP_THRESHOLD: u64 = 30;
-
         let stream_id_owned = stream_id.to_string();
         let sessions_clone = self.sessions.clone();
         let stream_manager = self.stream_manager.clone();
@@ -694,19 +697,6 @@ impl HlsServer {
             request_publisher_keyframe(&stream_id_owned);
 
             loop {
-                let lag = reader.hub().latest_seq().saturating_sub(reader.cursor());
-                if lag > HLS_MUX_LAG_SNAP_THRESHOLD {
-                    info!(
-                        "[HLS] [{}] mux lag {} frames — snap to live IDR",
-                        stream_id_owned, lag
-                    );
-                    request_publisher_keyframe(&stream_id_owned);
-                    reader.snap_to_latest_idr();
-                    if let Some(session) = sessions_clone.read().get(&stream_id_owned) {
-                        session.write().recover_from_lag();
-                    }
-                }
-
                 let frames = match reader.recv_batch().await {
                     Ok(f) if !f.is_empty() => f,
                     Ok(_) => continue,
@@ -733,7 +723,7 @@ impl HlsServer {
                         && is_hls_video_keyframe(&frame)
                     {
                         if let Some(stream) = stream_manager.get_stream(&stream_id_owned) {
-                            let data = crate::core::prepend_annex_b_config(
+                            let data = prepend_annex_b_config_if_needed(
                                 frame.codec,
                                 stream.vps.as_deref(),
                                 stream.sps.as_deref(),
@@ -993,6 +983,41 @@ mod playback_tests {
         )
     }
 
+    fn annex_b_hevc_idr() -> Bytes {
+        Bytes::from(vec![0, 0, 0, 1, 0x26, 0x01, 0xaf])
+    }
+
+    fn annex_b_hevc_p() -> Bytes {
+        Bytes::from(vec![0, 0, 0, 1, 0x02, 0x01, 0xaf])
+    }
+
+    fn h265_frame(ts: u64, key: bool) -> MediaFrame {
+        MediaFrame::new(
+            "test".into(),
+            0,
+            ts,
+            if key {
+                annex_b_hevc_idr()
+            } else {
+                annex_b_hevc_p()
+            },
+            key,
+            CodecType::H265,
+        )
+    }
+
+    fn push_one_second_h265_gop(session: &mut HlsSession, gop_index: u64) -> Vec<CompletedSegment> {
+        let mut completed = Vec::new();
+        for f in 0..25u64 {
+            let ts = RTP_BASE + (gop_index * 25 + f) * FRAME_TICKS;
+            let frame = h265_frame(ts, f == 0);
+            if let Ok(Some(seg)) = session.on_frame(&frame) {
+                completed.push(seg);
+            }
+        }
+        completed
+    }
+
     fn aac_frame(index: u64) -> MediaFrame {
         MediaFrame::new(
             "test".into(),
@@ -1114,6 +1139,56 @@ mod playback_tests {
                 "audio interleave should not cause long HLS segments, got {duration:.3}s"
             );
         }
+    }
+
+    #[test]
+    fn h265_one_second_gop_splits_near_target_not_three_seconds() {
+        let config = temp_hls_config("h265_split");
+        let mut session = HlsSession::new("t", &config).unwrap();
+        let mut durations = Vec::new();
+
+        for gop in 0..4 {
+            for seg in push_one_second_h265_gop(&mut session, gop) {
+                durations.push(seg.duration);
+            }
+        }
+
+        assert!(
+            durations.len() >= 3,
+            "expected multiple H265 segments, got {:?}",
+            durations
+        );
+        for &d in &durations {
+            assert!(
+                d <= 1.5,
+                "H265 segment {:.3}s should track ~1s GOP, not accumulate to 3s",
+                d
+            );
+        }
+    }
+
+    #[test]
+    fn h265_idr_detected_when_is_keyframe_flag_missing() {
+        let config = temp_hls_config("h265_idr_flag");
+        let mut session = HlsSession::new("t", &config).unwrap();
+        let idr = MediaFrame::new(
+            "test".into(),
+            0,
+            RTP_BASE,
+            annex_b_hevc_idr(),
+            false,
+            CodecType::H265,
+        );
+        let p = MediaFrame::new(
+            "test".into(),
+            0,
+            RTP_BASE + FRAME_TICKS,
+            annex_b_hevc_p(),
+            false,
+            CodecType::H265,
+        );
+        assert!(session.on_frame(&idr).unwrap().is_none());
+        assert!(session.on_frame(&p).unwrap().is_none());
     }
 
     #[test]

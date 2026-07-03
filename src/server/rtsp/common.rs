@@ -281,7 +281,7 @@ impl RtspCommon {
                                 if codec_parts.len() >= 2 {
                                     codec = match codec_parts[0].to_lowercase().as_str() {
                                         "h264" => CodecType::H264,
-                                        "h265" => CodecType::H265,
+                                        "h265" | "hevc" => CodecType::H265,
                                         "mpeg4-generic" | "aac" => CodecType::AAC,
                                         "opus" => CodecType::Opus,
                                         "pcmu" => CodecType::G711,
@@ -421,7 +421,7 @@ impl RtspCommon {
                                 if codec_parts.len() >= 2 {
                                     codec = match codec_parts[0].to_lowercase().as_str() {
                                         "h264" => CodecType::H264,
-                                        "h265" => CodecType::H265,
+                                        "h265" | "hevc" => CodecType::H265,
                                         "mpeg4-generic" | "aac" => CodecType::AAC,
                                         "opus" => CodecType::Opus,
                                         "pcmu" => CodecType::G711,

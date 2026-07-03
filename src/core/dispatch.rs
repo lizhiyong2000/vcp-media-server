@@ -282,10 +282,10 @@ impl DispatchReader {
         None
     }
 
-    /// After priming, align cursor for the policy (HLS: latest IDR, live play: edge).
+    /// After priming, align cursor for the policy (live play: edge; sequential mux: keep cursor).
     pub fn finish_prime(&mut self) {
         match self.policy {
-            DispatchPolicy::SequentialFromIdr => self.snap_to_latest_idr(),
+            DispatchPolicy::SequentialFromIdr => {}
             _ => self.snap_to_live_edge(),
         }
     }

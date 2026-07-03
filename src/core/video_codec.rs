@@ -195,6 +195,34 @@ pub fn prepend_annex_b_config(
     out
 }
 
+pub fn access_unit_has_param_sets(codec: CodecType, data: &[u8]) -> bool {
+    match codec {
+        CodecType::H265 => {
+            let (vps, sps, pps) = extract_hevc_param_sets(data);
+            vps.is_some() && sps.is_some() && pps.is_some()
+        }
+        CodecType::H264 => {
+            let (sps, pps) = extract_h264_sps_pps(data);
+            sps.is_some() && pps.is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Prepend VPS/SPS/PPS only when the access unit does not already carry them.
+pub fn prepend_annex_b_config_if_needed(
+    codec: CodecType,
+    vps: Option<&[u8]>,
+    sps: Option<&[u8]>,
+    pps: Option<&[u8]>,
+    access_unit: &[u8],
+) -> Vec<u8> {
+    if access_unit_has_param_sets(codec, access_unit) {
+        return access_unit.to_vec();
+    }
+    prepend_annex_b_config(codec, vps, sps, pps, access_unit)
+}
+
 /// Parse RTMP HEVCDecoderConfigurationRecord (after the 5-byte video tag header).
 pub fn parse_hevc_decoder_config_record(
     config: &[u8],
@@ -449,21 +477,26 @@ pub fn parse_hevc_sprop_fmtp(line: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>, O
     let mut pps = None;
     for part in line.split(';') {
         let part = part.trim();
-        if let Some(v) = part.strip_prefix("sprop-vps=") {
+        if let Some(v) = hevc_fmtp_value(part, "sprop-vps=") {
             if let Ok(decoded) = b64.decode(v.trim()) {
                 vps = Some(decoded);
             }
-        } else if let Some(v) = part.strip_prefix("sprop-sps=") {
+        } else if let Some(v) = hevc_fmtp_value(part, "sprop-sps=") {
             if let Ok(decoded) = b64.decode(v.trim()) {
                 sps = Some(decoded);
             }
-        } else if let Some(v) = part.strip_prefix("sprop-pps=") {
+        } else if let Some(v) = hevc_fmtp_value(part, "sprop-pps=") {
             if let Ok(decoded) = b64.decode(v.trim()) {
                 pps = Some(decoded);
             }
         }
     }
     (vps, sps, pps)
+}
+
+fn hevc_fmtp_value<'a>(part: &'a str, key: &str) -> Option<&'a str> {
+    let idx = part.find(key)?;
+    Some(&part[idx + key.len()..])
 }
 
 pub fn prepare_video_au_for_ts(codec: CodecType, data: &[u8]) -> Vec<u8> {
@@ -606,6 +639,9 @@ impl HevcFuReassembler {
             return None;
         }
         let nal_type = hevc_nalu_type(payload[0]);
+        if nal_type == 48 {
+            return depacketize_hevc_aggregation_packet(payload);
+        }
         if nal_type == 49 {
             let fu_header = payload[2];
             let start = (fu_header & 0x80) != 0;
@@ -626,7 +662,10 @@ impl HevcFuReassembler {
                 annex_b.push(self.header[0]);
                 annex_b.push(self.header[1]);
                 annex_b.extend_from_slice(&self.buffer);
-                let is_keyframe = matches!(orig_type, H265_NAL_IDR_W_RADL | H265_NAL_IDR_N_LP);
+                let is_keyframe = matches!(
+                    orig_type,
+                    H265_NAL_IDR_W_RADL | H265_NAL_IDR_N_LP | H265_NAL_CRA
+                );
                 self.buffer.clear();
                 return Some((Bytes::from(annex_b), is_keyframe));
             }
@@ -638,12 +677,45 @@ impl HevcFuReassembler {
             annex_b.extend_from_slice(payload);
             let is_keyframe = matches!(
                 hevc_nalu_type(payload[0]),
-                H265_NAL_IDR_W_RADL | H265_NAL_IDR_N_LP
+                H265_NAL_IDR_W_RADL | H265_NAL_IDR_N_LP | H265_NAL_CRA
             );
             return Some((Bytes::from(annex_b), is_keyframe));
         }
         None
     }
+}
+
+fn depacketize_hevc_aggregation_packet(payload: &[u8]) -> Option<(Bytes, bool)> {
+    if payload.len() < 4 {
+        return None;
+    }
+
+    let mut offset = 2;
+    let mut annex_b = Vec::new();
+    let mut is_keyframe = false;
+    while offset + 2 <= payload.len() {
+        let nal_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        if nal_len == 0 || offset + nal_len > payload.len() {
+            return None;
+        }
+
+        let nal = &payload[offset..offset + nal_len];
+        if nal.len() >= 2 {
+            annex_b.extend_from_slice(&ANNEX_B_PREFIX);
+            annex_b.extend_from_slice(nal);
+            is_keyframe |= matches!(
+                hevc_nalu_type(nal[0]),
+                H265_NAL_IDR_W_RADL | H265_NAL_IDR_N_LP | H265_NAL_CRA
+            );
+        }
+        offset += nal_len;
+    }
+
+    if annex_b.is_empty() || offset != payload.len() {
+        return None;
+    }
+    Some((Bytes::from(annex_b), is_keyframe))
 }
 
 #[cfg(test)]
@@ -660,6 +732,29 @@ mod tests {
     fn hevc_cra_is_treated_as_random_access_keyframe() {
         let cra = [0x00, 0x00, 0x00, 0x01, 0x2a, 0x01, 0xaf];
         assert!(contains_hevc_idr(&cra));
+    }
+
+    #[test]
+    fn hevc_aggregation_packet_depacketizes_to_annex_b_access_unit() {
+        let vps = [0x40, 0x01, 0x0c, 0x01];
+        let sps = [0x42, 0x01, 0x01, 0x60];
+        let pps = [0x44, 0x01, 0xc0, 0x73];
+        let cra = [0x2a, 0x01, 0x80, 0x00];
+        let mut payload = vec![0x60, 0x01]; // HEVC AP, type 48
+        for nal in [&vps[..], &sps[..], &pps[..], &cra[..]] {
+            payload.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            payload.extend_from_slice(nal);
+        }
+        let mut reassembler = HevcFuReassembler::default();
+
+        let (annex_b, is_keyframe) = reassembler.depacketize(&payload).unwrap();
+        let (parsed_vps, parsed_sps, parsed_pps) = extract_hevc_param_sets(&annex_b);
+
+        assert!(is_keyframe);
+        assert_eq!(parsed_vps.as_deref(), Some(vps.as_slice()));
+        assert_eq!(parsed_sps.as_deref(), Some(sps.as_slice()));
+        assert_eq!(parsed_pps.as_deref(), Some(pps.as_slice()));
+        assert!(contains_hevc_idr(&annex_b));
     }
 
     #[test]
@@ -700,6 +795,46 @@ mod tests {
         assert_eq!(parsed_vps.as_deref(), Some(vps.as_slice()));
         assert_eq!(parsed_sps.as_deref(), Some(sps.as_slice()));
         assert_eq!(parsed_pps.as_deref(), Some(pps.as_slice()));
+    }
+
+    #[test]
+    fn prepend_annex_b_config_if_needed_skips_when_param_sets_present() {
+        let vps = vec![0x40, 0x01, 0x0c, 0x01];
+        let sps = vec![0x42, 0x01, 0x01, 0x60];
+        let pps = vec![0x44, 0x01, 0xc0, 0x73];
+        let idr = vec![0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xaf];
+        let mut au = Vec::new();
+        for nal in [&vps, &sps, &pps, &idr] {
+            au.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            au.extend_from_slice(nal);
+        }
+
+        let out = prepend_annex_b_config_if_needed(
+            CodecType::H265,
+            Some(&vps),
+            Some(&sps),
+            Some(&pps),
+            &au,
+        );
+        assert_eq!(out, au);
+    }
+
+    #[test]
+    fn prepend_annex_b_config_if_needed_prepends_when_param_sets_missing() {
+        let vps = vec![0x40, 0x01, 0x0c, 0x01];
+        let sps = vec![0x42, 0x01, 0x01, 0x60];
+        let pps = vec![0x44, 0x01, 0xc0, 0x73];
+        let idr = vec![0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xaf];
+
+        let out = prepend_annex_b_config_if_needed(
+            CodecType::H265,
+            Some(&vps),
+            Some(&sps),
+            Some(&pps),
+            &idr,
+        );
+        assert!(access_unit_has_param_sets(CodecType::H265, &out));
+        assert!(contains_hevc_idr(&out));
     }
 
     #[test]

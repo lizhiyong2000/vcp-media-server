@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
         .map(|h| HlsModuleConfig {
             enabled: h.enabled,
             segment_duration: h.segment_duration.unwrap_or(1.0),
-            max_segments: h.max_segments.unwrap_or(1),
+            max_segments: h.max_segments.unwrap_or(3),
             output_dir: config.hls_output_dir(),
         })
         .unwrap_or_else(|| HlsModuleConfig {

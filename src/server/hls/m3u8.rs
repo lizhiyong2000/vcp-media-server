@@ -4,6 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::debug;
 
+/// Live HLS clients need a small sliding window to absorb polling and decode jitter.
+pub const MIN_LIVE_SEGMENTS: usize = 3;
+
 /// A single segment in the playlist
 #[derive(Debug, Clone)]
 pub struct Segment {
@@ -41,7 +44,7 @@ impl M3u8Generator {
     pub fn new(target_duration: f64, max_segments: usize) -> Self {
         Self {
             target_duration,
-            max_segments: max_segments.max(1),
+            max_segments: max_segments.max(MIN_LIVE_SEGMENTS),
             media_sequence: 0,
             segments: VecDeque::new(),
             next_sequence: 0,
@@ -228,8 +231,28 @@ mod tests {
     }
 
     #[test]
+    fn live_playlist_keeps_at_least_three_segments() {
+        let mut gen = M3u8Generator::new(1.0, 1);
+        let now = SystemTime::now();
+
+        for seq in 0..5 {
+            gen.add_segment(1.0, seq, now, false);
+        }
+
+        assert_eq!(gen.max_segments(), MIN_LIVE_SEGMENTS);
+        assert_eq!(gen.segment_count(), MIN_LIVE_SEGMENTS);
+        assert_eq!(gen.media_sequence(), 2);
+        let pl = gen.generate();
+        assert!(!pl.contains("segment_0.ts"));
+        assert!(!pl.contains("segment_1.ts"));
+        assert!(pl.contains("segment_2.ts"));
+        assert!(pl.contains("segment_3.ts"));
+        assert!(pl.contains("segment_4.ts"));
+    }
+
+    #[test]
     fn discontinuity_sequence_counts_only_segments_before_window() {
-        let mut gen = M3u8Generator::new(1.0, 2);
+        let mut gen = M3u8Generator::new(1.0, 3);
         let now = SystemTime::now();
 
         gen.add_segment(1.0, 0, now, false);
@@ -241,8 +264,14 @@ mod tests {
         gen.add_segment(1.0, 2, now, false);
         let pl = gen.generate();
         assert!(!pl.contains("#EXT-X-DISCONTINUITY-SEQUENCE:"));
+        assert!(pl.contains("#EXT-X-DISCONTINUITY\r\n"));
 
         gen.add_segment(1.0, 3, now, false);
+        let pl = gen.generate();
+        assert!(!pl.contains("#EXT-X-DISCONTINUITY-SEQUENCE:"));
+        assert!(pl.contains("#EXT-X-DISCONTINUITY\r\n"));
+
+        gen.add_segment(1.0, 4, now, false);
         let pl = gen.generate();
         assert!(pl.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"));
         assert!(!pl.contains("#EXT-X-DISCONTINUITY\r\n"));

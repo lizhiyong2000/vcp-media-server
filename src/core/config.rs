@@ -186,7 +186,7 @@ impl Default for Config {
                 hls: Some(HlsConfig {
                     enabled: true,
                     segment_duration: Some(1.0),
-                    max_segments: Some(1),
+                    max_segments: Some(3),
                     output_dir: Some(DEFAULT_HLS_OUTPUT_DIR.to_string()),
                 }),
                 http_flv: Some(HttpFlvConfig { enabled: true }),

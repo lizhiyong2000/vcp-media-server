@@ -12,7 +12,9 @@ use super::common::{
     extract_track_id, extract_transport, format_rtsp_message, is_udp_transport, RtspCommon,
 };
 use super::play_egress::{egress_rtp_packets, is_idr, prime_rtsp_play, PlayRtpTimeline};
-use super::{RtspRequest, RtspResponse, RtspServer, RtspSession, TransportMode};
+use super::{
+    InterleavedChannel, RtspRequest, RtspResponse, RtspServer, RtspSession, TransportMode,
+};
 use crate::core::dispatch::DispatchError;
 use crate::core::hevc_sprop_from_nals;
 use crate::core::{
@@ -155,26 +157,25 @@ impl RtspServerSession {
                 track_id, stream_id, peer_addr
             );
             let mut buffer = vec![0u8; 65535];
-            let mut h264_ingest =
-                if track_id == 0 && video_codec_for_track(&session_tracks, 0) != CodecType::H265 {
-                    Some(H264RtpIngest::new(
-                        manager.clone(),
-                        stream_id.clone(),
-                        "RTSP-Push-UDP",
-                    ))
-                } else {
-                    None
-                };
-            let mut hevc_ingest =
-                if track_id == 0 && video_codec_for_track(&session_tracks, 0) == CodecType::H265 {
-                    Some(HevcRtpIngest::new(
-                        manager.clone(),
-                        stream_id.clone(),
-                        "RTSP-Push-UDP",
-                    ))
-                } else {
-                    None
-                };
+            let track_codec = codec_for_track(&session_tracks, track_id).unwrap_or(CodecType::H264);
+            let mut h264_ingest = if track_codec == CodecType::H264 {
+                Some(H264RtpIngest::new(
+                    manager.clone(),
+                    stream_id.clone(),
+                    "RTSP-Push-UDP",
+                ))
+            } else {
+                None
+            };
+            let mut hevc_ingest = if track_codec == CodecType::H265 {
+                Some(HevcRtpIngest::new(
+                    manager.clone(),
+                    stream_id.clone(),
+                    "RTSP-Push-UDP",
+                ))
+            } else {
+                None
+            };
 
             loop {
                 match RtspCommon::receive_rtp_over_udp(&rtp_socket, &mut buffer).await {
@@ -183,48 +184,59 @@ impl RtspServerSession {
                             continue;
                         }
 
-                        if track_id == 0 {
-                            if let Some(ingest) = &mut hevc_ingest {
-                                ingest.ingest_rtp_packet(&buffer[..len]);
-                            } else if let Some(ingest) = &mut h264_ingest {
-                                ingest.ingest_rtp_packet(&buffer[..len]);
+                        match track_codec {
+                            CodecType::H265 => {
+                                if let Some(ingest) = &mut hevc_ingest {
+                                    ingest.ingest_rtp_packet(&buffer[..len]);
+                                }
                             }
-                        } else {
-                            let marker = (buffer[1] & 0x80) != 0;
-                            let ts = u32::from_be_bytes(buffer[4..8].try_into().unwrap_or([0; 4]))
-                                as u64;
-                            let payload_type = buffer[1] & 0x7F;
-                            let clock_rate = session_tracks
-                                .iter()
-                                .find(|track| {
-                                    track.id == track_id || track.payload_type == payload_type
-                                })
-                                .map(|track| track.clock_rate)
+                            CodecType::H264 => {
+                                if let Some(ingest) = &mut h264_ingest {
+                                    ingest.ingest_rtp_packet(&buffer[..len]);
+                                }
+                            }
+                            CodecType::AAC | CodecType::Opus | CodecType::G711 => {
+                                let marker = (buffer[1] & 0x80) != 0;
+                                let ts =
+                                    u32::from_be_bytes(buffer[4..8].try_into().unwrap_or([0; 4]))
+                                        as u64;
+                                let payload_type = buffer[1] & 0x7F;
+                                let clock_rate = clock_rate_for_track_or_payload(
+                                    &session_tracks,
+                                    track_id,
+                                    payload_type,
+                                )
                                 .unwrap_or(AAC_DEFAULT_CLOCK_RATE);
-                            let codec = if payload_type == 97 {
-                                CodecType::AAC
-                            } else {
-                                CodecType::AAC
-                            };
-                            let media =
-                                crate::server::webrtc::rtp_h264_media_payload(&buffer[..len])
-                                    .map(|(p, _, _)| p)
-                                    .unwrap_or(&buffer[12..len]);
-                            let aac_data = match super::common::strip_mpeg4_generic_aac(media) {
-                                Some(raw) if !raw.is_empty() => raw,
-                                _ => continue,
-                            };
-                            let frame = MediaFrame {
-                                stream_id: stream_id.clone(),
-                                track_id,
-                                timestamp: ts,
-                                clock_rate: Some(clock_rate),
-                                data: aac_data.into(),
-                                is_keyframe: marker,
-                                codec,
-                                rtp_data: Some(buffer[..len].to_vec().into()),
-                            };
-                            manager.publish_frame(frame);
+                                let media =
+                                    crate::server::webrtc::rtp_h264_media_payload(&buffer[..len])
+                                        .map(|(p, _, _)| p)
+                                        .unwrap_or(&buffer[12..len]);
+                                let frame_data = if track_codec == CodecType::AAC {
+                                    match super::common::strip_mpeg4_generic_aac(media) {
+                                        Some(raw) if !raw.is_empty() => raw,
+                                        _ => continue,
+                                    }
+                                } else {
+                                    media.to_vec()
+                                };
+                                let frame = MediaFrame {
+                                    stream_id: stream_id.clone(),
+                                    track_id: internal_track_id_for_codec(track_codec),
+                                    timestamp: ts,
+                                    clock_rate: Some(clock_rate),
+                                    data: frame_data.into(),
+                                    is_keyframe: marker,
+                                    codec: track_codec,
+                                    rtp_data: Some(buffer[..len].to_vec().into()),
+                                };
+                                manager.publish_frame(frame);
+                            }
+                            _ => {
+                                debug!(
+                                    "[RTSP] [UDP Receiver] ignore unsupported codec {:?} track={} stream='{}'",
+                                    track_codec, track_id, stream_id
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -771,7 +783,21 @@ impl RtspServerSession {
 
     async fn handle_rtp_data(&mut self, data: &BytesMut, channel: u8) {
         if let Some(ref stream_id) = self.session.stream_id {
-            let track_id = channel / 2;
+            if self.session.is_rtcp_channel(channel) {
+                debug!(
+                    "[RTSP] [{}] Ignore RTCP interleaved channel={} stream='{}'",
+                    self.peer_addr, channel, stream_id
+                );
+                return;
+            }
+
+            let Some(track_id) = self.session.rtp_track_for_channel(channel) else {
+                debug!(
+                    "[RTSP] [{}] Ignore unknown interleaved channel={} stream='{}'",
+                    self.peer_addr, channel, stream_id
+                );
+                return;
+            };
             let rtp_payload = &data[4..];
 
             if rtp_payload.len() < 12 {
@@ -790,10 +816,13 @@ impl RtspServerSession {
                 rtp_payload[6],
                 rtp_payload[7],
             ]);
+            let payload_type = rtp_payload[1] & 0x7F;
+            let track_codec =
+                codec_for_track_or_payload(&self.session.tracks, track_id, payload_type)
+                    .unwrap_or(CodecType::H264);
 
-            if track_id == 0 {
-                let video_codec = self.video_codec_for_track(0);
-                if video_codec == CodecType::H265 {
+            match track_codec {
+                CodecType::H265 => {
                     if self.hevc_ingest.is_none() {
                         self.hevc_ingest = Some(HevcRtpIngest::new(
                             Arc::clone(&self.manager),
@@ -804,7 +833,10 @@ impl RtspServerSession {
                     if let Some(ingest) = &mut self.hevc_ingest {
                         ingest.ingest_rtp_packet(rtp_payload);
                     }
-                } else {
+                    self.sync_codec_cache_from_manager(stream_id);
+                    return;
+                }
+                CodecType::H264 => {
                     if self.h264_ingest.is_none() {
                         self.h264_ingest = Some(H264RtpIngest::new(
                             Arc::clone(&self.manager),
@@ -815,30 +847,28 @@ impl RtspServerSession {
                     if let Some(ingest) = &mut self.h264_ingest {
                         ingest.ingest_rtp_packet(rtp_payload);
                     }
+                    self.sync_codec_cache_from_manager(stream_id);
+                    return;
                 }
-                self.sync_codec_cache_from_manager(stream_id);
-                return;
+                CodecType::AAC | CodecType::Opus | CodecType::G711 => {}
+                _ => {
+                    debug!(
+                        "[RTSP] [{}] Ignore unsupported RTP codec {:?} track={} stream='{}'",
+                        self.peer_addr, track_codec, track_id, stream_id
+                    );
+                    return;
+                }
             }
 
             // Audio / other tracks: pass through as before
-            let payload_type = rtp_payload[1] & 0x7F;
-            let clock_rate = self
-                .session
-                .tracks
-                .iter()
-                .find(|track| track.id == track_id || track.payload_type == payload_type)
-                .map(|track| track.clock_rate)
-                .unwrap_or(AAC_DEFAULT_CLOCK_RATE);
-            let codec = if payload_type == 97 {
-                CodecType::AAC
-            } else {
-                CodecType::AAC
-            };
+            let clock_rate =
+                clock_rate_for_track_or_payload(&self.session.tracks, track_id, payload_type)
+                    .unwrap_or(AAC_DEFAULT_CLOCK_RATE);
             let media_payload = crate::server::webrtc::rtp_h264_media_payload(rtp_payload)
                 .map(|(p, _, _)| p)
                 .unwrap_or(&rtp_payload[12..]);
 
-            let aac_data = if codec == CodecType::AAC {
+            let frame_data = if track_codec == CodecType::AAC {
                 match super::common::strip_mpeg4_generic_aac(media_payload) {
                     Some(raw) if !raw.is_empty() => raw,
                     _ => return,
@@ -849,13 +879,13 @@ impl RtspServerSession {
 
             let frame = MediaFrame {
                 stream_id: stream_id.clone(),
-                track_id: track_id as u8,
+                track_id: internal_track_id_for_codec(track_codec),
                 timestamp: rtp_timestamp as u64,
                 clock_rate: Some(clock_rate),
-                data: aac_data.into(),
+                data: frame_data.into(),
                 is_keyframe: marker,
-                codec,
-                rtp_data: Some(data.to_vec().into()),
+                codec: track_codec,
+                rtp_data: Some(rtp_payload.to_vec().into()),
             };
             self.manager.publish_frame(frame);
         } else {
@@ -995,6 +1025,7 @@ impl RtspServerSession {
         let peer_addr = self.peer_addr;
         let use_udp = self.session.transport_mode == TransportMode::Udp;
         let udp_tracks = self.udp_tracks.clone();
+        let interleaved_channels = self.session.interleaved_channels.clone();
 
         let handle = tokio::spawn(async move {
             info!(
@@ -1083,11 +1114,13 @@ impl RtspServerSession {
                     }
 
                     // TCP interleaved: one RTP packet per interleaved frame
+                    let rtp_channel = rtp_channel_for_track(&interleaved_channels, frame.track_id)
+                        .unwrap_or(frame.track_id);
                     for packet in packets {
                         if packet.is_empty() {
                             continue;
                         }
-                        let interleaved = RtspCommon::wrap_interleaved(&packet, frame.track_id);
+                        let interleaved = RtspCommon::wrap_interleaved(&packet, rtp_channel);
                         if write_tx.send(interleaved).await.is_err() {
                             info!(
                                 "[RTSP] [{}] PLAY client {} disconnected — stopping RTP sender",
@@ -1224,10 +1257,87 @@ impl RtspServerSession {
     }
 }
 
-fn video_codec_for_track(tracks: &[Track], track_id: u8) -> CodecType {
+fn codec_for_track_or_payload(
+    tracks: &[Track],
+    track_id: u8,
+    payload_type: u8,
+) -> Option<CodecType> {
+    tracks
+        .iter()
+        .find(|track| track.id == track_id || track.payload_type == payload_type)
+        .map(|track| track.codec)
+}
+
+fn codec_for_track(tracks: &[Track], track_id: u8) -> Option<CodecType> {
     tracks
         .iter()
         .find(|track| track.id == track_id)
         .map(|track| track.codec)
-        .unwrap_or(CodecType::H264)
+}
+
+fn clock_rate_for_track_or_payload(
+    tracks: &[Track],
+    track_id: u8,
+    payload_type: u8,
+) -> Option<u32> {
+    tracks
+        .iter()
+        .find(|track| track.id == track_id || track.payload_type == payload_type)
+        .map(|track| track.clock_rate)
+}
+
+fn internal_track_id_for_codec(codec: CodecType) -> u8 {
+    if matches!(codec, CodecType::H264 | CodecType::H265) {
+        0
+    } else {
+        1
+    }
+}
+
+fn rtp_channel_for_track(channels: &[InterleavedChannel], track_id: u8) -> Option<u8> {
+    channels
+        .iter()
+        .find(|entry| entry.track_id == track_id)
+        .map(|entry| entry.rtp_channel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtp_channel_lookup_uses_setup_mapping_not_track_id() {
+        let channels = vec![
+            InterleavedChannel {
+                track_id: 0,
+                rtp_channel: 4,
+                rtcp_channel: 5,
+            },
+            InterleavedChannel {
+                track_id: 1,
+                rtp_channel: 6,
+                rtcp_channel: 7,
+            },
+        ];
+
+        assert_eq!(rtp_channel_for_track(&channels, 0), Some(4));
+        assert_eq!(rtp_channel_for_track(&channels, 1), Some(6));
+        assert_eq!(rtp_channel_for_track(&channels, 2), None);
+    }
+
+    #[test]
+    fn codec_lookup_prefers_announced_track_id_for_rtsp_push() {
+        let tracks = vec![
+            Track::new(0, CodecType::AAC, 97, 44_100),
+            Track::new(1, CodecType::H265, 96, 90_000),
+        ];
+
+        assert_eq!(codec_for_track(&tracks, 1), Some(CodecType::H265));
+        assert_eq!(
+            codec_for_track_or_payload(&tracks, 9, 96),
+            Some(CodecType::H265)
+        );
+        assert_eq!(internal_track_id_for_codec(CodecType::H265), 0);
+        assert_eq!(internal_track_id_for_codec(CodecType::AAC), 1);
+    }
 }

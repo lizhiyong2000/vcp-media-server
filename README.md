@@ -112,7 +112,7 @@ cargo build
 
 | 文档 | 内容 |
 |------|------|
-| `docs/test-cases.md` | 全部测试用例（TC-01～TC-27，含完整命令） |
+| `docs/test-cases.md` | 测试用例（按编码 × 发布方式，播放覆盖全格式） |
 | `docs/architecture.md` | 架构规划（H265、录制、转码、分析、GB28181） |
 | `docs/getting-started.md` | 编译、启动、端口、API 速查 |
 | `docs/troubleshooting.md` | 故障排查 |

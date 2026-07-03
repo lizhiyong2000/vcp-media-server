@@ -167,7 +167,7 @@ impl FrameRing {
 
     fn evict_front_until_keyframe_or_empty(&mut self) {
         while let Some(front) = self.slots.front() {
-            if front.is_keyframe && matches!(front.codec, CodecType::H264 | CodecType::H265) {
+            if is_video_keyframe(&front.to_media_frame()) {
                 break;
             }
             if let Some(f) = self.slots.pop_front() {

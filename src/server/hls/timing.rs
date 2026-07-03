@@ -14,6 +14,9 @@ pub const MIN_SEGMENT_DURATION: f64 = 0.25;
 pub const FIRST_SEGMENT_MUX_SECS: f64 = 0.35;
 /// Fallback video step when publisher timestamps stall (25 fps).
 pub const MIN_VIDEO_MUX_STEP_MS: u64 = 40;
+/// Larger publisher PTS jumps often mean H264/H265 B-frame reordering on RTSP ingest.
+/// HLS mux DTS must stay decode-order smooth; use the nominal step for those jumps.
+pub const MAX_SMOOTH_VIDEO_STEP_MS: u64 = 60;
 
 /// Closed segment EXTINF from mux PTS span (must match TS payload).
 pub fn closed_segment_secs(last_mux_ms: u64, open_mux_ms_at_split: u64) -> f64 {
@@ -69,7 +72,7 @@ pub fn advance_video_mux_ms(
             frame_timestamp,
             clock_rate,
         );
-        if delta > 0 && delta < 500 {
+        if delta > 0 && delta <= MAX_SMOOTH_VIDEO_STEP_MS {
             delta
         } else {
             MIN_VIDEO_MUX_STEP_MS
@@ -205,6 +208,31 @@ mod tests {
         let (_, mux2) =
             advance_video_mux_ms(1_000_040, mux1, 1_000_040, Some(MILLISECOND_CLOCK_RATE));
         assert_eq!(mux2, 80);
+    }
+
+    #[test]
+    fn mux_timeline_smooths_reordered_h265_rtp_pts() {
+        let raw = [
+            3_400_040_840u64,
+            3_400_055_240,
+            3_400_048_040,
+            3_400_044_440,
+            3_400_051_640,
+            3_400_069_640,
+        ];
+        let mut last_raw = 0;
+        let mut mux_ms = 0;
+        let mut mux = Vec::new();
+
+        for ts in raw {
+            let (new_raw, new_mux) =
+                advance_video_mux_ms(last_raw, mux_ms, ts, Some(VIDEO_RTP_CLOCK_RATE));
+            last_raw = new_raw;
+            mux_ms = new_mux;
+            mux.push(mux_ms);
+        }
+
+        assert_eq!(mux, vec![0, 40, 80, 120, 160, 200]);
     }
 
     #[test]

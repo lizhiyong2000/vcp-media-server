@@ -43,9 +43,9 @@ pub use video_codec::{
     is_enhanced_rtmp_video, is_keyframe_annex_b, is_parameter_set_only, merge_annex_b_nalu_config,
     packetize_hevc_access_unit_for_rtp, parse_enhanced_hevc_video_message,
     parse_hevc_decoder_config_record, parse_hevc_sprop_fmtp, prepare_video_au_for_ts,
-    prepend_annex_b_config, HevcFuReassembler, FLV_FRAME_INTER, FLV_FRAME_KEY, FLV_IS_EX_HEADER,
-    H265_NAL_PPS, H265_NAL_SPS, H265_NAL_VPS, HEVC_FOURCC, RTMP_PKT_CODED_FRAMES,
-    RTMP_PKT_CODED_FRAMES_X, RTMP_PKT_SEQUENCE_START,
+    prepend_annex_b_config, prepend_annex_b_config_if_needed, HevcFuReassembler, FLV_FRAME_INTER,
+    FLV_FRAME_KEY, FLV_IS_EX_HEADER, H265_NAL_PPS, H265_NAL_SPS, H265_NAL_VPS, HEVC_FOURCC,
+    RTMP_PKT_CODED_FRAMES, RTMP_PKT_CODED_FRAMES_X, RTMP_PKT_SEQUENCE_START,
 };
 
 pub type StreamId = String;
