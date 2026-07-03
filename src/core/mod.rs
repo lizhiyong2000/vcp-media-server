@@ -2,6 +2,7 @@ mod config;
 pub mod dispatch;
 mod frame_ring;
 pub mod live_play;
+pub mod metrics;
 pub mod protocol;
 mod pusher;
 mod stream_hub;
@@ -23,6 +24,10 @@ pub use config::{
     SnapshotConfig, StorageConfig, WebrtcConfig, DEFAULT_HLS_DIR, DEFAULT_HLS_OUTPUT_DIR,
     DEFAULT_RECORD_DIR, DEFAULT_RECORD_OUTPUT_DIR, DEFAULT_SNAPSHOT_DIR,
     DEFAULT_SNAPSHOT_OUTPUT_DIR, DEFAULT_STORAGE_BASE_DIR,
+};
+pub use metrics::{
+    FirstFrameStats, HlsMetricsSnapshot, MetricsRegistry, MetricsSnapshot, PlaybackProtocol,
+    PlayerCounts, RingStats, StreamMetricsSnapshot,
 };
 pub use live_play::{
     is_idr_frame, is_playable_video_frame, prepend_video_config, prime_live_play,

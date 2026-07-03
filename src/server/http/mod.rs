@@ -7,8 +7,9 @@ use tokio::time::{sleep, Duration, Instant};
 use tracing::{error, info, warn};
 
 use crate::core::{
-    is_idr_frame, prime_live_play, CodecType, DispatchError, DispatchPolicy, StreamManager,
-    StreamProtocol, StreamSourceMode, Track, WallclockMsTimeline,
+    is_idr_frame, prime_live_play, CodecType, DispatchError, DispatchPolicy, MetricsRegistry,
+    MetricsSnapshot, PlaybackProtocol, StreamManager, StreamProtocol, StreamSourceMode, Track,
+    WallclockMsTimeline,
 };
 use crate::process::analysis::{AnalysisManager, StartAnalysisRequest, StopAnalysisRequest};
 use crate::process::record::{RecorderManager, StartRecordRequest, StopRecordRequest};
@@ -23,6 +24,7 @@ use crate::server::webrtc::request_publisher_keyframe;
 
 pub struct HttpServer {
     stream_manager: Arc<StreamManager>,
+    metrics: Arc<MetricsRegistry>,
     port: u16,
     hls_server: Option<Arc<HlsServer>>,
     http_flv_server: Option<Arc<HttpFlvServer>>,
@@ -34,6 +36,7 @@ pub struct HttpServer {
 impl HttpServer {
     pub fn new(
         stream_manager: Arc<StreamManager>,
+        metrics: Arc<MetricsRegistry>,
         port: u16,
         hls_server: Option<Arc<HlsServer>>,
         http_flv_server: Option<Arc<HttpFlvServer>>,
@@ -43,6 +46,7 @@ impl HttpServer {
     ) -> Self {
         Self {
             stream_manager,
+            metrics,
             port,
             hls_server,
             http_flv_server,
@@ -68,6 +72,8 @@ impl HttpServer {
         info!("[HTTP]   POST /api/rtsp/pull      - RTSP pull from remote URL");
         info!("[HTTP]   POST /api/rtsp/push      - RTSP push to remote URL");
         info!("[HTTP]   POST /api/rtmp/pull      - RTMP pull from remote URL");
+        info!("[HTTP]   GET  /api/metrics         - Operational metrics (all streams)");
+        info!("[HTTP]   GET  /api/metrics/<id>    - Per-stream metrics");
         if self.recorder.is_some() {
             info!("[HTTP]   POST /api/record/start  - Start DVR recording");
             info!("[HTTP]   POST /api/record/stop   - Stop DVR recording");
@@ -98,6 +104,7 @@ impl HttpServer {
                 Ok((socket, peer_addr)) => {
                     info!("[HTTP] New request from {}", peer_addr);
                     let manager = self.stream_manager.clone();
+                    let metrics = self.metrics.clone();
                     let hls = self.hls_server.clone();
                     let flv = self.http_flv_server.clone();
                     let recorder = self.recorder.clone();
@@ -105,7 +112,7 @@ impl HttpServer {
                     let snapshot = self.snapshot.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection(
-                            socket, manager, hls, flv, recorder, analysis, snapshot,
+                            socket, manager, metrics, hls, flv, recorder, analysis, snapshot,
                         )
                         .await
                         {
@@ -123,6 +130,7 @@ impl HttpServer {
     async fn handle_connection(
         socket: TcpStream,
         manager: Arc<StreamManager>,
+        metrics: Arc<MetricsRegistry>,
         hls_server: Option<Arc<HlsServer>>,
         flv_server: Option<Arc<HttpFlvServer>>,
         recorder: Option<Arc<RecorderManager>>,
@@ -256,6 +264,14 @@ impl HttpServer {
                                 return Ok(());
                             }
                         };
+                        MetricsRegistry::inc_player(&stream_id_owned, PlaybackProtocol::HttpFlv);
+                        struct FlvPlayerGuard(String);
+                        impl Drop for FlvPlayerGuard {
+                            fn drop(&mut self) {
+                                MetricsRegistry::dec_player(&self.0, PlaybackProtocol::HttpFlv);
+                            }
+                        }
+                        let _flv_player = FlvPlayerGuard(stream_id_owned.clone());
 
                         // Wait for video parameter sets before responding so players can probe codecs.
                         // H265 needs VPS/SPS/PPS; H264 needs SPS/PPS.
@@ -399,6 +415,12 @@ impl HttpServer {
                                         break;
                                     }
                                     if frames_sent == 0 {
+                                        let first_ms = play_started_at.elapsed().as_millis() as u64;
+                                        MetricsRegistry::record_first_frame_ms(
+                                            &stream_id_owned,
+                                            PlaybackProtocol::HttpFlv,
+                                            first_ms,
+                                        );
                                         info!(
                                         "[HTTP-FLV] [{}] >>> SENT first frame after={}ms codec={:?} keyframe={} raw_ts={} tag_ts={} send_elapsed_ms={} tag_bytes={} chunk_bytes={} cursor={} latest_seq={}",
                                         stream_id,
@@ -483,8 +505,15 @@ impl HttpServer {
         }
 
         // Regular API request
-        let response =
-            Self::process_request(&request, manager.clone(), recorder, analysis, snapshot).await?;
+        let response = Self::process_request(
+            &request,
+            manager.clone(),
+            metrics,
+            recorder,
+            analysis,
+            snapshot,
+        )
+        .await?;
         socket.write_all(response.as_bytes()).await?;
         socket.flush().await?;
 
@@ -494,6 +523,7 @@ impl HttpServer {
     async fn process_request(
         request: &str,
         manager: Arc<StreamManager>,
+        metrics: Arc<MetricsRegistry>,
         recorder: Option<Arc<RecorderManager>>,
         analysis: Option<Arc<AnalysisManager>>,
         snapshot: Option<Arc<SnapshotManager>>,
@@ -577,6 +607,37 @@ impl HttpServer {
                     Ok(Self::http_response(200, "OK", &body))
                 } else {
                     Ok(Self::http_response(404, "Not Found", ""))
+                }
+            }
+            ("GET", "/api/metrics") => {
+                let snap: MetricsSnapshot = metrics.snapshot(&manager);
+                Ok(Self::http_response(
+                    200,
+                    "OK",
+                    &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string()),
+                ))
+            }
+            ("GET", "/api/metrics/") => {
+                let body = json!({
+                    "usage": "GET /api/metrics/<stream_id>"
+                })
+                .to_string();
+                Ok(Self::http_response(200, "OK", &body))
+            }
+            ("GET", path) if path.starts_with("/api/metrics/") => {
+                let stream_id = path.trim_start_matches("/api/metrics/");
+                if let Some(snap) = metrics.stream_snapshot(&manager, stream_id) {
+                    Ok(Self::http_response(
+                        200,
+                        "OK",
+                        &serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string()),
+                    ))
+                } else {
+                    Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"stream not found\"}",
+                    ))
                 }
             }
             ("POST", "/api/streams") => {
@@ -1137,6 +1198,7 @@ impl HttpServer {
             ("DELETE", path) if path.starts_with("/api/stream/") => {
                 let stream_id = path.trim_start_matches("/api/stream/");
                 if manager.remove_stream(&stream_id.to_string()).is_some() {
+                    MetricsRegistry::remove_stream(stream_id);
                     Ok(Self::http_response(200, "OK", ""))
                 } else {
                     Ok(Self::http_response(404, "Not Found", ""))
@@ -1145,6 +1207,11 @@ impl HttpServer {
             ("GET", "/health") => Ok(Self::http_response(200, "OK", "{\"status\":\"healthy\"}")),
             ("GET", "/") => {
                 let mut endpoints = serde_json::Map::new();
+                endpoints.insert("GET /api/metrics".to_string(), json!("Operational metrics"));
+                endpoints.insert(
+                    "GET /api/metrics/<id>".to_string(),
+                    json!("Per-stream metrics"),
+                );
                 endpoints.insert("GET /api/streams".to_string(), json!("List all streams"));
                 endpoints.insert("GET /api/stream/<id>".to_string(), json!("Get stream info"));
                 endpoints.insert(

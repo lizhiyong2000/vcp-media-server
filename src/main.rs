@@ -14,7 +14,7 @@ use tracing_subscriber::{
     prelude::*,
 };
 
-use crate::core::{Config, StreamManager};
+use crate::core::{Config, MetricsRegistry, StreamManager};
 use crate::process::analysis;
 use crate::process::record::{self, RecordFormat, RecorderManager};
 use crate::process::snapshot::{self, SnapshotManager};
@@ -149,6 +149,8 @@ async fn main() -> Result<()> {
     info!("Starting Media Server...");
 
     let stream_manager = Arc::new(StreamManager::new());
+    let metrics_registry = MetricsRegistry::new();
+    MetricsRegistry::install_global(metrics_registry.clone());
 
     // Initialize HLS server
     let hls_config = config
@@ -303,6 +305,7 @@ async fn main() -> Result<()> {
 
     let http_server = http::HttpServer::new(
         stream_manager.clone(),
+        metrics_registry,
         config.server.http.port,
         hls_server_http,
         http_flv_server_http,

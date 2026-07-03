@@ -105,6 +105,7 @@ Rust 实现的轻量级流媒体服务，以 `StreamManager` 为媒体中枢，�
 | 流列表 / 详情 | `GET /api/streams`、`GET /api/stream/<id>` | 已支持 |
 | 流创建 / 删除 | `POST /api/streams`、`DELETE /api/stream/<id>` | 已支持 |
 | 健康检查 | `GET /health` | 已支持 |
+| 运行指标 | `GET /api/metrics`、`GET /api/metrics/<id>` — 关键帧请求、首帧耗时、播放器数、HLS 切片、ring/RTP gap | 已支持 |
 | 拉流 / 推流 API | `POST /api/rtmp/pull`、`POST /api/rtsp/pull`、`POST /api/rtsp/push` | 已支持 |
 | 录制控制 API | 启停录制、查询录制列表与回放 | 规划中 |
 | 转码 / 分析 API | 衍生流配置、分析任务与事件查询 | 规划中 |
@@ -116,6 +117,14 @@ Rust 实现的轻量级流媒体服务，以 `StreamManager` 为媒体中枢，�
 cargo build
 ./target/debug/vcp-media-server
 ```
+
+**跨协议自动化回归：**
+
+```bash
+scripts/cross_protocol_regression.sh
+```
+
+默认覆盖 H264/H265 的 RTMP、RTSP TCP、RTSP UDP、RTMP API 拉流、RTSP API 拉流 TCP/UDP 发布，并验证 RTMP、RTSP、HTTP-FLV、HLS 播放。WebRTC 推流/播放依赖浏览器和系统 codec 能力，仍通过 `webrtc/webrtc-test.html` 做浏览器端验证。
 
 ## 待办清单
 
@@ -131,9 +140,9 @@ cargo build
 
 ### P2 稳定性与工程化
 
-- [ ] 增加跨协议自动化回归：H264/H265 × RTMP/RTSP/WebRTC 推流 × RTMP/RTSP/FLV/HLS/WebRTC 播放。
+- [x] 增加跨协议自动化回归：已新增 `scripts/cross_protocol_regression.sh`，覆盖 H264/H265 × RTMP/RTSP/API 拉流发布 × RTMP/RTSP/HTTP-FLV/HLS 播放；WebRTC 由测试页做浏览器能力验证。
 - [ ] 增加延迟回归测试：利用 WebRTC 页面测试信号读秒，固定采样 RTMP/FLV/HLS/WebRTC 首帧和播放延迟。
-- [ ] 监控与指标 API：把关键帧请求、首帧耗时、播放器连接数、HLS 切片状态、丢包/序列 gap 等指标结构化暴露出来。
+- [x] 监控与指标 API：把关键帧请求、首帧耗时、播放器连接数、HLS 切片状态、丢包/序列 gap 等指标结构化暴露出来。
 - [ ] 清理 `cargo test` 中大量 `dead_code` 警告，降低后续排查噪音。
 - [ ] HLS 低延迟能力继续优化：当前已修复 H265 B 帧 PTS/DTS、音频对齐和 live window，但还可以评估 LL-HLS、part segment 或更细的播放器参数文档。
 

@@ -8,7 +8,7 @@ use tracing::info;
 use super::frame_ring::{is_playable_video, is_video_keyframe, SnapMode};
 use super::stream_hub::StreamHub;
 use super::timestamp::media_frame_timestamp_delta_ms;
-use super::{is_keyframe_annex_b, CodecType, MediaFrame, StreamManager};
+use super::{is_keyframe_annex_b, CodecType, MediaFrame, MetricsRegistry, StreamManager};
 use crate::server::webrtc::request_publisher_keyframe;
 
 /// Max frames per batch for sequential muxers (HLS); keeps pace with live ingest.
@@ -372,6 +372,7 @@ impl DispatchReader {
                         self.stream_id, self.cursor, oldest
                     );
                     request_publisher_keyframe(&self.stream_id);
+                    MetricsRegistry::record_ring_gap(&self.stream_id);
                     self.pending_muxer_resync = true;
                     self.cursor = self.hub.snap(SnapMode::LatestIdr).max(oldest);
                     let latest = self.hub.latest_seq();

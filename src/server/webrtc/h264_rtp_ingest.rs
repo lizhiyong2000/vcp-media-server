@@ -6,6 +6,7 @@ use tracing::{debug, info, warn};
 use webrtc::rtp::packet::Packet;
 
 use crate::core::{CodecType, MediaFrame, StreamManager, VIDEO_RTP_CLOCK_RATE};
+use crate::core::MetricsRegistry;
 
 use super::h264_util::{
     contains_vcl_nalu, describe_annex_b, is_keyframe_annex_b, is_parameter_set_only,
@@ -204,6 +205,7 @@ impl H264RtpIngest {
             seq,
             describe_rtp_payload(payload)
         );
+        MetricsRegistry::record_rtp_sequence_gap(&self.stream_id);
         self.discard_partial_access_unit();
 
         // A continuation/end FU-A after a gap cannot be reconstructed safely.

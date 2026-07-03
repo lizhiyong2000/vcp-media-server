@@ -17,8 +17,9 @@ use self::m3u8::M3u8Generator;
 use self::ts_muxer::TsMuxer;
 use crate::core::dispatch::DispatchError;
 use crate::core::{
-    is_keyframe_annex_b, prepend_annex_b_config_if_needed, CodecType, DispatchPolicy, MediaFrame,
-    StreamManager, DEFAULT_HLS_DIR, MILLISECOND_CLOCK_RATE,
+    is_keyframe_annex_b, prepend_annex_b_config_if_needed, CodecType, DispatchPolicy,
+    HlsMetricsSnapshot, MediaFrame, MetricsRegistry, StreamManager, DEFAULT_HLS_DIR,
+    MILLISECOND_CLOCK_RATE,
 };
 use crate::server::webrtc::{annex_b_with_config, request_publisher_keyframe};
 
@@ -592,6 +593,28 @@ impl HlsServer {
         self.last_access
             .write()
             .insert(stream_id.to_string(), Instant::now());
+        MetricsRegistry::record_hls_access(stream_id);
+        self.sync_hls_metrics(stream_id);
+    }
+
+    fn sync_hls_metrics(&self, stream_id: &str) {
+        let mut snapshot = HlsMetricsSnapshot {
+            generating: self.has_stream(stream_id),
+            target_duration: self.config.segment_duration.ceil().max(1.0),
+            max_segments: self.config.max_segments,
+            ..Default::default()
+        };
+        if snapshot.generating {
+            let sessions = self.sessions.read();
+            if let Some(session) = sessions.get(stream_id) {
+                let sess = session.read();
+                snapshot.segment_count = sess.playlist.segment_count();
+                snapshot.media_sequence = sess.playlist.media_sequence();
+                snapshot.target_duration = sess.playlist.target_duration();
+                snapshot.max_segments = sess.playlist.max_segments();
+            }
+        }
+        MetricsRegistry::merge_hls(stream_id, snapshot);
     }
 
     /// Periodically stop HLS sessions with no recent playlist/segment requests.
@@ -835,6 +858,8 @@ impl HlsServer {
         self.task_aborts
             .write()
             .insert(stream_id.to_string(), handle.abort_handle());
+        MetricsRegistry::inc_player(stream_id, crate::core::PlaybackProtocol::Hls);
+        self.sync_hls_metrics(stream_id);
         self.touch(stream_id);
 
         Ok(())
@@ -897,6 +922,8 @@ impl HlsServer {
         };
 
         if session.is_some() {
+            MetricsRegistry::dec_player(stream_id, crate::core::PlaybackProtocol::Hls);
+            self.sync_hls_metrics(stream_id);
             info!("[HLS] Stopped HLS for stream: {}", stream_id);
         }
 
@@ -955,6 +982,12 @@ async fn commit_hls_segment(
         commit.duration,
         commit.data.len()
     );
+    MetricsRegistry::record_hls_segment_committed(
+        stream_id,
+        commit.seq,
+        commit.duration,
+        commit.data.len(),
+    );
     let playlist_update = {
         let sessions = sessions.read();
         sessions.get(stream_id).map(|s| {
@@ -978,6 +1011,20 @@ async fn commit_hls_segment(
             let _ = fs::rename(&tmp, &m3u8_path).await;
         }
         prune_old_segments(&commit.output_dir, prune_before).await;
+        if let Some(s) = sessions.read().get(stream_id) {
+            let sess = s.read();
+            MetricsRegistry::merge_hls(
+                stream_id,
+                HlsMetricsSnapshot {
+                    generating: true,
+                    segment_count: sess.playlist.segment_count(),
+                    media_sequence: sess.playlist.media_sequence(),
+                    target_duration: sess.playlist.target_duration(),
+                    max_segments: sess.playlist.max_segments(),
+                    ..Default::default()
+                },
+            );
+        }
     }
 }
 

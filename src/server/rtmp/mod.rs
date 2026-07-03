@@ -17,8 +17,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::core::{
     default_live_tracks, is_idr_frame, prime_live_play, CodecType, DispatchError, DispatchPolicy,
-    MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, StreamStatus,
-    MILLISECOND_CLOCK_RATE,
+    MediaFrame, MetricsRegistry, PlaybackProtocol, StreamManager, StreamProtocol, StreamSourceMode,
+    StreamStatus, MILLISECOND_CLOCK_RATE,
 };
 use crate::server::webrtc::request_publisher_keyframe;
 use chunk::RtmpMessage;
@@ -834,7 +834,10 @@ impl RtmpServer {
                 );
             }
             "publish" => {
-                let stream_name = conn.session.handle_publish(args);
+                let mut stream_name = conn.session.handle_publish(args);
+                if stream_name.is_empty() {
+                    stream_name = conn.session.fallback_stream_name();
+                }
                 let publisher_id = format!("rtmp:{}", peer_addr);
 
                 if conn.stream_manager.get_stream(&stream_name).is_none() {
@@ -942,7 +945,10 @@ impl RtmpServer {
                 }
             }
             "play" => {
-                let play_stream_id = conn.session.handle_play(args);
+                let mut play_stream_id = conn.session.handle_play(args);
+                if play_stream_id.is_empty() {
+                    play_stream_id = conn.session.fallback_stream_name();
+                }
                 conn.stream_id = play_stream_id.clone();
                 info!(
                     "[RTMP] [{}] --- play stream='{}'",
@@ -1128,6 +1134,7 @@ impl RtmpServer {
                         let peer_log = peer_addr.to_string();
                         let stream_id_for_play = play_stream_id.clone();
                         let manager_for_play = Arc::clone(&conn.stream_manager);
+                        MetricsRegistry::inc_player(&play_stream_id, PlaybackProtocol::Rtmp);
                         let mut pending = prime_live_play(
                             &mut reader,
                             &conn.stream_manager,
@@ -1136,6 +1143,13 @@ impl RtmpServer {
                         )
                         .await;
                         let handle = tokio::spawn(async move {
+                            struct RtmpPlayerGuard(String);
+                            impl Drop for RtmpPlayerGuard {
+                                fn drop(&mut self) {
+                                    MetricsRegistry::dec_player(&self.0, PlaybackProtocol::Rtmp);
+                                }
+                            }
+                            let _player = RtmpPlayerGuard(stream_id_for_play.clone());
                             let mut video_streaming = pending.is_some();
                             let mut frames_sent = 0u64;
                             let mut clock = session::RtmpPlayClock::default();
@@ -1241,6 +1255,12 @@ impl RtmpServer {
                                         return;
                                     }
                                     if frames_sent == 0 {
+                                        let first_ms = play_started_at.elapsed().as_millis() as u64;
+                                        MetricsRegistry::record_first_frame_ms(
+                                            &stream_id_for_play,
+                                            PlaybackProtocol::Rtmp,
+                                            first_ms,
+                                        );
                                         info!(
                                         "[RTMP] [{}] >>> SENT first frame after={}ms: stream='{}' codec={:?} keyframe={} raw_ts={} rtmp_ts={} send_elapsed_ms={} payload_bytes={} message_bytes={} cursor={} latest_seq={}",
                                         peer_log,

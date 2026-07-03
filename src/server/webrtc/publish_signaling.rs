@@ -11,6 +11,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 
 use super::signaling::ServerSignal;
+use crate::core::MetricsRegistry;
 
 struct Entry {
     tx: Option<mpsc::UnboundedSender<ServerSignal>>,
@@ -111,6 +112,7 @@ pub fn request_publisher_keyframe(stream_id: &str) -> bool {
                 "[WebRTC] keyframe_request id={} skipped stream='{}' reason=no_webrtc_publisher",
                 request_id, stream_id
             );
+            MetricsRegistry::record_keyframe_request(stream_id, false);
             return false;
         };
         entry.last_request = Some(KeyframeRequestRecord {
@@ -185,6 +187,7 @@ pub fn request_publisher_keyframe(stream_id: &str) -> bool {
         signaling_sent,
         started_at.elapsed().as_millis()
     );
+    MetricsRegistry::record_keyframe_request(stream_id, requested);
     requested
 }
 
@@ -201,12 +204,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keyframe_request_without_webrtc_publisher_does_not_create_entry() {
+    fn keyframe_request_without_webrtc_publisher_records_metrics() {
+        use crate::core::{MetricsRegistry, StreamManager, StreamProtocol, StreamSourceMode};
+
         let stream_id = "no_webrtc_publisher_stream";
         map().lock().remove(stream_id);
 
+        let registry = MetricsRegistry::new();
+        MetricsRegistry::install_global(registry.clone());
+        let manager = StreamManager::new();
+        manager.create_stream(stream_id, StreamSourceMode::Push, StreamProtocol::RTSP, None);
+
         assert!(!request_publisher_keyframe(stream_id));
         assert!(latest_keyframe_request_age_ms(stream_id).is_none());
+
+        let snap = registry
+            .stream_snapshot(&manager, stream_id)
+            .expect("snapshot");
+        assert_eq!(snap.keyframe_requests, 1);
+        assert_eq!(snap.keyframe_requests_delivered, 0);
+        assert!(snap.last_keyframe_request_age_ms.is_some());
     }
 
     #[test]

@@ -55,6 +55,8 @@ pub struct RtmpSession {
     pub transaction_id: f64,
     /// Peer address string for logging
     pub peer_addr: String,
+    /// RTMP tcUrl from connect (used when play/publish omit stream name)
+    pub tc_url: String,
 }
 
 /// Session mode: publish or play
@@ -81,23 +83,68 @@ impl RtmpSession {
             metadata_sent: false,
             transaction_id: 1.0,
             peer_addr: peer_addr.to_string(),
+            tc_url: String::new(),
         }
     }
 
     /// Handle a connect command, extract app name
     pub fn handle_connect(&mut self, args: &[Amf0Value]) -> String {
-        // Extract app from command args
         for arg in args {
-            if let Some(map) = arg.as_object() {
-                if let Some(app) = map.get("app").and_then(|v| v.as_str()) {
-                    self.app = app.to_string();
-                    // info!("[RTMP] [{}] App: {}", self.peer_addr, self.app);
-                }
+            if let Some(app) = amf0::get_string_prop(arg, "app") {
+                self.app = app;
+            }
+            if let Some(tc_url) = amf0::get_string_prop(arg, "tcUrl") {
+                self.tc_url = tc_url;
+            }
+        }
+        if self.app.is_empty() {
+            if let Some(stream) = stream_name_from_tc_url(&self.tc_url) {
+                self.app = stream.clone();
+                self.stream_name = stream;
             }
         }
         self.state = SessionState::Connected;
-        // self.transaction_id += 1.0;
         self.app.clone()
+    }
+
+    pub fn fallback_stream_name(&self) -> String {
+        if !self.stream_name.is_empty() {
+            return self.stream_name.clone();
+        }
+        if !self.app.is_empty() && self.app != "live" {
+            return self.app.clone();
+        }
+        stream_name_from_tc_url(&self.tc_url).unwrap_or_default()
+    }
+
+    /// Parse stream name from play/publish args; fall back to connect `app` for single-path URLs
+    /// like `rtmp://host/<stream_id>` where ffmpeg sends play("", …) and app=<stream_id>.
+    fn resolve_stream_name(&mut self, args: &[Amf0Value]) {
+        self.stream_name.clear();
+        for arg in args {
+            if let Some(s) = arg.as_str() {
+                if !s.is_empty() {
+                    self.stream_name = s.to_string();
+                    break;
+                }
+            }
+            if let Some(map) = arg.as_object() {
+                if let Some(name) = map.get("streamName").and_then(|v| v.as_str()) {
+                    if !name.is_empty() {
+                        self.stream_name = name.to_string();
+                        break;
+                    }
+                }
+            }
+        }
+        if self.stream_name.is_empty() && !self.app.is_empty() && self.app != "live" {
+            self.stream_name = self.app.clone();
+        }
+        if self.stream_name.is_empty() {
+            if let Some(stream) = stream_name_from_tc_url(&self.tc_url) {
+                self.stream_name = stream;
+            }
+        }
     }
 
     /// Handle createStream command
@@ -111,19 +158,7 @@ impl RtmpSession {
 
     /// Handle publish command
     pub fn handle_publish(&mut self, args: &[Amf0Value]) -> String {
-        for arg in args {
-            if let Some(s) = arg.as_str() {
-                if s.len() > 0 {
-                    self.stream_name = s.to_string();
-                    break;
-                }
-            }
-            if let Some(map) = arg.as_object() {
-                if let Some(name) = map.get("streamName").and_then(|v| v.as_str()) {
-                    self.stream_name = name.to_string();
-                }
-            }
-        }
+        self.resolve_stream_name(args);
         self.mode = SessionMode::Publish;
         self.state = SessionState::Publishing;
         info!(
@@ -135,19 +170,7 @@ impl RtmpSession {
 
     /// Handle play command
     pub fn handle_play(&mut self, args: &[Amf0Value]) -> String {
-        for arg in args {
-            if let Some(s) = arg.as_str() {
-                if s.len() > 0 {
-                    self.stream_name = s.to_string();
-                    break;
-                }
-            }
-            if let Some(map) = arg.as_object() {
-                if let Some(name) = map.get("streamName").and_then(|v| v.as_str()) {
-                    self.stream_name = name.to_string();
-                }
-            }
-        }
+        self.resolve_stream_name(args);
         self.mode = SessionMode::Play;
         self.state = SessionState::Playing;
         debug!(
@@ -177,6 +200,19 @@ impl RtmpSession {
         let id = self.transaction_id;
         self.transaction_id += 1.0;
         id
+    }
+}
+
+/// Derive stream id from RTMP tcUrl (`rtmp://host:port/live/name` or `rtmp://host:port/name`).
+pub fn stream_name_from_tc_url(tc_url: &str) -> Option<String> {
+    let rest = tc_url.strip_prefix("rtmp://")?;
+    let path = rest.split_once('/')?.1;
+    let parts: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    match parts.as_slice() {
+        ["live", name] => Some((*name).to_string()),
+        [name] => Some((*name).to_string()),
+        [.., name] if !name.is_empty() => Some((*name).to_string()),
+        _ => None,
     }
 }
 
@@ -347,5 +383,65 @@ pub struct RtmpPlayClock(crate::core::WallclockMsTimeline);
 impl RtmpPlayClock {
     pub fn map_wallclock(&mut self) -> u32 {
         self.0.map_ms()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_session() -> RtmpSession {
+        RtmpSession::new("127.0.0.1:1935")
+    }
+
+    #[test]
+    fn stream_name_from_tc_url_supports_live_and_single_path() {
+        assert_eq!(
+            stream_name_from_tc_url("rtmp://127.0.0.1:1935/live/pub_h264"),
+            Some("pub_h264".to_string())
+        );
+        assert_eq!(
+            stream_name_from_tc_url("rtmp://127.0.0.1:1935/pub_h264_rtsp"),
+            Some("pub_h264_rtsp".to_string())
+        );
+    }
+
+    #[test]
+    fn play_uses_app_when_stream_name_missing_in_single_path_url() {
+        let mut session = test_session();
+        session.handle_connect(&[Amf0Value::Object({
+            let mut map = std::collections::HashMap::new();
+            map.insert(
+                "app".to_string(),
+                Amf0Value::String("pub_h264_rtsp".to_string()),
+            );
+            map.insert(
+                "tcUrl".to_string(),
+                Amf0Value::String("rtmp://127.0.0.1:1935/pub_h264_rtsp".to_string()),
+            );
+            map
+        })]);
+        let stream = session.handle_play(&[
+            Amf0Value::Null,
+            Amf0Value::String(String::new()),
+            Amf0Value::String(String::new()),
+        ]);
+        assert_eq!(stream, "pub_h264_rtsp");
+    }
+
+    #[test]
+    fn play_prefers_explicit_stream_name_over_app() {
+        let mut session = test_session();
+        session.handle_connect(&[Amf0Value::Object({
+            let mut map = std::collections::HashMap::new();
+            map.insert("app".to_string(), Amf0Value::String("live".to_string()));
+            map
+        })]);
+        let stream = session.handle_play(&[
+            Amf0Value::Null,
+            Amf0Value::String("pub_h264_rtsp".to_string()),
+            Amf0Value::String(String::new()),
+        ]);
+        assert_eq!(stream, "pub_h264_rtsp");
     }
 }

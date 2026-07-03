@@ -18,7 +18,8 @@ use super::{
 use crate::core::dispatch::DispatchError;
 use crate::core::hevc_sprop_from_nals;
 use crate::core::{
-    CodecType, DispatchPolicy, MediaFrame, StreamManager, Track, AAC_DEFAULT_CLOCK_RATE,
+    CodecType, DispatchPolicy, MediaFrame, MetricsRegistry, PlaybackProtocol, StreamManager, Track,
+    AAC_DEFAULT_CLOCK_RATE,
 };
 use crate::server::webrtc::{H264RtpIngest, HevcRtpIngest};
 
@@ -1027,7 +1028,18 @@ impl RtspServerSession {
         let udp_tracks = self.udp_tracks.clone();
         let interleaved_channels = self.session.interleaved_channels.clone();
 
+        MetricsRegistry::inc_player(&stream_id, PlaybackProtocol::Rtsp);
         let handle = tokio::spawn(async move {
+            struct RtspPlayerGuard(String);
+            impl Drop for RtspPlayerGuard {
+                fn drop(&mut self) {
+                    MetricsRegistry::dec_player(&self.0, PlaybackProtocol::Rtsp);
+                }
+            }
+            let _player = RtspPlayerGuard(stream_id.clone());
+            let play_started_at = std::time::Instant::now();
+            let mut first_frame_sent = false;
+
             info!(
                 "[RTSP] [{}] Starting RTP sender (udp={}) SSRC={}",
                 stream_id, use_udp, rtp_ssrc
@@ -1083,6 +1095,8 @@ impl RtspServerSession {
                     let packets =
                         egress_rtp_packets(&frame, &manager, &stream_id, timeline, seq, rtp_ssrc);
 
+                    let mut sent_any = false;
+
                     if use_udp {
                         if let Some(track) = udp_tracks.get(&frame.track_id) {
                             let mut send_failed = false;
@@ -1105,29 +1119,45 @@ impl RtspServerSession {
                                     send_failed = true;
                                     break;
                                 }
+                                sent_any = true;
                             }
                             if send_failed {
                                 break 'rtp;
                             }
                         }
-                        continue;
-                    }
-
-                    // TCP interleaved: one RTP packet per interleaved frame
-                    let rtp_channel = rtp_channel_for_track(&interleaved_channels, frame.track_id)
-                        .unwrap_or(frame.track_id);
-                    for packet in packets {
-                        if packet.is_empty() {
+                        if !sent_any {
                             continue;
                         }
-                        let interleaved = RtspCommon::wrap_interleaved(&packet, rtp_channel);
-                        if write_tx.send(interleaved).await.is_err() {
-                            info!(
-                                "[RTSP] [{}] PLAY client {} disconnected — stopping RTP sender",
-                                stream_id, peer_addr
-                            );
-                            break 'rtp;
+                    } else {
+                        // TCP interleaved: one RTP packet per interleaved frame
+                        let rtp_channel = rtp_channel_for_track(&interleaved_channels, frame.track_id)
+                            .unwrap_or(frame.track_id);
+                        for packet in packets {
+                            if packet.is_empty() {
+                                continue;
+                            }
+                            let interleaved = RtspCommon::wrap_interleaved(&packet, rtp_channel);
+                            if write_tx.send(interleaved).await.is_err() {
+                                info!(
+                                    "[RTSP] [{}] PLAY client {} disconnected — stopping RTP sender",
+                                    stream_id, peer_addr
+                                );
+                                break 'rtp;
+                            }
+                            sent_any = true;
                         }
+                        if !sent_any {
+                            continue;
+                        }
+                    }
+
+                    if !first_frame_sent {
+                        first_frame_sent = true;
+                        MetricsRegistry::record_first_frame_ms(
+                            &stream_id,
+                            PlaybackProtocol::Rtsp,
+                            play_started_at.elapsed().as_millis() as u64,
+                        );
                     }
                     if frame_count <= 10 || frame.is_keyframe || frame_count % 100 == 0 {
                         info!(

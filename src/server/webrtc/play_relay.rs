@@ -8,6 +8,8 @@ use tokio::task::AbortHandle;
 use tracing::info;
 use uuid::Uuid;
 
+use crate::core::{MetricsRegistry, PlaybackProtocol};
+
 struct PlayRelayCtrl {
     stream_id: String,
     stop: watch::Sender<bool>,
@@ -44,6 +46,8 @@ pub fn cancel_play_relay(relay_id: &str) -> bool {
         return false;
     };
 
+    MetricsRegistry::dec_player(&ctrl.stream_id, PlaybackProtocol::Webrtc);
+
     let stream_id = ctrl.stream_id.clone();
     let _ = ctrl.stop.send(true);
     let abort = ctrl.abort;
@@ -73,6 +77,7 @@ pub fn register_play_relay(stream_id: &str) -> (String, watch::Receiver<bool>, u
         },
     );
     let active = count_for_stream(stream_id);
+    MetricsRegistry::inc_player(stream_id, PlaybackProtocol::Webrtc);
     info!(
         "[WebRTC] Registered play relay id='{}' stream='{}' active_players={}",
         relay_id, stream_id, active

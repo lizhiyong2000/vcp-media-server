@@ -20,10 +20,8 @@ use super::rtp_h264::{
 };
 use super::sdp_h264::parse_sprop_parameter_sets;
 use super::signaling::ServerSignal;
-use crate::core::{
-    parse_hevc_sprop_fmtp, CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode,
-    Track, VIDEO_RTP_CLOCK_RATE,
-};
+use crate::core::{parse_hevc_sprop_fmtp, CodecType, MediaFrame, MetricsRegistry, StreamManager, StreamProtocol, StreamSourceMode,
+    Track, VIDEO_RTP_CLOCK_RATE};
 use webrtc::api::API;
 
 pub struct PublishSession {
@@ -323,6 +321,7 @@ async fn read_hevc_track(
                 pkt.header.timestamp,
                 pkt.payload.len()
             );
+            MetricsRegistry::record_rtp_sequence_gap(&stream_id);
             ingest = HevcRtpIngest::new(manager.clone(), stream_id.clone(), "WebRTC");
         }
 
@@ -383,6 +382,7 @@ async fn read_h264_track(
                 pkt.payload.len(),
                 describe_rtp_payload(&pkt.payload)
             );
+            MetricsRegistry::record_rtp_sequence_gap(&stream_id);
             depacketizer.reset();
             batch.parts.clear();
             batch.is_keyframe = false;

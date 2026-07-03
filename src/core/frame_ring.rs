@@ -114,6 +114,10 @@ impl FrameRing {
         self.slots.len()
     }
 
+    pub fn bytes_used(&self) -> usize {
+        self.bytes_used
+    }
+
     pub fn latest_idr_seq(&self) -> Option<u64> {
         self.idr_seqs.back().copied()
     }

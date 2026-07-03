@@ -180,6 +180,14 @@ impl StreamHub {
         self.ring.read().oldest_seq()
     }
 
+    pub fn ring_frame_count(&self) -> usize {
+        self.ring.read().len()
+    }
+
+    pub fn ring_bytes_used(&self) -> usize {
+        self.ring.read().bytes_used()
+    }
+
     pub fn reset(&self) {
         *self.ring.write() = FrameRing::new();
         let _ = self.seq_tx.send(0);

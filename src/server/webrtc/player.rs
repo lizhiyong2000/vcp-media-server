@@ -32,7 +32,7 @@ use crate::core::dispatch::DispatchError;
 use crate::core::{
     extract_hevc_param_sets, is_parameter_set_only as is_parameter_set_only_for_codec,
     packetize_hevc_access_unit_for_rtp, prepend_annex_b_config, CodecType, DispatchPolicy,
-    MediaFrame, StreamManager,
+    MediaFrame, MetricsRegistry, PlaybackProtocol, StreamManager,
 };
 use webrtc::api::API;
 
@@ -604,6 +604,13 @@ async fn relay_stream_to_track(
         }
         last_sent_ts = Some(frame.timestamp);
         rtp_sent += 1;
+        if rtp_sent == 1 {
+            MetricsRegistry::record_first_frame_ms(
+                &stream_id,
+                PlaybackProtocol::Webrtc,
+                wait_start.elapsed().as_millis() as u64,
+            );
+        }
 
         if rtp_sent <= 8 || is_idr || frame.is_keyframe {
             info!(
