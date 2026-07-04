@@ -4,6 +4,7 @@ mod outbound_h264;
 mod peer;
 mod rtp_h264;
 mod sdp_h264;
+mod sdp_h265;
 pub use outbound_h264::annex_b_with_config;
 pub use publish_signaling::request_publisher_keyframe;
 pub use sdp_h264::parse_sprop_parameter_sets;

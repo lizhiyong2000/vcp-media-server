@@ -27,6 +27,7 @@ use super::play_relay::{attach_relay_abort_handle, register_play_relay, unregist
 use super::publish_signaling::request_publisher_keyframe;
 use super::publisher::wire_ice_candidates;
 use super::sdp_h264::{build_h264_sdp_fmtp, patch_answer_sdp_h264};
+use super::sdp_h265::{build_h265_sdp_fmtp, patch_answer_sdp_h265};
 use super::signaling::ServerSignal;
 use crate::core::dispatch::DispatchError;
 use crate::core::{
@@ -59,15 +60,20 @@ pub async fn start_play(
     manager.ensure_stream_hub(&stream_id);
     log_stream_codec_state(&manager, &stream_id, "play-request");
 
-    let h264_fmtp = if video_codec == CodecType::H264 {
-        manager
+    let fmtp = match video_codec {
+        CodecType::H264 => manager
             .get_stream(&stream_id.to_string())
             .and_then(|stream| match (&stream.sps, &stream.pps) {
                 (Some(sps), Some(pps)) => Some(build_h264_sdp_fmtp(sps, pps)),
                 _ => None,
-            })
-    } else {
-        None
+            }),
+        CodecType::H265 => manager
+            .get_stream(&stream_id.to_string())
+            .and_then(|stream| match (&stream.vps, &stream.sps, &stream.pps) {
+                (Some(vps), Some(sps), Some(pps)) => Some(build_h265_sdp_fmtp(vps, sps, pps)),
+                _ => None,
+            }),
+        _ => None,
     };
 
     let pc = new_peer_connection(&api).await?;
@@ -78,11 +84,11 @@ pub async fn start_play(
         clock_rate: 90000,
         ..Default::default()
     };
-    if let Some(fmtp) = &h264_fmtp {
-        codec_capability.sdp_fmtp_line = fmtp.clone();
+    if let Some(fmtp_value) = &fmtp {
+        codec_capability.sdp_fmtp_line = fmtp_value.clone();
         info!(
             "[WebRTC] Play track codec fmtp stream='{}' {}",
-            stream_id, fmtp
+            stream_id, fmtp_value
         );
     }
 
@@ -129,11 +135,21 @@ pub async fn start_play(
     pc.set_local_description(answer.clone()).await?;
 
     let mut answer_sdp = answer.sdp.clone();
-    if video_codec == CodecType::H264 {
-        if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
-            if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
-                answer_sdp = patch_answer_sdp_h264(&answer_sdp, sps, pps);
+    if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
+        match video_codec {
+            CodecType::H264 => {
+                if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
+                    answer_sdp = patch_answer_sdp_h264(&answer_sdp, sps, pps);
+                }
             }
+            CodecType::H265 => {
+                if let (Some(vps), Some(sps), Some(pps)) =
+                    (&stream.vps, &stream.sps, &stream.pps)
+                {
+                    answer_sdp = patch_answer_sdp_h265(&answer_sdp, vps, sps, pps);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -212,8 +228,13 @@ fn playable_video_codec(manager: &StreamManager, stream_id: &str) -> Result<Code
 
 fn webrtc_mime_type(codec: CodecType, offer_sdp: &str) -> &'static str {
     match codec {
-        CodecType::H265 if offer_has_rtpmap_codec(offer_sdp, "H265") => MIME_TYPE_H265,
-        CodecType::H265 => MIME_TYPE_HEVC,
+        CodecType::H265 => {
+            if offer_has_rtpmap_codec(offer_sdp, "H265") {
+                MIME_TYPE_H265
+            } else {
+                MIME_TYPE_HEVC
+            }
+        }
         _ => MIME_TYPE_H264,
     }
 }
@@ -816,6 +837,10 @@ mod tests {
         assert_eq!(
             webrtc_mime_type(CodecType::H265, h265_offer),
             MIME_TYPE_H265
+        );
+        assert_eq!(
+            webrtc_mime_type(CodecType::H265, hevc_offer),
+            MIME_TYPE_HEVC
         );
         assert!(ensure_offer_supports_video_codec(h264_offer, CodecType::H264).is_ok());
     }

@@ -700,6 +700,17 @@
         const playCaps = RTCRtpReceiver.getCapabilities('video');
         if (playCaps?.codecs?.length) {
           log('Play: receiver codecs=' + playCaps.codecs.map((c) => c.mimeType).join(','));
+          
+          const hevcCodecs = playCaps.codecs.filter((c) => c.mimeType.toLowerCase().includes('hevc') || c.mimeType.toLowerCase().includes('h265'));
+          const h264Codecs = playCaps.codecs.filter((c) => c.mimeType.toLowerCase().includes('h264'));
+          
+          if (hevcCodecs.length > 0) {
+            log('Play: HEVC codecs available, setting codec preference');
+            playTr.setCodecPreferences([...hevcCodecs, ...h264Codecs]);
+          } else if (h264Codecs.length > 0) {
+            log('Play: No HEVC codecs available, using H264');
+            playTr.setCodecPreferences(h264Codecs);
+          }
         }
         const remoteStream = new MediaStream();
         $('remoteVideo').srcObject = remoteStream;
@@ -710,6 +721,7 @@
             return;
           }
           log('收到远端 track: ' + ev.track.kind + ' id=' + ev.track.id + ' readyState=' + ev.track.readyState);
+          log('track codec: ' + (ev.track.getSettings ? JSON.stringify(ev.track.getSettings()) : 'no getSettings'));
           remoteStream.addTrack(ev.track);
           ev.track.onended = () => log('track ended: ' + ev.track.kind);
           ev.track.onmute = () => log('track muted: ' + ev.track.kind);
@@ -718,6 +730,26 @@
             $('remoteVideo').play().catch((e) => log('video.play(): ' + e));
           };
           $('remoteVideo').play().catch((e) => log('video.play(): ' + e));
+        };
+        
+        $('remoteVideo').onloadedmetadata = () => {
+          log('视频元数据加载完成: width=' + $('remoteVideo').videoWidth + ' height=' + $('remoteVideo').videoHeight);
+        };
+        
+        $('remoteVideo').onplaying = () => {
+          log('视频开始播放');
+        };
+        
+        $('remoteVideo').onwaiting = () => {
+          log('视频等待中...');
+        };
+        
+        $('remoteVideo').onstalled = () => {
+          log('视频流停滞');
+        };
+        
+        $('remoteVideo').onerror = (e) => {
+          log('视频错误: ' + e.message);
         };
         const offer = await playPc.createOffer();
         await playPc.setLocalDescription(offer);
