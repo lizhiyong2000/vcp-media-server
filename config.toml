@@ -53,21 +53,21 @@ ffmpeg_path = "ffmpeg"
 max_workers = 4
 
 [log]
-level = "debug"
+level = "info"
 path = "./logs/media-server.log"
 max_size_mb = 10
 max_files = 5
 
 [log.modules]
-rtsp = "debug"
-rtmp = "debug"
-http = "debug"
-http_flv = "debug"
-hls = "debug"
-webrtc = "debug"
-core = "debug"
-analysis = "debug"
-record = "debug"
+rtsp = "info"
+rtmp = "info"
+http = "info"
+http_flv = "info"
+hls = "info"
+webrtc = "info"
+core = "info"
+analysis = "info"
+record = "info"
 snapshot = "debug"
 transcode = "debug"
 
