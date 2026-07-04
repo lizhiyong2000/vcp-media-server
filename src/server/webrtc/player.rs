@@ -31,9 +31,9 @@ use super::sdp_h265::{build_h265_sdp_fmtp, patch_answer_sdp_h265};
 use super::signaling::ServerSignal;
 use crate::core::dispatch::DispatchError;
 use crate::core::{
-    extract_hevc_param_sets, is_parameter_set_only as is_parameter_set_only_for_codec,
-    packetize_hevc_access_unit_for_rtp, prepend_annex_b_config, CodecType, DispatchPolicy,
-    MediaFrame, MetricsRegistry, PlaybackProtocol, StreamManager,
+    extract_hevc_param_sets, is_keyframe_annex_b, is_parameter_set_only as is_parameter_set_only_for_codec,
+    packetize_hevc_access_unit_for_rtp, prepend_annex_b_config, video_media_timestamp_to_rtp_ticks,
+    CodecType, DispatchPolicy, MediaFrame, MetricsRegistry, PlaybackProtocol, StreamManager,
 };
 use webrtc::api::API;
 
@@ -94,7 +94,7 @@ pub async fn start_play(
 
     let outbound = if video_codec == CodecType::H265 {
         let track = Arc::new(TrackLocalStaticRTP::new(
-            codec_capability,
+            codec_capability.clone(),
             "video".to_owned(),
             stream_id.clone(),
         ));
@@ -103,6 +103,11 @@ pub async fn start_play(
                 Arc::clone(&track) as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>
             )
             .await?;
+        info!(
+            "[WebRTC] Codec negotiation: created H265 track with MIME type '{}', fmtp='{}'",
+            codec_capability.mime_type,
+            if codec_capability.sdp_fmtp_line.is_empty() { "none" } else { &codec_capability.sdp_fmtp_line }
+        );
         OutboundVideoTrack::H265 {
             track,
             seq: 1,
@@ -110,7 +115,7 @@ pub async fn start_play(
         }
     } else {
         let video_track = Arc::new(TrackLocalStaticSample::new(
-            codec_capability,
+            codec_capability.clone(),
             "video".to_owned(),
             stream_id.clone(),
         ));
@@ -118,6 +123,11 @@ pub async fn start_play(
             .add_track(Arc::clone(&video_track)
                 as Arc<dyn webrtc::track::track_local::TrackLocal + Send + Sync>)
             .await?;
+        info!(
+            "[WebRTC] Codec negotiation: created H264 track with MIME type '{}', fmtp='{}'",
+            codec_capability.mime_type,
+            if codec_capability.sdp_fmtp_line.is_empty() { "none" } else { &codec_capability.sdp_fmtp_line }
+        );
         OutboundVideoTrack::H264(OutboundH264Track::new(video_track))
     };
     info!(
@@ -215,38 +225,61 @@ fn validate_playable_stream(manager: &StreamManager, stream_id: &str) -> Result<
 }
 
 fn playable_video_codec(manager: &StreamManager, stream_id: &str) -> Result<CodecType> {
-    let stream = manager
-        .get_stream(&stream_id.to_string())
-        .ok_or_else(|| anyhow!("Stream '{}' not found", stream_id))?;
-    stream
-        .tracks
-        .iter()
-        .find(|track| matches!(track.codec, CodecType::H264 | CodecType::H265))
-        .map(|track| track.codec)
+    manager
+        .published_video_codec(stream_id)
         .ok_or_else(|| anyhow!("Stream '{}' has no playable video track", stream_id))
 }
 
 fn webrtc_mime_type(codec: CodecType, offer_sdp: &str) -> &'static str {
     match codec {
         CodecType::H265 => {
-            if offer_has_rtpmap_codec(offer_sdp, "H265") {
+            let has_h265 = offer_has_rtpmap_codec(offer_sdp, "H265");
+            let has_hevc = offer_has_rtpmap_codec(offer_sdp, "HEVC");
+            let selected = if has_h265 {
+                info!("[WebRTC] Codec negotiation: offer contains H265, selecting video/H265");
                 MIME_TYPE_H265
-            } else {
+            } else if has_hevc {
+                info!("[WebRTC] Codec negotiation: offer contains HEVC, selecting video/HEVC");
                 MIME_TYPE_HEVC
-            }
+            } else {
+                info!("[WebRTC] Codec negotiation: offer contains neither H265 nor HEVC, defaulting to video/HEVC");
+                MIME_TYPE_HEVC
+            };
+            info!(
+                "[WebRTC] Codec negotiation: final selected MIME type '{}' for H265 stream",
+                selected
+            );
+            selected
+        }
+        CodecType::H264 => {
+            info!("[WebRTC] Codec negotiation: selecting video/H264 for H264 stream");
+            MIME_TYPE_H264
         }
         _ => MIME_TYPE_H264,
     }
 }
 
 fn ensure_offer_supports_video_codec(offer_sdp: &str, codec: CodecType) -> Result<()> {
-    let supported = match codec {
+    let (supported, details) = match codec {
         CodecType::H265 => {
-            offer_has_rtpmap_codec(offer_sdp, "H265") || offer_has_rtpmap_codec(offer_sdp, "HEVC")
+            let has_h265 = offer_has_rtpmap_codec(offer_sdp, "H265");
+            let has_hevc = offer_has_rtpmap_codec(offer_sdp, "HEVC");
+            let supported = has_h265 || has_hevc;
+            let details = format!("H265={}, HEVC={}", has_h265, has_hevc);
+            (supported, details)
         }
-        CodecType::H264 => offer_has_rtpmap_codec(offer_sdp, "H264"),
+        CodecType::H264 => {
+            let supported = offer_has_rtpmap_codec(offer_sdp, "H264");
+            (supported, format!("H264={}", supported))
+        }
         _ => return Err(anyhow!("Unsupported WebRTC video codec {:?}", codec)),
     };
+    
+    info!(
+        "[WebRTC] Codec negotiation: checking if offer supports {:?} - {}",
+        codec, details
+    );
+    
     if supported {
         Ok(())
     } else {
@@ -348,9 +381,12 @@ impl OutboundVideoTrack {
     async fn wait_binding(&self, label: &str) -> Result<()> {
         match self {
             OutboundVideoTrack::H264(track) => track.wait_binding(label).await,
-            // TrackLocalStaticRTP has no public binding count; relay starts only after
-            // PeerConnection is connected, so the RTP binding should already be installed.
-            OutboundVideoTrack::H265 { .. } => Ok(()),
+            OutboundVideoTrack::H265 { .. } => {
+                // Bind runs during setLocalDescription; allow SRTP to finish after ICE connects.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                info!("[WebRTC] {} H265 RTP track ready", label);
+                Ok(())
+            }
         }
     }
 
@@ -359,22 +395,26 @@ impl OutboundVideoTrack {
         codec: CodecType,
         access_unit: &[u8],
         duration: Duration,
-        timestamp: u64,
-    ) -> Result<()> {
+        rtp_ts: u32,
+    ) -> Result<usize> {
         match self {
-            OutboundVideoTrack::H264(track) => track.send_access_unit(access_unit, duration).await,
+            OutboundVideoTrack::H264(track) => {
+                track.send_access_unit(access_unit, duration).await?;
+                Ok(access_unit.len())
+            }
             OutboundVideoTrack::H265 { track, seq, ssrc } => {
-                let rtp_ts = (timestamp & 0xFFFF_FFFF) as u32;
                 let packets =
                     packetize_hevc_access_unit_for_rtp(access_unit, 96, seq, rtp_ts, *ssrc);
+                let mut written = 0usize;
                 for packet in &packets {
                     let rtp = parse_generated_rtp_packet(packet)?;
-                    track.write_rtp(&rtp).await?;
+                    let n = track.write_rtp(&rtp).await?;
+                    written += n;
                 }
                 if packets.is_empty() && codec == CodecType::H265 {
                     debug!("[WebRTC] H265 access unit generated zero RTP packets");
                 }
-                Ok(())
+                Ok(written)
             }
         }
     }
@@ -533,18 +573,21 @@ async fn relay_stream_to_track(
             );
         }
 
-        let is_idr = frame.is_keyframe || contains_idr_nalu(&sample_data);
-        let nalu_desc = describe_annex_b(&sample_data);
+        let is_idr = is_keyframe_annex_b(video_codec, &sample_data);
 
         if is_parameter_set_only_for_codec(video_codec, &sample_data) {
             skipped += 1;
             continue;
         }
 
+        let nalu_desc = describe_annex_b(&sample_data);
+        let rtp_ts = video_media_timestamp_to_rtp_ticks(frame.timestamp, frame.clock_rate);
+        let rtp_ts_u64 = rtp_ts as u64;
+
         if streaming {
             if let Some(prev) = last_sent_ts {
-                if is_rtp_timeline_reset(frame.timestamp, prev) {
-                    if is_idr || frame.is_keyframe {
+                if is_rtp_timeline_reset(rtp_ts_u64, prev) {
+                    if is_idr {
                         info!(
                             "[WebRTC] Play new timeline IDR stream='{}' {} -> {}",
                             stream_id, prev, frame.timestamp
@@ -571,8 +614,7 @@ async fn relay_stream_to_track(
         }
 
         if !streaming {
-            let can_start = is_idr || frame.is_keyframe;
-            if !can_start {
+            if !is_idr {
                 skipped += 1;
                 if last_keyframe_request.elapsed() >= KEYFRAME_REQUEST_INTERVAL {
                     request_publisher_keyframe(&stream_id);
@@ -597,7 +639,7 @@ async fn relay_stream_to_track(
                 "[WebRTC] Play streaming started stream='{}' relay='{}' codec={:?} ts={} [{}] idr={} late_joiner={}",
                 stream_id, relay_id, video_codec, frame.timestamp, nalu_desc, is_idr, is_late_joiner
             );
-        } else if is_idr || frame.is_keyframe {
+        } else if is_idr {
             sample_data = prepend_stream_config(&manager, &stream_id, video_codec, &sample_data);
         }
 
@@ -606,24 +648,42 @@ async fn relay_stream_to_track(
         let duration = if catch_up {
             Duration::from_millis(1)
         } else {
-            duration_from_rtp_timestamps(last_sent_ts, frame.timestamp)
+            duration_from_rtp_timestamps(last_sent_ts, rtp_ts_u64)
         };
-        if stop_requested(&stop_rx) {
+        if stop_requested(&mut stop_rx) {
             break;
         }
-        tokio::select! {
-            biased;
-            _ = stop_rx.changed() => {
-                if stop_requested(&stop_rx) {
-                    info!("[WebRTC] Play relay stop during send stream='{}'", stream_id);
-                    break;
-                }
+        let mut send_ok = false;
+        for attempt in 0..20u32 {
+            if stop_requested(&mut stop_rx) {
+                break;
             }
-            result = outbound.send_access_unit(video_codec, &sample_data, duration, frame.timestamp) => {
-                result?;
+            let written = outbound
+                .send_access_unit(video_codec, &sample_data, duration, rtp_ts)
+                .await?;
+            if written > 0 {
+                send_ok = true;
+                break;
             }
+            if attempt == 0 && rtp_sent == 0 {
+                debug!(
+                    "[WebRTC] Play H265 RTP not bound yet stream='{}' rtp_ts={} — retry",
+                    stream_id, rtp_ts
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        last_sent_ts = Some(frame.timestamp);
+        if !send_ok {
+            skipped += 1;
+            if rtp_sent == 0 && skipped <= 3 {
+                warn!(
+                    "[WebRTC] Play H265 RTP send dropped stream='{}' rtp_ts={} (binding not ready?)",
+                    stream_id, rtp_ts
+                );
+            }
+            continue;
+        }
+        last_sent_ts = Some(rtp_ts_u64);
         rtp_sent += 1;
         if rtp_sent == 1 {
             MetricsRegistry::record_first_frame_ms(
@@ -633,14 +693,14 @@ async fn relay_stream_to_track(
             );
         }
 
-        if rtp_sent <= 8 || is_idr || frame.is_keyframe {
+        if rtp_sent <= 8 || is_idr {
             info!(
-                "[WebRTC] Play sent stream='{}' #{} ts={} [{}] kf={}",
+                "[WebRTC] Play sent stream='{}' #{} rtp_ts={} [{}] kf={}",
                 stream_id,
                 rtp_sent,
-                frame.timestamp,
+                rtp_ts,
                 nalu_desc,
-                is_idr || frame.is_keyframe
+                is_idr
             );
         } else if rtp_sent % 100 == 0 {
             info!(
@@ -751,6 +811,9 @@ async fn recv_coalesced_dispatch(
 
 fn store_live_nalu_config(manager: &StreamManager, stream_id: &str, codec: CodecType, data: &[u8]) {
     if codec == CodecType::H265 {
+        if stream_has_config(manager, stream_id, codec) {
+            return;
+        }
         let (vps, sps, pps) = extract_hevc_param_sets(data);
         if let (Some(vps), Some(sps), Some(pps)) = (vps, sps, pps) {
             manager.set_stream_hevc_params(stream_id, vps, sps, pps);

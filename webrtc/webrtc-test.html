@@ -727,9 +727,13 @@
           ev.track.onmute = () => log('track muted: ' + ev.track.kind);
           ev.track.onunmute = () => {
             log('track unmuted: ' + ev.track.kind);
-            $('remoteVideo').play().catch((e) => log('video.play(): ' + e));
+            $('remoteVideo').play().catch((e) => {
+              if (e?.name !== 'AbortError') log('video.play(): ' + e);
+            });
           };
-          $('remoteVideo').play().catch((e) => log('video.play(): ' + e));
+          $('remoteVideo').play().catch((e) => {
+            if (e?.name !== 'AbortError') log('video.play(): ' + e);
+          });
         };
         
         $('remoteVideo').onloadedmetadata = () => {

@@ -496,6 +496,8 @@ impl RtmpServer {
                                 if !annex_b.is_empty() {
                                     let is_keyframe =
                                         crate::core::is_keyframe_annex_b(CodecType::H265, &annex_b);
+                                    conn.stream_manager
+                                        .ensure_video_track_codec(&conn.stream_id, CodecType::H265);
                                     let frame = MediaFrame::new(
                                         conn.stream_id.clone(),
                                         0,
@@ -596,7 +598,7 @@ impl RtmpServer {
                     }
                     0x01 => {
                         conn.frames_received += 1;
-                        let is_keyframe = (data[0] & 0xF0) == 0x10;
+                        let header_keyframe = (data[0] & 0xF0) == 0x10;
                         let avcc_payload = &data[5..];
                         let video_codec = if video_codec_id == 0x0C {
                             CodecType::H265
@@ -605,7 +607,7 @@ impl RtmpServer {
                         };
 
                         if conn.frames_received <= 3
-                            || is_keyframe && conn.frames_received % 30 == 0
+                            || header_keyframe && conn.frames_received % 30 == 0
                         {
                             debug!(
                                 "[RTMP] [{}] <<< VIDEO {} {} ts={} size={} frame#{}",
@@ -636,6 +638,14 @@ impl RtmpServer {
                             }
 
                             if !annex_b.is_empty() {
+                                let is_keyframe = header_keyframe
+                                    || crate::core::is_keyframe_annex_b(video_codec, &annex_b);
+                                if video_codec == CodecType::H265 {
+                                    conn.stream_manager.ensure_video_track_codec(
+                                        &conn.stream_id,
+                                        CodecType::H265,
+                                    );
+                                }
                                 let frame = MediaFrame::new(
                                     conn.stream_id.clone(),
                                     0,

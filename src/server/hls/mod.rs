@@ -32,7 +32,7 @@ const MIN_SEGMENT_BYTES: usize = 512;
 const MAX_AUDIO_VIDEO_LAG_MS: u64 = 200;
 
 fn is_hls_video_keyframe(frame: &MediaFrame) -> bool {
-    frame.is_keyframe && matches!(frame.codec, CodecType::H264 | CodecType::H265)
+    crate::core::is_video_keyframe(frame)
 }
 
 fn audio_timestamp_delta_ms(prev: u64, curr: u64, clock_rate: Option<u32>) -> u64 {

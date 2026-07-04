@@ -81,6 +81,19 @@ pub fn flv_timestamp_ms(codec: crate::core::CodecType, raw: u64) -> u32 {
     (ms & 0xFFFF_FFFF) as u32
 }
 
+/// Map a stored media timestamp to 90 kHz RTP ticks for WebRTC video egress.
+pub fn video_media_timestamp_to_rtp_ticks(timestamp: u64, clock_rate: Option<u32>) -> u32 {
+    match clock_rate {
+        Some(MILLISECOND_CLOCK_RATE) => {
+            ((timestamp.saturating_mul(VIDEO_RTP_CLOCK_HZ)) / 1_000) as u32
+        }
+        Some(VIDEO_RTP_CLOCK_RATE) => timestamp as u32,
+        Some(rate) => ((timestamp.saturating_mul(VIDEO_RTP_CLOCK_HZ)) / rate.max(1) as u64) as u32,
+        None if timestamp > 1_000_000 => timestamp as u32,
+        None => ((timestamp.saturating_mul(VIDEO_RTP_CLOCK_HZ)) / 1_000) as u32,
+    }
+}
+
 /// Wall-clock FLV/RTMP tag timeline for low-latency live play.
 ///
 /// Tag timestamps follow elapsed wall time instead of publisher media time, so players
@@ -243,6 +256,18 @@ mod tests {
     fn low_base_rtsp_rtp_video_delta_uses_rtp_clock_domain() {
         assert_eq!(media_timestamp_delta_ms(90_000, 91_800), 20);
         assert_eq!(media_timestamp_delta_ms(90_000, 93_600), 40);
+    }
+
+    #[test]
+    fn video_media_timestamp_to_rtp_ticks_converts_rtmp_ms() {
+        assert_eq!(
+            video_media_timestamp_to_rtp_ticks(1_000, Some(MILLISECOND_CLOCK_RATE)),
+            90_000
+        );
+        assert_eq!(
+            video_media_timestamp_to_rtp_ticks(91_800, Some(VIDEO_RTP_CLOCK_RATE)),
+            91_800
+        );
     }
 
     #[test]

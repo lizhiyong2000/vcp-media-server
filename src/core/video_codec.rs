@@ -78,23 +78,13 @@ pub fn contains_h264_idr(data: &[u8]) -> bool {
 }
 
 pub fn contains_hevc_idr(data: &[u8]) -> bool {
-    if data.len() < 5 {
-        return false;
+    for (start, _) in iter_annex_b_nal_ranges(data) {
+        match hevc_nalu_type(data[start]) {
+            H265_NAL_IDR_W_RADL | H265_NAL_IDR_N_LP | H265_NAL_CRA => return true,
+            _ => {}
+        }
     }
-    
-    let mut offset = 0;
-    if data.starts_with(&ANNEX_B_PREFIX) {
-        offset = 4;
-    } else if data.starts_with(&[0, 0, 1]) {
-        offset = 3;
-    }
-    
-    if offset >= data.len() {
-        return false;
-    }
-    
-    let nalu_type = hevc_nalu_type(data[offset]);
-    matches!(nalu_type, H265_NAL_IDR_W_RADL | H265_NAL_IDR_N_LP | H265_NAL_CRA)
+    false
 }
 
 pub fn is_keyframe_annex_b(codec: CodecType, data: &[u8]) -> bool {
@@ -634,6 +624,32 @@ pub fn packetize_hevc_nal_for_rtp(
     packets
 }
 
+pub fn strip_hevc_aud_from_annex_b(annex_b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(annex_b.len());
+    for (start, end) in iter_annex_b_nal_ranges(annex_b) {
+        if hevc_nalu_type(annex_b[start]) == H265_NAL_AUD {
+            continue;
+        }
+        out.extend_from_slice(&ANNEX_B_PREFIX);
+        out.extend_from_slice(&annex_b[start..end]);
+    }
+    if out.is_empty() {
+        annex_b.to_vec()
+    } else {
+        out
+    }
+}
+
+fn build_hevc_ap_rtp_payload(nalus: &[&[u8]]) -> Vec<u8> {
+    let mut payload = vec![0x60, 0x01]; // AP (48), layer_id=0, tid=1
+    for nal in nalus {
+        let len = nal.len().min(u16::MAX as usize) as u16;
+        payload.extend_from_slice(&len.to_be_bytes());
+        payload.extend_from_slice(nal);
+    }
+    payload
+}
+
 pub fn packetize_hevc_access_unit_for_rtp(
     annex_b: &[u8],
     payload_type: u8,
@@ -641,17 +657,27 @@ pub fn packetize_hevc_access_unit_for_rtp(
     ts: u32,
     ssrc: u32,
 ) -> Vec<Vec<u8>> {
-    let ranges = iter_annex_b_nal_ranges(annex_b);
+    let annex_b = strip_hevc_aud_from_annex_b(annex_b);
+    let ranges = iter_annex_b_nal_ranges(&annex_b);
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    let nalus: Vec<&[u8]> = ranges
+        .iter()
+        .map(|(start, end)| &annex_b[*start..*end])
+        .collect();
+    let ap_payload = build_hevc_ap_rtp_payload(&nalus);
+    if ap_payload.len() <= UDP_RTP_MAX_PAYLOAD {
+        let pkt = build_rtp_packet(payload_type, *seq, ts, ssrc, true, &ap_payload);
+        *seq = seq.wrapping_add(1);
+        return vec![pkt];
+    }
+
     let mut packets = Vec::new();
-    for (i, (start, end)) in ranges.iter().enumerate() {
-        let marker = i + 1 == ranges.len();
+    for (i, nal) in nalus.iter().enumerate() {
+        let marker = i + 1 == nalus.len();
         packets.extend(packetize_hevc_nal_for_rtp(
-            &annex_b[*start..*end],
-            payload_type,
-            seq,
-            ts,
-            ssrc,
-            marker,
+            nal, payload_type, seq, ts, ssrc, marker,
         ));
     }
     packets
@@ -789,6 +815,15 @@ mod tests {
     fn hevc_cra_is_treated_as_random_access_keyframe() {
         let cra = [0x00, 0x00, 0x00, 0x01, 0x2a, 0x01, 0xaf];
         assert!(contains_hevc_idr(&cra));
+    }
+
+    #[test]
+    fn hevc_idr_detection_skips_leading_aud() {
+        let au = prepare_video_au_for_ts(
+            CodecType::H265,
+            &[0x00, 0x00, 0x00, 0x01, 0x2a, 0x01, 0xaf],
+        );
+        assert!(contains_hevc_idr(&au));
     }
 
     #[test]

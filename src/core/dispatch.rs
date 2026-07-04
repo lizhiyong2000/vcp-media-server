@@ -154,6 +154,25 @@ impl DispatchReader {
         stream_id: &str,
     ) -> Option<MediaFrame> {
         let started_at = Instant::now();
+
+        // RTMP publishers cannot honor WebRTC keyframe requests — use the latest buffered IDR/CRA.
+        if self.policy == DispatchPolicy::WebRtcPlay {
+            if let Some(idr_seq) = self.hub.latest_idr_seq() {
+                if let Some(idr) = self.hub.get(idr_seq).filter(is_playable_idr) {
+                    self.cursor = idr_seq.saturating_add(1);
+                    self.primed = true;
+                    info!(
+                        "[Dispatch] [{}] prime_from_idr immediate IDR ts={} seq={} latest_seq={}",
+                        stream_id,
+                        idr.timestamp,
+                        idr_seq,
+                        self.hub.latest_seq()
+                    );
+                    return Some(idr);
+                }
+            }
+        }
+
         let baseline_latest = self.hub.latest_seq();
         let baseline_idr = self.hub.latest_idr_seq();
         let requested = request_publisher_keyframe(stream_id);
@@ -174,14 +193,14 @@ impl DispatchReader {
                 let (close_to_live, live_lag, media_lag_ms) = self.idr_is_close_to_live(idr_seq);
                 if fresh_after_request || close_to_live {
                     if let Some(idr) = self.hub.get(idr_seq).filter(is_playable_idr) {
-                        self.cursor = idr_seq;
+                        self.cursor = idr_seq.saturating_add(1);
                         self.primed = true;
                         info!(
                             "[Dispatch] [{}] prime_from_idr hit IDR after={}ms ts={} seq={} fresh={} live_lag={} media_lag_ms={:?} latest_seq={}",
                             stream_id,
                             started_at.elapsed().as_millis(),
                             idr.timestamp,
-                            self.cursor,
+                            idr_seq,
                             fresh_after_request,
                             live_lag,
                             media_lag_ms,
@@ -216,14 +235,14 @@ impl DispatchReader {
             let (close_to_live, live_lag, media_lag_ms) = self.idr_is_close_to_live(idr_seq);
             if fresh_after_request || close_to_live {
                 if let Some(idr) = self.hub.get(idr_seq).filter(is_playable_idr) {
-                    self.cursor = idr_seq;
+                    self.cursor = idr_seq.saturating_add(1);
                     self.primed = true;
                     info!(
                         "[Dispatch] [{}] prime_from_idr fallback IDR after={}ms ts={} seq={} fresh={} live_lag={} media_lag_ms={:?} latest_seq={}",
                         stream_id,
                         started_at.elapsed().as_millis(),
                         idr.timestamp,
-                        self.cursor,
+                        idr_seq,
                         fresh_after_request,
                         live_lag,
                         media_lag_ms,
@@ -278,6 +297,26 @@ impl DispatchReader {
             self.hub.latest_seq(),
             self.hub.latest_idr_seq()
         );
+
+        // RTMP/FLV publishers cannot honor WebRTC PLI — use the latest ring IDR so replay
+        // does not stall until the next GOP when an existing keyframe is already buffered.
+        if self.policy == DispatchPolicy::WebRtcPlay {
+            if let Some(idr_seq) = self.hub.latest_idr_seq() {
+                if let Some(idr) = self.hub.get(idr_seq).filter(is_playable_idr) {
+                    self.cursor = idr_seq.saturating_add(1);
+                    self.primed = true;
+                    info!(
+                        "[Dispatch] [{}] prime_from_idr stale IDR fallback after={}ms ts={} seq={} latest_seq={}",
+                        stream_id,
+                        started_at.elapsed().as_millis(),
+                        idr.timestamp,
+                        idr_seq,
+                        self.hub.latest_seq()
+                    );
+                    return Some(idr);
+                }
+            }
+        }
 
         None
     }
@@ -334,7 +373,7 @@ impl DispatchReader {
                 );
                 request_publisher_keyframe(&self.stream_id);
             }
-            DispatchPolicy::WebRtcPlay if lag > WEBRTC_LAG_SNAP_THRESHOLD => {
+            DispatchPolicy::WebRtcPlay if lag > WEBRTC_LAG_SNAP_THRESHOLD && !self.primed => {
                 info!(
                     "[Dispatch] [{}] WebRTC lag {} frames — snap to edge",
                     self.stream_id, lag
@@ -343,6 +382,12 @@ impl DispatchReader {
                 self.pending_live_snap = true;
                 self.snap_to_live_edge();
                 latest = self.hub.latest_seq();
+            }
+            DispatchPolicy::WebRtcPlay if lag > WEBRTC_LAG_SNAP_THRESHOLD && self.primed => {
+                info!(
+                    "[Dispatch] [{}] WebRTC lag {} frames — sequential catch-up from primed IDR",
+                    self.stream_id, lag
+                );
             }
             DispatchPolicy::WebRtcPlay => {}
             DispatchPolicy::LiveCoalesce => {}
@@ -424,6 +469,17 @@ impl DispatchReader {
         }
 
         self.cursor = batch_end.saturating_add(1);
+
+        if matches!(self.policy, DispatchPolicy::WebRtcPlay) && self.primed {
+            let lag = self.hub.latest_seq().saturating_sub(self.cursor);
+            if lag <= WEBRTC_LAG_SNAP_THRESHOLD {
+                self.primed = false;
+                info!(
+                    "[Dispatch] [{}] WebRTC catch-up complete at cursor={} (lag={})",
+                    self.stream_id, self.cursor, lag
+                );
+            }
+        }
 
         Ok(match self.policy {
             DispatchPolicy::LiveCoalesce | DispatchPolicy::WebRtcPlay => coalesce_flv_batch(frames),
@@ -774,7 +830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prime_from_idr_waits_for_fresh_idr_when_existing_idr_is_stale() {
+    async fn webrtc_play_primes_from_buffered_idr_without_waiting_for_fresh() {
         let hub = StreamHub::new("s");
         let base = 2_648_000_000u64;
         hub.publish(MediaFrame::new(
@@ -814,13 +870,13 @@ mod tests {
         let idr = reader
             .prime_from_idr(&manager, "s")
             .await
-            .expect("fresh IDR should be primed");
+            .expect("buffered IDR should be primed immediately for WebRTC play");
 
-        assert_eq!(idr.timestamp, base + 41 * 3600);
+        assert_eq!(idr.timestamp, base);
         assert_eq!(
             reader.cursor(),
-            41,
-            "cursor should start at the fresh IDR seq"
+            1,
+            "cursor should advance past primed IDR"
         );
     }
 
@@ -924,6 +980,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webrtc_play_sequential_catchup_after_prime_skips_snap() {
+        let hub = StreamHub::new("s");
+        let base = 2_648_000_000u64;
+        for gop in 0..4 {
+            publish_gop(&hub, gop, base);
+        }
+
+        let manager = StreamManager::new();
+        let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::WebRtcPlay);
+        reader.cursor = 0;
+
+        let idr = reader
+            .prime_from_idr(&manager, "s")
+            .await
+            .expect("should prime from latest IDR");
+        assert!(reader.primed);
+        let idr_seq = hub.latest_idr_seq().expect("IDR indexed");
+        assert_eq!(reader.cursor(), idr_seq.saturating_add(1));
+
+        let mut delivered = 0usize;
+        for _ in 0..10 {
+            let batch = reader.recv_batch().await.unwrap();
+            assert!(
+                !reader.take_live_snap(),
+                "primed WebRTC play must not snap to live edge mid catch-up"
+            );
+            if batch.is_empty() {
+                break;
+            }
+            delivered += batch.len();
+        }
+
+        assert!(
+            delivered >= 5,
+            "should deliver sequential frames after primed IDR, got {delivered}"
+        );
+        assert_eq!(idr.timestamp, hub.get(idr_seq).unwrap().timestamp);
+    }
+
+    #[tokio::test]
     async fn webrtc_play_snaps_when_lag_exceeds_threshold() {
         let hub = StreamHub::new("s");
         let base = 2_648_000_000u64;
@@ -934,12 +1030,17 @@ mod tests {
         let mut reader = DispatchReader::new(hub.clone(), DispatchPolicy::WebRtcPlay);
         reader.cursor = 0;
 
-        let batch = reader.recv_batch().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(50), reader.recv_batch()).await;
         assert!(
-            batch.len() < 100,
-            "WebRTC play should snap when lag > {WEBRTC_LAG_SNAP_THRESHOLD}, delivered {}",
-            batch.len()
+            reader.take_live_snap(),
+            "large lag should flag live snap"
         );
-        assert!(reader.take_live_snap(), "large lag should flag live snap");
+        if let Ok(Ok(batch)) = result {
+            assert!(
+                batch.len() < 100,
+                "WebRTC play should snap when lag > {WEBRTC_LAG_SNAP_THRESHOLD}, delivered {}",
+                batch.len()
+            );
+        }
     }
 }

@@ -38,8 +38,8 @@ pub use pusher::*;
 pub use tester::StreamTester;
 pub use timestamp::{
     flv_timestamp_ms, media_frame_timestamp_delta_ms, media_timestamp_delta_ms,
-    media_timestamp_delta_ms_with_clock, FlvPlayTimeline, WallclockMsTimeline,
-    AAC_DEFAULT_CLOCK_RATE, MILLISECOND_CLOCK_RATE, VIDEO_RTP_CLOCK_RATE,
+    media_timestamp_delta_ms_with_clock, video_media_timestamp_to_rtp_ticks, FlvPlayTimeline,
+    WallclockMsTimeline, AAC_DEFAULT_CLOCK_RATE, MILLISECOND_CLOCK_RATE, VIDEO_RTP_CLOCK_RATE,
 };
 pub use video_codec::{
     build_enhanced_rtmp_hevc_sequence_header, build_rtmp_hevc_sequence_header,

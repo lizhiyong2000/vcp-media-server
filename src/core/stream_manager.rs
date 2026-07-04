@@ -12,6 +12,7 @@ use super::stream_hub::StreamHub;
 use super::{
     CodecType, MediaFrame, PlaybackStatus, ReceiverId, ReceiverStatus, Stream, StreamId,
     StreamProtocol, StreamReceiver, StreamSinkMode, StreamSourceMode, StreamStatus, Track,
+    VIDEO_RTP_CLOCK_RATE,
 };
 
 pub struct StreamManager {
@@ -145,6 +146,56 @@ impl StreamManager {
                     .push(Track::new(1, CodecType::AAC, 97, 48_000));
             });
         }
+    }
+
+    /// Mark the primary video track as H264/H265 (RTMP publish starts with placeholder H264).
+    pub fn ensure_video_track_codec(&self, stream_id: &str, codec: CodecType) {
+        if !matches!(codec, CodecType::H264 | CodecType::H265) {
+            return;
+        }
+        if let Some(hub) = self.get_hub(stream_id) {
+            hub.update_stream(|stream| {
+                if let Some(track) = stream.tracks.iter_mut().find(|t| t.id == 0) {
+                    if track.codec != codec {
+                        track.codec = codec;
+                    }
+                } else {
+                    stream
+                        .tracks
+                        .insert(0, Track::new(0, codec, 96, VIDEO_RTP_CLOCK_RATE));
+                }
+            });
+        }
+    }
+
+    /// Resolve the codec actually being published (stream metadata, ring, then track list).
+    pub fn published_video_codec(&self, stream_id: &str) -> Option<CodecType> {
+        let stream = self.get_stream(&stream_id.to_string())?;
+        if stream.vps.is_some() && stream.sps.is_some() && stream.pps.is_some() {
+            return Some(CodecType::H265);
+        }
+        if stream.sps.is_some() && stream.pps.is_some() && stream.vps.is_none() {
+            return Some(CodecType::H264);
+        }
+        if let Some(hub) = self.get_hub(stream_id) {
+            let latest = hub.latest_seq();
+            if let Some(frame) = hub.get(latest) {
+                if matches!(frame.codec, CodecType::H264 | CodecType::H265) {
+                    return Some(frame.codec);
+                }
+            }
+        }
+        stream
+            .tracks
+            .iter()
+            .find(|t| t.codec == CodecType::H265)
+            .or_else(|| {
+                stream
+                    .tracks
+                    .iter()
+                    .find(|t| matches!(t.codec, CodecType::H264 | CodecType::H265))
+            })
+            .map(|t| t.codec)
     }
 
     /// Merge VPS/SPS/PPS from a single NALU into stream codec config.
@@ -596,6 +647,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::collections::{HashMap, HashSet};
+    use crate::core::default_live_tracks;
 
     fn create_test_stream(manager: &StreamManager, stream_id: &str) -> Stream {
         manager.create_stream(
@@ -711,6 +763,33 @@ mod tests {
         assert_eq!(from_manager.playback_status, PlaybackStatus::Playing);
         assert_eq!(from_manager.status, StreamStatus::Paused);
         assert_eq!(from_hub.status, StreamStatus::Paused);
+    }
+
+    #[test]
+    fn published_video_codec_prefers_ring_over_placeholder_h264_track() {
+        let manager = StreamManager::new();
+        manager.create_stream("s", StreamSourceMode::Push, StreamProtocol::RTMP, None);
+        manager.set_stream_tracks("s", default_live_tracks());
+        manager.ensure_stream_hub("s");
+
+        assert_eq!(
+            manager.published_video_codec("s"),
+            Some(CodecType::H264)
+        );
+
+        manager.publish_frame(MediaFrame::new(
+            "s".into(),
+            0,
+            1000,
+            bytes::Bytes::from_static(&[0, 0, 0, 1, 0x2a, 0x01, 0xaf]),
+            true,
+            CodecType::H265,
+        ));
+
+        assert_eq!(
+            manager.published_video_codec("s"),
+            Some(CodecType::H265)
+        );
     }
 
     #[test]
