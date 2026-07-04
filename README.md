@@ -28,60 +28,67 @@ Rust 实现的轻量级流媒体服务，以 `StreamManager` 为媒体中枢，�
 
 ## 按协议
 
-| 协议 | 端口 | 接入（发布） | 分发（播放） | 编码 | 状态 |
-|------|------|--------------|--------------|------|------|
-| RTMP | 1935 | publish | play | H264 / H265 | 已支持 |
-| RTSP | 554 | ANNOUNCE + RECORD（TCP / UDP） | DESCRIBE + PLAY（TCP / UDP） | H264 / H265 | 已支持 |
-| HTTP-FLV | 8081 | — | `GET /flv/<stream_id>` | H264 / H265 | 已支持 |
-| HLS | 8081 | — | `GET /hls/<stream_id>/live.m3u8` | H264 / H265 | 已支持 |
-| WebRTC | 9080 | WebSocket 信令 publish | WebSocket 信令 play | H264 / H265 | 已支持 |
-| GB28181 | 5060（规划） | SIP 注册 · PS over RTP 接入 | 国标级联输出 | H264 / H265（规划） | 规划中 |
+| 协议       | 端口       | 接入（发布）                       | 分发（播放）                           | 编码              | 状态  |
+| -------- | -------- | ---------------------------- | -------------------------------- | --------------- | --- |
+| RTMP     | 1935     | publish                      | play                             | H264 / H265     | 已支持 |
+| RTSP     | 554      | ANNOUNCE + RECORD（TCP / UDP） | DESCRIBE + PLAY（TCP / UDP）       | H264 / H265     | 已支持 |
+| HTTP-FLV | 8081     | —                            | `GET /flv/<stream_id>`           | H264 / H265     | 已支持 |
+| HLS      | 8081     | —                            | `GET /hls/<stream_id>/live.m3u8` | H264 / H265     | 已支持 |
+| WebRTC   | 9080     | WebSocket 信令 publish         | WebSocket 信令 play                | H264 / H265     | 已支持 |
+| GB28181  | 5060（规划） | SIP 注册 · PS over RTP 接入      | 国标级联输出                           | H264 / H265（规划） | 规划中 |
 
 **地址示例**
 
-| 协议 | 示例 |
-|------|------|
-| RTMP | `rtmp://127.0.0.1:1935/live/stream1` |
-| RTSP | `rtsp://127.0.0.1:554/stream1` |
-| HTTP-FLV | `http://127.0.0.1:8081/flv/stream1` |
-| HLS | `http://127.0.0.1:8081/hls/stream1/live.m3u8` |
+| 协议         | 示例                                              |
+| ---------- | ----------------------------------------------- |
+| RTMP       | `rtmp://127.0.0.1:1935/live/stream1`            |
+| RTSP       | `rtsp://127.0.0.1:554/stream1`                  |
+| HTTP-FLV   | `http://127.0.0.1:8081/flv/stream1`             |
+| HLS        | `http://127.0.0.1:8081/hls/stream1/live.m3u8`   |
 | WebRTC 测试页 | `http://127.0.0.1:8081/webrtc/webrtc-test.html` |
-| HTTP API | `http://127.0.0.1:8081/api/streams` |
+| HTTP API   | `http://127.0.0.1:8081/api/streams`             |
 
 ## 按功能
 
 ### 流接入
 
-| 功能 | 说明 | 状态 |
-|------|------|------|
-| RTMP 推流 | ffmpeg / OBS 等客户端 publish | 已支持 |
-| RTSP 推流 | ffmpeg ANNOUNCE + RECORD，TCP / UDP | 已支持 |
-| WebRTC 推流 | 浏览器经 WebSocket 信令发布，测试页可选择 H264 或 H265/HEVC | 已支持 |
-| RTMP 拉流 | HTTP API 从远端 RTMP 拉取并本地 relay | 已支持 |
-| RTSP 拉流 | HTTP API 从远端 RTSP 拉取，支持 `?transport=udp` | 已支持 |
-| RTSP 推流转发 | HTTP API 向远端 RTSP 地址推流 | 已支持 |
-| GB28181 接入 | SIP 注册、目录、实时点播，PS 解复用入 Hub | 规划中 |
+| 功能         | 说明                                          | 状态  |
+| ---------- | ------------------------------------------- | --- |
+| RTMP 推流    | ffmpeg / OBS 等客户端 publish                   | 已支持 |
+| RTSP 推流    | ffmpeg ANNOUNCE + RECORD，TCP / UDP          | 已支持 |
+| WebRTC 推流  | 浏览器经 WebSocket 信令发布，测试页可选择 H264 或 H265/HEVC | 已支持 |
+| RTMP 拉流    | HTTP API 从远端 RTMP 拉取并本地 relay               | 已支持 |
+| RTSP 拉流    | HTTP API 从远端 RTSP 拉取，支持 `?transport=udp`    | 已支持 |
+| RTSP 推流转发  | HTTP API 向远端 RTSP 地址推流                      | 已支持 |
+| GB28181 接入 | SIP 注册、目录、实时点播，PS 解复用入 Hub                  | 规划中 |
 
 ### 流分发
 
-| 功能 | 说明 | 状态 |
-|------|------|------|
-| 跨协议播放 | 任一路接入，RTMP / RTSP / FLV / HLS / WebRTC 均可播放同一 `stream_id` | 已支持 |
-| RTSP UDP 传输 | 推流、播放、拉流均支持 UDP RTP | 已支持 |
-| WebRTC 多路播放 | 同一 `stream_id` 多浏览器独立 relay | 已支持 |
-| 录制文件回放 | fMP4 / TS 归档，按时间段查询与下载 | 规划中 |
-| GB28181 级联输出 | 向上级平台回传 PS over RTP | 规划中 |
+| 功能           | 说明                                                        | 状态  |
+| ------------ | --------------------------------------------------------- | --- |
+| 跨协议播放        | 任一路接入，RTMP / RTSP / FLV / HLS / WebRTC 均可播放同一 `stream_id` | 已支持 |
+| RTSP UDP 传输  | 推流、播放、拉流均支持 UDP RTP                                       | 已支持 |
+| WebRTC 多路播放  | 同一 `stream_id` 多浏览器独立 relay                               | 已支持 |
+| 录制文件回放       | fMP4 / TS 归档，按时间段查询与下载                                    | 规划中 |
+| GB28181 级联输出 | 向上级平台回传 PS over RTP                                       | 规划中 |
 
 ### 编解码
 
-| 功能 | 说明 | 状态 |
-|------|------|------|
-| H264 透传 | RTMP / RTSP / FLV / HLS / WebRTC 全链路 | 已支持 |
+| 功能             | 说明                                                        | 状态  |
+| -------------- | --------------------------------------------------------- | --- |
+| H264 透传        | RTMP / RTSP / FLV / HLS / WebRTC 全链路                      | 已支持 |
 | H265 / HEVC 透传 | RTMP / RTSP / FLV / HLS / WebRTC 全链路，支持 VPS/SPS/PPS 参数集传播 | 已支持 |
+<<<<<<< HEAD
 | AAC 音频 | RTMP / RTSP / FLV / HLS 伴音 | 已支持 |
 | Opus 音频 | WebRTC 推流音频接入 | 已支持 |
 | 视频转码 | H.264 ↔ H.265 互转，分辨率/码率/帧率调整，输出衍生流 | 已支持 |
 | 滤镜 | 水印、帧率控制等 | 规划中 |
+=======
+| AAC 音频         | RTMP / RTSP / FLV / HLS 伴音                                | 已支持 |
+| Opus 音频        | WebRTC 推流音频接入                                             | 已支持 |
+| 视频转码           | H.264 ↔ H.265 互转，分辨率/码率/帧率调整，输出衍生流                        | 已支持 |
+| 滤镜             | 水印、帧率控制等                                                  | 规划中 |
+>>>>>>> c058ff7 (docs(readme): 更新转码功能描述，标记为已支持，并添加功能截图)
 
 **H265 / HEVC 注意事项**
 
@@ -92,14 +99,15 @@ Rust 实现的轻量级流媒体服务，以 `StreamManager` 为媒体中枢，�
 
 ### 媒体处理
 
-| 功能 | 说明 | 状态 |
-|------|------|------|
+| 功能        | 说明                  | 状态  |
+| --------- | ------------------- | --- |
 | 直播 HLS 切片 | 按需生成 MPEG-TS，滑动窗口保留 | 已支持 |
-| 视频录制 | 独立 DVR，关键帧对齐切片，长期保留 | 规划中 |
-| 视频分析 | 码流指标、场景检测、插件化内容分析 | 规划中 |
+| 视频录制      | 独立 DVR，关键帧对齐切片，长期保留 | 规划中 |
+| 视频分析      | 码流指标、场景检测、插件化内容分析   | 规划中 |
 
 ### 管理与控制
 
+<<<<<<< HEAD
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | 流列表 / 详情 | `GET /api/streams`、`GET /api/stream/<id>` | 已支持 |
@@ -111,6 +119,33 @@ Rust 实现的轻量级流媒体服务，以 `StreamManager` 为媒体中枢，�
 | 转码 API | 转码会话管理、H.264/H.265 互转、分辨率/码率/帧率调整 | 已支持 |
 | 分析 API | 衍生流配置、分析任务与事件查询 | 规划中 |
 | GB28181 API | 设备目录、点播控制 | 规划中 |
+=======
+| 功能          | 说明                                                                               | 状态  |
+| ----------- | -------------------------------------------------------------------------------- | --- |
+| 流列表 / 详情    | `GET /api/streams`、`GET /api/stream/<id>`                                        | 已支持 |
+| 流创建 / 删除    | `POST /api/streams`、`DELETE /api/stream/<id>`                                    | 已支持 |
+| 健康检查        | `GET /health`                                                                    | 已支持 |
+| 运行指标        | `GET /api/metrics`、`GET /api/metrics/<id>` — 关键帧请求、首帧耗时、播放器数、HLS 切片、ring/RTP gap | 已支持 |
+| 拉流 / 推流 API | `POST /api/rtmp/pull`、`POST /api/rtsp/pull`、`POST /api/rtsp/push`                | 已支持 |
+| 录制控制 API    | 启停录制、查询录制列表与回放                                                                   | 规划中 |
+| 转码 API      | 转码会话管理、H.264/H.265 互转、分辨率/码率/帧率调整                                                | 已支持 |
+| 分析 API      | 衍生流配置、分析任务与事件查询                                                                  | 规划中 |
+| GB28181 API | 设备目录、点播控制                                                                        | 规划中 |
+
+## 管理界面功能截图
+
+### 设备列表
+
+![概览面板](docs/dashboard.png)
+
+### 设备流播放
+
+![服务器管理](docs/servers.png)
+
+### WebRTC测试
+
+![实时预览](docs/preview.png)
+>>>>>>> c058ff7 (docs(readme): 更新转码功能描述，标记为已支持，并添加功能截图)
 
 ## 快速开始
 
@@ -141,12 +176,12 @@ cargo test --test integration_tests codec_matrix
 
 集成测试覆盖：
 
-| 测试维度 | 覆盖范围 |
-|----------|----------|
-| 视频编码 | H264, H265 |
+| 测试维度 | 覆盖范围                           |
+| ---- | ------------------------------ |
+| 视频编码 | H264, H265                     |
 | 发布方式 | RTMP 推流模拟, RTSP 发布模拟, API Push |
-| 播放方式 | RTMP, RTSP, HTTP-FLV, HLS |
-| 跨协议 | 任一发布方式 → 所有播放方式 |
+| 播放方式 | RTMP, RTSP, HTTP-FLV, HLS      |
+| 跨协议  | 任一发布方式 → 所有播放方式                |
 
 WebRTC 推流/播放依赖浏览器和系统 codec 能力，通过 `webrtc/webrtc-test.html` 做浏览器端验证。
 
@@ -172,9 +207,10 @@ WebRTC 推流/播放依赖浏览器和系统 codec 能力，通过 `webrtc/webrt
 
 ## 文档
 
-| 文档 | 内容 |
-|------|------|
-| `docs/test-cases.md` | 测试用例（按编码 × 发布方式，播放覆盖全格式） |
-| `docs/architecture.md` | 架构规划（H265、录制、转码、分析、GB28181） |
-| `docs/getting-started.md` | 编译、启动、端口、API 速查 |
-| `docs/troubleshooting.md` | 故障排查 |
+| 文档                        | 内容                          |
+| ------------------------- | --------------------------- |
+| `docs/test-cases.md`      | 测试用例（按编码 × 发布方式，播放覆盖全格式）    |
+| `docs/architecture.md`    | 架构规划（H265、录制、转码、分析、GB28181） |
+| `docs/getting-started.md` | 编译、启动、端口、API 速查             |
+| `docs/troubleshooting.md` | 故障排查                        |
+
