@@ -32,13 +32,7 @@ const MIN_SEGMENT_BYTES: usize = 512;
 const MAX_AUDIO_VIDEO_LAG_MS: u64 = 200;
 
 fn is_hls_video_keyframe(frame: &MediaFrame) -> bool {
-    if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
-        return false;
-    }
-    if frame.codec == CodecType::H265 {
-        return is_keyframe_annex_b(frame.codec, &frame.data);
-    }
-    frame.is_keyframe || is_keyframe_annex_b(frame.codec, &frame.data)
+    frame.is_keyframe && matches!(frame.codec, CodecType::H264 | CodecType::H265)
 }
 
 fn audio_timestamp_delta_ms(prev: u64, curr: u64, clock_rate: Option<u32>) -> u64 {
@@ -574,7 +568,7 @@ pub struct HlsServer {
     stream_manager: Arc<StreamManager>,
     config: HlsConfig,
     sessions: Arc<RwLock<HashMap<String, Arc<RwLock<HlsSession>>>>>,
-    task_aborts: Arc<RwLock<HashMap<String, tokio::task::AbortHandle>>>,
+    task_handles: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     last_access: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
@@ -584,7 +578,7 @@ impl HlsServer {
             stream_manager,
             config,
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            task_aborts: Arc::new(RwLock::new(HashMap::new())),
+            task_handles: Arc::new(RwLock::new(HashMap::new())),
             last_access: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -713,7 +707,7 @@ impl HlsServer {
         let stream_id_owned = stream_id.to_string();
         let sessions_clone = self.sessions.clone();
         let stream_manager = self.stream_manager.clone();
-        let task_aborts = self.task_aborts.clone();
+        let task_handles = self.task_handles.clone();
 
         let handle = tokio::spawn(async move {
             info!(
@@ -852,12 +846,12 @@ impl HlsServer {
                     stream_id_owned
                 );
             }
-            task_aborts.write().remove(&stream_id_owned);
+            task_handles.write().remove(&stream_id_owned);
         });
 
-        self.task_aborts
+        self.task_handles
             .write()
-            .insert(stream_id.to_string(), handle.abort_handle());
+            .insert(stream_id.to_string(), handle);
         MetricsRegistry::inc_player(stream_id, crate::core::PlaybackProtocol::Hls);
         self.sync_hls_metrics(stream_id);
         self.touch(stream_id);
@@ -911,8 +905,10 @@ impl HlsServer {
 
     /// Stop HLS generation for a stream
     pub async fn stop_stream(&self, stream_id: &str) -> Result<()> {
-        if let Some(handle) = self.task_aborts.write().remove(stream_id) {
+        let handle = self.task_handles.write().remove(stream_id);
+        if let Some(handle) = handle {
             handle.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         }
         self.last_access.write().remove(stream_id);
 

@@ -533,15 +533,17 @@ impl RtmpServer {
                             peer_addr, frame_type_str, codec_str
                         );
                         if video_codec_id == 0x0C {
-                            if data.len() > 13 {
+                            if data.len() > 5 {
+                                let hvcc = &data[5..];
                                 let (vps, sps, pps) =
-                                    crate::core::parse_hevc_decoder_config_record(&data[5..]);
+                                    crate::core::parse_hevc_decoder_config_record(hvcc);
                                 if sps.is_some() {
-                                    conn.stream_manager.set_stream_hevc_params(
+                                    conn.stream_manager.set_stream_hevc_config(
                                         &conn.stream_id,
                                         vps.unwrap_or_default(),
                                         sps.unwrap_or_default(),
                                         pps.unwrap_or_default(),
+                                        Some(hvcc.to_vec()),
                                     );
                                 }
                             }

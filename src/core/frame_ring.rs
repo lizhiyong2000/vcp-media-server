@@ -71,7 +71,7 @@ impl FrameRing {
 
     pub fn push(&mut self, frame: MediaFrame) -> u64 {
         let seq = self.write_seq;
-        if is_video_keyframe(&frame) {
+        if frame.is_keyframe && matches!(frame.codec, CodecType::H264 | CodecType::H265) {
             self.gop_starts.push_back(seq);
             self.idr_seqs.push_back(seq);
         }
@@ -171,7 +171,7 @@ impl FrameRing {
 
     fn evict_front_until_keyframe_or_empty(&mut self) {
         while let Some(front) = self.slots.front() {
-            if is_video_keyframe(&front.to_media_frame()) {
+            if front.is_keyframe && matches!(front.codec, CodecType::H264 | CodecType::H265) {
                 break;
             }
             if let Some(f) = self.slots.pop_front() {

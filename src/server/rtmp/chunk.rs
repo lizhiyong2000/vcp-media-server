@@ -289,7 +289,7 @@ pub fn parse_chunks(
         buf.advance(header_size + data_size);
 
         // Check if message is complete
-        if assembler.received >= assembler.msg_length as usize && assembler.msg_length > 0 {
+        if assembler.msg_length > 0 && assembler.received >= assembler.msg_length as usize {
             let msg = RtmpMessage {
                 msg_type: assembler.msg_type_id,
                 timestamp: assembler.timestamp,

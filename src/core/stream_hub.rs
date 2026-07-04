@@ -129,7 +129,8 @@ impl StreamHub {
 
     pub fn publish(&self, frame: MediaFrame) -> u64 {
         let seq = self.ring.write().push(frame);
-        let _ = self.seq_tx.send(seq);
+        // Always notify: after ring reset seq may repeat 0 and `send` would not wake readers.
+        self.seq_tx.send_modify(|v| *v = seq);
         seq
     }
 
@@ -190,7 +191,7 @@ impl StreamHub {
 
     pub fn reset(&self) {
         *self.ring.write() = FrameRing::new();
-        let _ = self.seq_tx.send(0);
+        self.seq_tx.send_modify(|v| *v = 0);
     }
 }
 

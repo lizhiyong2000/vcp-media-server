@@ -351,6 +351,20 @@ impl DispatchReader {
         }
 
         if self.cursor > latest {
+            // Ring reset or live snap left the cursor past the edge — resync instead of spinning.
+            if self.hub.is_empty() {
+                self.cursor = self.hub.snap(SnapMode::LatestIdr);
+            } else if let Some(oldest) = self.hub.oldest_seq() {
+                if self.cursor < oldest || self.cursor > latest.saturating_add(1) {
+                    self.cursor = self
+                        .hub
+                        .snap(SnapMode::LatestIdr)
+                        .max(oldest);
+                }
+            }
+            if self.cursor > self.hub.latest_seq() {
+                self.ensure_data().await?;
+            }
             return Ok(Vec::new());
         }
 

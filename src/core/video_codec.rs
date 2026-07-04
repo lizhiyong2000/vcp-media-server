@@ -2,6 +2,7 @@
 
 use base64::Engine;
 use bytes::Bytes;
+use tracing::debug;
 
 use super::CodecType;
 
@@ -77,13 +78,23 @@ pub fn contains_h264_idr(data: &[u8]) -> bool {
 }
 
 pub fn contains_hevc_idr(data: &[u8]) -> bool {
-    for (start, _) in iter_annex_b_nal_ranges(data) {
-        match hevc_nalu_type(data[start]) {
-            H265_NAL_IDR_W_RADL | H265_NAL_IDR_N_LP | H265_NAL_CRA => return true,
-            _ => {}
-        }
+    if data.len() < 5 {
+        return false;
     }
-    false
+    
+    let mut offset = 0;
+    if data.starts_with(&ANNEX_B_PREFIX) {
+        offset = 4;
+    } else if data.starts_with(&[0, 0, 1]) {
+        offset = 3;
+    }
+    
+    if offset >= data.len() {
+        return false;
+    }
+    
+    let nalu_type = hevc_nalu_type(data[offset]);
+    matches!(nalu_type, H265_NAL_IDR_W_RADL | H265_NAL_IDR_N_LP | H265_NAL_CRA)
 }
 
 pub fn is_keyframe_annex_b(codec: CodecType, data: &[u8]) -> bool {
@@ -327,7 +338,15 @@ pub fn parse_enhanced_hevc_video_message(data: &[u8]) -> Option<EnhancedHevcVide
     let packet_type = enhanced_rtmp_packet_type(data[0]);
     let payload = match packet_type {
         RTMP_PKT_SEQUENCE_START | RTMP_PKT_CODED_FRAMES_X => &data[5..],
-        RTMP_PKT_CODED_FRAMES if data.len() >= 9 => &data[8..],
+        RTMP_PKT_CODED_FRAMES => {
+            if data.len() >= 9 {
+                &data[8..]
+            } else if data.len() > 5 {
+                &data[5..]
+            } else {
+                return None;
+            }
+        }
         _ => return None,
     };
     Some(EnhancedHevcVideoMessage {
@@ -338,8 +357,15 @@ pub fn parse_enhanced_hevc_video_message(data: &[u8]) -> Option<EnhancedHevcVide
 }
 
 pub fn hvcc_payload_to_annex_b(payload: &[u8]) -> Vec<u8> {
+    if payload.len() < 4 {
+        debug!("[VideoCodec] hvcc_payload_to_annex_b: payload too small ({})", payload.len());
+        return Vec::new();
+    }
+    
     let mut annex_b = Vec::with_capacity(payload.len());
     let mut offset = 0;
+    let mut nalu_count = 0;
+    
     while offset + 4 <= payload.len() {
         let nalu_len = u32::from_be_bytes([
             payload[offset],
@@ -348,13 +374,44 @@ pub fn hvcc_payload_to_annex_b(payload: &[u8]) -> Vec<u8> {
             payload[offset + 3],
         ]) as usize;
         offset += 4;
-        if offset + nalu_len > payload.len() {
+        
+        if nalu_len == 0 {
+            debug!("[VideoCodec] hvcc_payload_to_annex_b: zero NALU length at offset {}", offset);
             break;
         }
+        
+        if nalu_len > 10 * 1024 * 1024 {
+            debug!("[VideoCodec] hvcc_payload_to_annex_b: NALU too large ({}) at offset {}", nalu_len, offset);
+            break;
+        }
+        
+        if offset + nalu_len > payload.len() {
+            debug!("[VideoCodec] hvcc_payload_to_annex_b: NALU exceeds payload (offset={}, len={}, payload_len={})", offset, nalu_len, payload.len());
+            break;
+        }
+        
+        let nalu_type = if !payload[offset..offset + nalu_len].is_empty() {
+            hevc_nalu_type(payload[offset])
+        } else {
+            0
+        };
+        
+        if nalu_count == 0 {
+            debug!("[VideoCodec] hvcc_payload_to_annex_b: first NALU type={}, len={}, payload_len={}", nalu_type, nalu_len, payload.len());
+        }
+        
         annex_b.extend_from_slice(&ANNEX_B_PREFIX);
         annex_b.extend_from_slice(&payload[offset..offset + nalu_len]);
         offset += nalu_len;
+        nalu_count += 1;
+        
+        if nalu_count > 1000 {
+            debug!("[VideoCodec] hvcc_payload_to_annex_b: too many NALUs ({})", nalu_count);
+            break;
+        }
     }
+    
+    debug!("[VideoCodec] hvcc_payload_to_annex_b: converted {} NALUs, output len={}", nalu_count, annex_b.len());
     annex_b
 }
 
