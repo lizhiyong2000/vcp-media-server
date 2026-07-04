@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vcp-media-server
+  namespace: vcp-media
+  labels:
+    app.kubernetes.io/name: vcp-media-server
+data:
+  config.toml: |
+    [storage]
+    base_dir = "/data/saving"
+
+    [server.rtmp]
+    port = 1935
+
+    [server.rtsp]
+    port = 8554
+
+    [server.webrtc]
+    port = 9080
+
+    [server.http]
+    port = 8081
+
+    [server.hls]
+    enabled = true
+    segment_duration = 1
+    max_segments = 3
+    output_dir = "hls"
+
+    [server.http_flv]
+    enabled = true
+
+    [record]
+    enabled = true
+    output_dir = "recordings"
+    default_format = "ts"
+    segment_duration_sec = 300
+    align_keyframe = true
+
+    [analysis]
+    enabled = false
+
+    [snapshot]
+    enabled = true
+    output_dir = "snapshots"
+    ffmpeg_path = "ffmpeg"
+    wait_keyframe_ms = 1000
+
+    [log]
+    level = "info"
+    path = "/data/logs/media-server.log"
+    max_size_mb = 50
+    max_files = 7

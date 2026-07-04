@@ -117,6 +117,9 @@ impl StreamManager {
                 stream.pps = Some(pps);
                 if hevc_decoder_config.is_some() {
                     stream.hevc_decoder_config = hevc_decoder_config;
+                    // Drop placeholder AAC from default_live_tracks until publisher
+                    // sends an AAC sequence header (transcode -an is video-only).
+                    stream.tracks.retain(|t| t.codec != CodecType::AAC);
                 }
                 if let Some(track) = stream.tracks.iter_mut().find(|t| t.id == 0) {
                     track.codec = CodecType::H265;
@@ -126,6 +129,20 @@ impl StreamManager {
                         .insert(0, Track::new(0, CodecType::H265, 96, 90_000));
                 }
                 info!("[Core] Setting HEVC VPS/SPS/PPS for stream {}", stream_id);
+            });
+        }
+    }
+
+    /// Ensure AAC track exists after an AAC sequence header (e.g. Enhanced HEVC + AAC publish).
+    pub fn ensure_aac_track(&self, stream_id: &str) {
+        if let Some(hub) = self.get_hub(stream_id) {
+            hub.update_stream(|stream| {
+                if stream.tracks.iter().any(|t| t.codec == CodecType::AAC) {
+                    return;
+                }
+                stream
+                    .tracks
+                    .push(Track::new(1, CodecType::AAC, 97, 48_000));
             });
         }
     }

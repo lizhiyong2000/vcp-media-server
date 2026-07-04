@@ -687,6 +687,9 @@ impl RtmpServer {
                         if sound_size == 1 { 16 } else { 8 },
                         if sound_type == 1 { "stereo" } else { "mono" }
                     );
+                    if sound_format == 0x0A && conn.is_publishing {
+                        conn.stream_manager.ensure_aac_track(&conn.stream_id);
+                    }
                 } else {
                     debug!(
                         "[RTMP] [{}] <<< AUDIO ts={} size={} frame#{}",

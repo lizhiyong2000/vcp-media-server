@@ -1,0 +1,30 @@
+# Optional: expose RTMP/HTTP/WebRTC to clients outside the cluster.
+# WebRTC may still need hostNetwork or extra UDP/TURN configuration for production ICE.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vcp-media-server-lb
+  namespace: vcp-media
+  labels:
+    app.kubernetes.io/name: vcp-media-server
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: vcp-media-server
+  ports:
+    - name: rtmp
+      port: 1935
+      targetPort: rtmp
+      protocol: TCP
+    - name: rtsp
+      port: 8554
+      targetPort: rtsp
+      protocol: TCP
+    - name: http
+      port: 8081
+      targetPort: http
+      protocol: TCP
+    - name: webrtc
+      port: 9080
+      targetPort: webrtc
+      protocol: TCP

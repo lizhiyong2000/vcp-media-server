@@ -544,13 +544,11 @@ async fn read_audio_track(
     stream_id: String,
     track: Arc<TrackRemote>,
 ) -> Result<()> {
-    let mut frames: u64 = 0;
     let clock_rate = track.codec().capability.clock_rate;
     while let Ok((pkt, _)) = track.read_rtp().await {
         if pkt.payload.is_empty() {
             continue;
         }
-        frames += 1;
         let frame = MediaFrame::new(
             stream_id.clone(),
             1,

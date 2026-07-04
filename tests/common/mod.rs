@@ -3,10 +3,15 @@
 //! This module provides shared test infrastructure for cross-protocol streaming tests.
 
 pub mod frame_generators;
+pub mod ffmpeg_helper;
+pub mod http_client;
 pub mod hls_helper;
 pub mod http_flv_helper;
+pub mod media_server_runner;
+pub mod process_manager;
 pub mod rtmp_helper;
 pub mod rtsp_helper;
+pub mod server_helper;
 pub mod stream_helper;
 
 /// Test configuration for cross-protocol tests.
@@ -79,6 +84,6 @@ pub mod timeouts {
 
     pub const FRAME_WAIT: Duration = Duration::from_millis(100);
     pub const STREAM_WAIT: Duration = Duration::from_millis(500);
-    pub const SERVER_START: Duration = Duration::from_secs(2);
+    pub const SERVER_START: Duration = Duration::from_secs(5);
     pub const CLEANUP_WAIT: Duration = Duration::from_millis(100);
 }

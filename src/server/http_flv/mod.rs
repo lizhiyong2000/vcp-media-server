@@ -61,10 +61,16 @@ fn generate_flv_tag(tag_type: u8, timestamp: u32, data: &[u8]) -> Vec<u8> {
     tag
 }
 
-/// Generate HEVC sequence header (VPS/SPS/PPS) for video
-fn generate_hevc_sequence_header(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
-    let data = crate::core::build_rtmp_hevc_sequence_header(vps, sps, pps);
-    generate_flv_tag(0x09, 0, &data)
+/// Generate HEVC sequence header for Enhanced RTMP FLV play.
+fn generate_hevc_sequence_header(stream: &Stream) -> Option<Vec<u8>> {
+    let data = if let Some(hvcc) = &stream.hevc_decoder_config {
+        crate::core::build_enhanced_rtmp_hevc_sequence_header(hvcc)
+    } else if let (Some(vps), Some(sps), Some(pps)) = (&stream.vps, &stream.sps, &stream.pps) {
+        crate::core::build_rtmp_hevc_sequence_header(vps, sps, pps)
+    } else {
+        return None;
+    };
+    Some(generate_flv_tag(0x09, 0, &data))
 }
 
 /// Generate AVC sequence header (SPS/PPS) for video
@@ -129,7 +135,8 @@ fn stream_has_codec(stream: &Stream, codec: CodecType) -> bool {
 
 pub fn stream_has_video_sequence_header(stream: &Stream) -> bool {
     if stream_has_codec(stream, CodecType::H265) {
-        stream.vps.is_some() && stream.sps.is_some() && stream.pps.is_some()
+        stream.hevc_decoder_config.is_some()
+            || (stream.vps.is_some() && stream.sps.is_some() && stream.pps.is_some())
     } else if stream_has_codec(stream, CodecType::H264) {
         stream.sps.is_some() && stream.pps.is_some()
     } else {
@@ -265,10 +272,8 @@ impl HttpFlvSession {
         if !self.sequence_header_sent {
             if has_video {
                 if stream_has_codec(stream, CodecType::H265) {
-                    if let (Some(vps), Some(sps), Some(pps)) =
-                        (&stream.vps, &stream.sps, &stream.pps)
-                    {
-                        data.extend(generate_hevc_sequence_header(vps, sps, pps));
+                    if let Some(tag) = generate_hevc_sequence_header(stream) {
+                        data.extend(tag);
                     }
                 } else if let (Some(sps), Some(pps)) = (&stream.sps, &stream.pps) {
                     data.extend(generate_avc_sequence_header(sps, pps));
@@ -440,6 +445,34 @@ mod tests {
         assert!(
             !data.windows(4).any(|w| w == crate::core::HEVC_FOURCC),
             "HEVC sequence header must not be emitted without VPS/SPS/PPS"
+        );
+    }
+
+    #[test]
+    fn h265_initial_data_prefers_hevc_decoder_config() {
+        let vps = vec![0x40, 0x01, 0x0c, 0x01];
+        let sps = vec![0x42, 0x01, 0x01, 0x60];
+        let pps = vec![0x44, 0x01, 0xc0, 0x73];
+        let seq = crate::core::build_rtmp_hevc_sequence_header(&vps, &sps, &pps);
+        let hvcc = seq[5..].to_vec();
+        let mut stream =
+            publishing_stream_with_tracks(vec![Track::new(0, CodecType::H265, 96, 90_000)]);
+        stream.vps = Some(vps);
+        stream.sps = Some(sps);
+        stream.pps = Some(pps);
+        stream.hevc_decoder_config = Some(hvcc);
+        let mut session = HttpFlvSession::new("h265_hvcc");
+
+        let data = session.generate_initial_data(&stream);
+
+        assert!(!session.needs_sequence_headers());
+        assert!(
+            data.windows(4).any(|w| w == crate::core::HEVC_FOURCC),
+            "HEVC sequence header should carry hvc1 FourCC"
+        );
+        assert!(
+            !data.windows(4).any(|w| w == [0x08, 0x00, 0x00, 0x04]),
+            "video-only HEVC stream should not emit placeholder AAC sequence header"
         );
     }
 

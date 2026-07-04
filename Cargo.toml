@@ -32,3 +32,4 @@ time = { version = "0.3.49", features = ["local-offset"] }
 webrtc = "0.12"
 ice = { package = "webrtc-ice", version = "0.12" }
 tokio-tungstenite = "0.24"
+ffmpeg-next = "8.1"

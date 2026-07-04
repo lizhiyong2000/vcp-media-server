@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vcp-media-server-data
+  namespace: vcp-media
+  labels:
+    app.kubernetes.io/name: vcp-media-server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi

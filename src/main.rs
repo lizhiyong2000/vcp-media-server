@@ -4,9 +4,9 @@ mod server;
 
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_appender::{non_blocking, rolling};
 use tracing_subscriber::{
     filter::{EnvFilter, LevelFilter},
@@ -14,10 +14,11 @@ use tracing_subscriber::{
     prelude::*,
 };
 
-use crate::core::{Config, MetricsRegistry, StreamManager};
+use crate::core::{Config, MetricsRegistry, StreamManager, TranscodeConfig};
 use crate::process::analysis;
 use crate::process::record::{self, RecordFormat, RecorderManager};
 use crate::process::snapshot::{self, SnapshotManager};
+use crate::process::transcode::TranscodeManager;
 use crate::server::hls::{self, HlsConfig as HlsModuleConfig};
 use crate::server::{http, http_flv, rtmp, rtsp, webrtc};
 static LOG_GUARD: Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> = Mutex::new(None);
@@ -32,7 +33,17 @@ fn server_task_result(
 }
 
 fn read_config() -> Result<Config> {
-    let config_path = Path::new("config.toml");
+    let config_path = std::env::var("VCP_CONFIG_PATH")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            std::env::args()
+                .nth(1)
+                .map(PathBuf::from)
+                .filter(|path| path.is_file())
+        })
+        .unwrap_or_else(|| Path::new("config.toml").to_path_buf());
 
     if config_path.exists() {
         info!("Reading config from: {}", config_path.display());
@@ -67,7 +78,7 @@ fn init_logging(config: &Config) -> Result<()> {
         for (module, level) in modules {
             let target = if module.contains("::") {
                 module.clone()
-            } else if matches!(module.as_str(), "analysis" | "record" | "snapshot") {
+            } else if matches!(module.as_str(), "analysis" | "record" | "snapshot" | "transcode") {
                 format!("vcp_media_server::process::{}", module)
             } else if matches!(
                 module.as_str(),
@@ -145,6 +156,11 @@ async fn main() -> Result<()> {
         .context("Failed to create storage directories")?;
 
     init_logging(&config)?;
+
+    info!("Initializing FFmpeg...");
+    ffmpeg_next::init().unwrap_or_else(|e| {
+        warn!("Failed to initialize FFmpeg: {}, some features may not work", e);
+    });
 
     info!("Starting Media Server...");
 
@@ -303,15 +319,34 @@ async fn main() -> Result<()> {
         None
     };
 
+    let default_transcode_config = TranscodeConfig {
+        enabled: false,
+        ffmpeg_path: Some("ffmpeg".to_string()),
+        max_workers: Some(4),
+    };
+    let transcode_config = config.transcode.as_ref().unwrap_or(&default_transcode_config);
+    let transcode_manager = Arc::new(TranscodeManager::new(
+        stream_manager.clone(),
+        transcode_config,
+        config.server.http.port,
+        config.server.rtmp.port,
+    ));
+    let transcode_http = if transcode_config.enabled {
+        Some(transcode_manager.clone())
+    } else {
+        None
+    };
+
     let http_server = http::HttpServer::new(
         stream_manager.clone(),
         metrics_registry,
-        config.server.http.port,
+        config.clone(),
         hls_server_http,
         http_flv_server_http,
         recorder_http,
         analysis_http,
         snapshot_http,
+        transcode_http,
     );
 
     let rtmp_server = rtmp::RtmpServer::new(
@@ -354,6 +389,13 @@ async fn main() -> Result<()> {
             "  Snapshot API: http://localhost:{}/api/snapshot (dir: {})",
             config.server.http.port,
             snapshot_config.base_dir.display()
+        );
+    }
+    if transcode_config.enabled {
+        info!(
+            "  Transcode API: http://localhost:{}/api/transcode/start (max_workers: {})",
+            config.server.http.port,
+            transcode_config.max_workers.unwrap_or(4)
         );
     }
     info!(

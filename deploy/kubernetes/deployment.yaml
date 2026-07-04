@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vcp-media-server
+  namespace: vcp-media
+  labels:
+    app.kubernetes.io/name: vcp-media-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vcp-media-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vcp-media-server
+    spec:
+      containers:
+        - name: vcp-media-server
+          image: vcp-media-server:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - /etc/vcp-media-server/config.toml
+          env:
+            - name: VCP_CONFIG_PATH
+              value: /etc/vcp-media-server/config.toml
+          ports:
+            - name: rtmp
+              containerPort: 1935
+              protocol: TCP
+            - name: rtsp
+              containerPort: 8554
+              protocol: TCP
+            - name: http
+              containerPort: 8081
+              protocol: TCP
+            - name: webrtc
+              containerPort: 9080
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vcp-media-server
+              readOnly: true
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: config
+          configMap:
+            name: vcp-media-server
+            items:
+              - key: config.toml
+                path: config.toml
+        - name: data
+          persistentVolumeClaim:
+            claimName: vcp-media-server-data

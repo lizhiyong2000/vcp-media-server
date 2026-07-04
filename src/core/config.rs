@@ -19,6 +19,7 @@ pub struct Config {
     pub record: Option<RecordConfig>,
     pub analysis: Option<AnalysisConfig>,
     pub snapshot: Option<SnapshotConfig>,
+    pub transcode: Option<TranscodeConfig>,
     pub log: LogConfig,
 }
 
@@ -97,6 +98,13 @@ pub struct SnapshotConfig {
     pub output_dir: Option<String>,
     pub ffmpeg_path: Option<String>,
     pub wait_keyframe_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranscodeConfig {
+    pub enabled: bool,
+    pub ffmpeg_path: Option<String>,
+    pub max_workers: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -215,6 +223,11 @@ impl Default for Config {
                 output_dir: Some(DEFAULT_SNAPSHOT_OUTPUT_DIR.to_string()),
                 ffmpeg_path: Some("ffmpeg".to_string()),
                 wait_keyframe_ms: Some(1_000),
+            }),
+            transcode: Some(TranscodeConfig {
+                enabled: false,
+                ffmpeg_path: Some("ffmpeg".to_string()),
+                max_workers: Some(4),
             }),
             log: LogConfig::default(),
         }

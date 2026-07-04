@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 pub use config::{
     AnalysisConfig, Config, HttpConfig, RecordConfig, RtmpConfig, RtspConfig, ServerConfig,
-    SnapshotConfig, StorageConfig, WebrtcConfig, DEFAULT_HLS_DIR, DEFAULT_HLS_OUTPUT_DIR,
+    SnapshotConfig, StorageConfig, TranscodeConfig, WebrtcConfig, DEFAULT_HLS_DIR, DEFAULT_HLS_OUTPUT_DIR,
     DEFAULT_RECORD_DIR, DEFAULT_RECORD_OUTPUT_DIR, DEFAULT_SNAPSHOT_DIR,
     DEFAULT_SNAPSHOT_OUTPUT_DIR, DEFAULT_STORAGE_BASE_DIR,
 };

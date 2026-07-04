@@ -7,13 +7,14 @@ use tokio::time::{sleep, Duration, Instant};
 use tracing::{error, info, warn};
 
 use crate::core::{
-    is_idr_frame, prime_live_play, CodecType, DispatchError, DispatchPolicy, MetricsRegistry,
+    is_idr_frame, prime_live_play, CodecType, Config, DispatchError, DispatchPolicy, MetricsRegistry,
     MetricsSnapshot, PlaybackProtocol, StreamManager, StreamProtocol, StreamSourceMode, Track,
     WallclockMsTimeline,
 };
 use crate::process::analysis::{AnalysisManager, StartAnalysisRequest, StopAnalysisRequest};
 use crate::process::record::{RecorderManager, StartRecordRequest, StopRecordRequest};
 use crate::process::snapshot::{CaptureSnapshotRequest, SnapshotManager};
+use crate::process::transcode::{StartTranscodeRequest, StopTranscodeRequest, TranscodeManager};
 use crate::server::hls::HlsServer;
 use crate::server::http_flv::{
     format_chunk, stream_has_video_sequence_header, HttpFlvServer, HttpFlvSession,
@@ -25,39 +26,42 @@ use crate::server::webrtc::request_publisher_keyframe;
 pub struct HttpServer {
     stream_manager: Arc<StreamManager>,
     metrics: Arc<MetricsRegistry>,
-    port: u16,
+    config: Config,
     hls_server: Option<Arc<HlsServer>>,
     http_flv_server: Option<Arc<HttpFlvServer>>,
     recorder: Option<Arc<RecorderManager>>,
     analysis: Option<Arc<AnalysisManager>>,
     snapshot: Option<Arc<SnapshotManager>>,
+    transcode: Option<Arc<TranscodeManager>>,
 }
 
 impl HttpServer {
     pub fn new(
         stream_manager: Arc<StreamManager>,
         metrics: Arc<MetricsRegistry>,
-        port: u16,
+        config: Config,
         hls_server: Option<Arc<HlsServer>>,
         http_flv_server: Option<Arc<HttpFlvServer>>,
         recorder: Option<Arc<RecorderManager>>,
         analysis: Option<Arc<AnalysisManager>>,
         snapshot: Option<Arc<SnapshotManager>>,
+        transcode: Option<Arc<TranscodeManager>>,
     ) -> Self {
         Self {
             stream_manager,
             metrics,
-            port,
+            config,
             hls_server,
             http_flv_server,
             recorder,
             analysis,
             snapshot,
+            transcode,
         }
     }
 
     pub async fn start(&self) -> Result<()> {
-        let addr = format!("0.0.0.0:{}", self.port);
+        let addr = format!("0.0.0.0:{}", self.config.server.http.port);
         info!("[HTTP] Initializing HTTP API server on {}", addr);
 
         let listener = TcpListener::bind(&addr).await?;
@@ -90,6 +94,11 @@ impl HttpServer {
             info!("[HTTP]   GET  /api/snapshots     - List snapshots");
             info!("[HTTP]   GET  /api/snapshots/<id>.jpg - Read snapshot image");
         }
+        if self.transcode.is_some() {
+            info!("[HTTP]   POST /api/transcode/start - Start transcoding");
+            info!("[HTTP]   POST /api/transcode/stop  - Stop transcoding");
+            info!("[HTTP]   GET  /api/transcode      - List active sessions");
+        }
         info!("[HTTP]   GET  /webrtc/webrtc-test.html - WebRTC test page");
         if self.hls_server.is_some() {
             info!("[HTTP]   GET  /hls/<stream_id>/live.m3u8 - HLS playlist");
@@ -105,14 +114,16 @@ impl HttpServer {
                     info!("[HTTP] New request from {}", peer_addr);
                     let manager = self.stream_manager.clone();
                     let metrics = self.metrics.clone();
+                    let config = self.config.clone();
                     let hls = self.hls_server.clone();
                     let flv = self.http_flv_server.clone();
                     let recorder = self.recorder.clone();
                     let analysis = self.analysis.clone();
                     let snapshot = self.snapshot.clone();
+                    let transcode = self.transcode.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection(
-                            socket, manager, metrics, hls, flv, recorder, analysis, snapshot,
+                            socket, manager, metrics, config, hls, flv, recorder, analysis, snapshot, transcode,
                         )
                         .await
                         {
@@ -131,11 +142,13 @@ impl HttpServer {
         socket: TcpStream,
         manager: Arc<StreamManager>,
         metrics: Arc<MetricsRegistry>,
+        config: Config,
         hls_server: Option<Arc<HlsServer>>,
         flv_server: Option<Arc<HttpFlvServer>>,
         recorder: Option<Arc<RecorderManager>>,
         analysis: Option<Arc<AnalysisManager>>,
         snapshot: Option<Arc<SnapshotManager>>,
+        transcode: Option<Arc<TranscodeManager>>,
     ) -> Result<()> {
         let mut buffer = vec![0u8; 8192];
         let mut socket = socket;
@@ -235,16 +248,28 @@ impl HttpServer {
             // HTTP-FLV request
             if path.starts_with("/flv/") {
                 if let Some(ref flv) = flv_server {
-                    let stream_id = path.trim_start_matches("/flv/").trim_end_matches('/');
+                    let flv_path = path.trim_start_matches("/flv/").trim_end_matches('/');
+                    let (stream_id, join_from_idr) = if let Some((id, query)) = flv_path.split_once('?')
+                    {
+                        let join = query.split('&').any(|p| p == "join=idr");
+                        (id.trim_end_matches('/'), join)
+                    } else {
+                        (flv_path, false)
+                    };
                     if let Some((mut session, mut stream)) = flv.create_session(stream_id) {
                         let play_started_at = Instant::now();
                         let stream_id_owned = stream_id.to_string();
                         let manager = flv.stream_manager();
                         manager.ensure_stream_hub(stream_id);
-                        let requested_keyframe = request_publisher_keyframe(stream_id);
+                        let requested_keyframe = if join_from_idr {
+                            false
+                        } else {
+                            request_publisher_keyframe(stream_id)
+                        };
                         info!(
-                            "[HTTP-FLV] [{}] play request start requested_keyframe={} latest_seq={} latest_idr={:?}",
+                            "[HTTP-FLV] [{}] play request start join_from_idr={} requested_keyframe={} latest_seq={} latest_idr={:?}",
                             stream_id,
+                            join_from_idr,
                             requested_keyframe,
                             manager
                                 .get_hub(stream_id)
@@ -252,9 +277,12 @@ impl HttpServer {
                                 .unwrap_or_default(),
                             manager.get_hub(stream_id).and_then(|hub| hub.latest_idr_seq())
                         );
-                        let mut reader = match manager
-                            .dispatch_subscribe(stream_id, DispatchPolicy::LiveSequential)
-                        {
+                        let dispatch_policy = if join_from_idr {
+                            DispatchPolicy::SequentialFromIdr
+                        } else {
+                            DispatchPolicy::LiveSequential
+                        };
+                        let mut reader = match manager.dispatch_subscribe(stream_id, dispatch_policy) {
                             Some(r) => r,
                             None => {
                                 let response =
@@ -329,10 +357,13 @@ impl HttpServer {
                             reader.hub().latest_seq(),
                             reader.hub().latest_idr_seq()
                         );
-                        let mut pending_idr =
+                        let mut pending_idr = if join_from_idr {
+                            None
+                        } else {
                             prime_live_play(&mut reader, manager, &stream_id_owned, "HTTP-FLV")
-                                .await;
-                        let mut video_streaming = pending_idr.is_some();
+                                .await
+                        };
+                        let mut video_streaming = join_from_idr || pending_idr.is_some();
                         let mut frames_sent = 0u64;
                         let mut wallclock = WallclockMsTimeline::default();
                         let send_started_at = Instant::now();
@@ -348,15 +379,29 @@ impl HttpServer {
                                 }
                             };
                             if reader.take_muxer_resync() {
-                                video_streaming = false;
                                 reader.clear_video_catchup();
-                                request_publisher_keyframe(&stream_id_owned);
-                                info!(
-                                    "[HTTP-FLV] [{}] ring gap — wait for fresh IDR cursor={} latest_seq={}",
-                                    stream_id,
-                                    reader.cursor(),
-                                    reader.hub().latest_seq()
-                                );
+                                if join_from_idr {
+                                    // Transcode/ffmpeg inputs cannot answer keyframe requests;
+                                    // snap to the latest IDR already in the ring instead.
+                                    reader.snap_to_latest_idr();
+                                    video_streaming = true;
+                                    info!(
+                                        "[HTTP-FLV] [{}] ring gap — resync to latest IDR cursor={} latest_seq={} latest_idr={:?}",
+                                        stream_id,
+                                        reader.cursor(),
+                                        reader.hub().latest_seq(),
+                                        reader.hub().latest_idr_seq()
+                                    );
+                                } else {
+                                    video_streaming = false;
+                                    request_publisher_keyframe(&stream_id_owned);
+                                    info!(
+                                        "[HTTP-FLV] [{}] ring gap — wait for fresh IDR cursor={} latest_seq={}",
+                                        stream_id,
+                                        reader.cursor(),
+                                        reader.hub().latest_seq()
+                                    );
+                                }
                             }
                             for frame in frames {
                                 if frame.codec == CodecType::Opus || frame.codec == CodecType::G711
@@ -509,9 +554,11 @@ impl HttpServer {
             &request,
             manager.clone(),
             metrics,
+            config,
             recorder,
             analysis,
             snapshot,
+            transcode,
         )
         .await?;
         socket.write_all(response.as_bytes()).await?;
@@ -524,9 +571,11 @@ impl HttpServer {
         request: &str,
         manager: Arc<StreamManager>,
         metrics: Arc<MetricsRegistry>,
+        config: Config,
         recorder: Option<Arc<RecorderManager>>,
         analysis: Option<Arc<AnalysisManager>>,
         snapshot: Option<Arc<SnapshotManager>>,
+        transcode: Option<Arc<TranscodeManager>>,
     ) -> Result<String> {
         let lines: Vec<&str> = request.lines().collect();
         if lines.is_empty() {
@@ -1195,6 +1244,81 @@ impl HttpServer {
                     ))
                 }
             }
+            ("POST", "/api/transcode/start") => {
+                let Some(transcode) = transcode else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"transcode API disabled\"}",
+                    ));
+                };
+                let body = Self::json_body(request);
+                let req = match serde_json::from_str::<StartTranscodeRequest>(body) {
+                    Ok(req) => req,
+                    Err(_) => {
+                        return Ok(Self::http_response(
+                            400,
+                            "Bad Request",
+                            "{\"error\":\"Invalid JSON body\"}",
+                        ));
+                    }
+                };
+                match transcode.start(req) {
+                    Ok(info) => Ok(Self::http_response(
+                        200,
+                        "OK",
+                        &json!({"transcode": info, "message": "transcoding started"}).to_string(),
+                    )),
+                    Err(err) => Ok(Self::http_response(
+                        400,
+                        "Bad Request",
+                        &json!({"error": err.to_string()}).to_string(),
+                    )),
+                }
+            }
+            ("POST", "/api/transcode/stop") => {
+                let Some(transcode) = transcode else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"transcode API disabled\"}",
+                    ));
+                };
+                let body = Self::json_body(request);
+                let req = match serde_json::from_str::<StopTranscodeRequest>(body) {
+                    Ok(req) => req,
+                    Err(_) => {
+                        return Ok(Self::http_response(
+                            400,
+                            "Bad Request",
+                            "{\"error\":\"Invalid JSON body\"}",
+                        ));
+                    }
+                };
+                match transcode.stop(req) {
+                    Ok(info) => Ok(Self::http_response(
+                        200,
+                        "OK",
+                        &json!({"transcode": info, "message": "transcoding stopped"}).to_string(),
+                    )),
+                    Err(err) => Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        &json!({"error": err.to_string()}).to_string(),
+                    )),
+                }
+            }
+            ("GET", "/api/transcode") | ("GET", "/api/transcode/") => {
+                let Some(transcode) = transcode else {
+                    return Ok(Self::http_response(
+                        404,
+                        "Not Found",
+                        "{\"error\":\"transcode API disabled\"}",
+                    ));
+                };
+                let body = json!({"sessions": transcode.active_sessions()}).to_string();
+                Ok(Self::http_response(200, "OK", &body))
+            }
             ("DELETE", path) if path.starts_with("/api/stream/") => {
                 let stream_id = path.trim_start_matches("/api/stream/");
                 if manager.remove_stream(&stream_id.to_string()).is_some() {
@@ -1203,6 +1327,57 @@ impl HttpServer {
                 } else {
                     Ok(Self::http_response(404, "Not Found", ""))
                 }
+            }
+            ("GET", "/api/play-urls") | ("GET", "/api/play-urls/") => {
+                let body = json!({
+                    "usage": "GET /api/play-urls/<stream_id>",
+                    "example": {
+                        "rtmp": "rtmp://localhost:1935/live/<stream_id>",
+                        "rtsp": "rtsp://localhost:554/<stream_id>",
+                        "http_flv": "http://localhost:8081/flv/<stream_id>",
+                        "hls": "http://localhost:8081/hls/<stream_id>/live.m3u8",
+                        "webrtc_test_page": "http://localhost:8081/webrtc/webrtc-test.html"
+                    }
+                })
+                .to_string();
+                Ok(Self::http_response(200, "OK", &body))
+            }
+            ("GET", path) if path.starts_with("/api/play-urls/") => {
+                let stream_id = path.trim_start_matches("/api/play-urls/").trim_end_matches('/');
+                if stream_id.is_empty() {
+                    return Ok(Self::http_response(
+                        400,
+                        "Bad Request",
+                        "{\"error\":\"missing stream_id\"}",
+                    ));
+                }
+                let http_port = config.server.http.port;
+                let rtmp_port = config.server.rtmp.port;
+                let rtsp_port = config.server.rtsp.port;
+                let hls_enabled = config.server.hls.as_ref().map(|h| h.enabled).unwrap_or(false);
+                let http_flv_enabled = config.server.http_flv.as_ref().map(|h| h.enabled).unwrap_or(true);
+
+                let mut play_urls = serde_json::Map::new();
+                play_urls.insert("rtmp".to_string(), json!(format!("rtmp://localhost:{}/live/{}", rtmp_port, stream_id)));
+                play_urls.insert("rtsp".to_string(), json!(format!("rtsp://localhost:{}/{}", rtsp_port, stream_id)));
+                if http_flv_enabled {
+                    play_urls.insert("http_flv".to_string(), json!(format!("http://localhost:{}/flv/{}", http_port, stream_id)));
+                } else {
+                    play_urls.insert("http_flv".to_string(), serde_json::Value::Null);
+                }
+                if hls_enabled {
+                    play_urls.insert("hls".to_string(), json!(format!("http://localhost:{}/hls/{}/live.m3u8", http_port, stream_id)));
+                } else {
+                    play_urls.insert("hls".to_string(), serde_json::Value::Null);
+                }
+                play_urls.insert("webrtc_test_page".to_string(), json!(format!("http://localhost:{}/webrtc/webrtc-test.html", http_port)));
+
+                let body = json!({
+                    "stream_id": stream_id,
+                    "play_urls": play_urls,
+                })
+                .to_string();
+                Ok(Self::http_response(200, "OK", &body))
             }
             ("GET", "/health") => Ok(Self::http_response(200, "OK", "{\"status\":\"healthy\"}")),
             ("GET", "/") => {

@@ -1,0 +1,14 @@
+target/
+.git/
+.idea/
+.vscode/
+.DS_Store
+logs/
+hls/
+recordings/
+snapshots/
+saving/
+**/*.md
+docs/
+tests/
+deploy/kubernetes/

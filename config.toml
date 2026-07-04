@@ -47,13 +47,27 @@ output_dir = "snapshots"
 ffmpeg_path = "ffmpeg"
 wait_keyframe_ms = 1000
 
+[transcode]
+enabled = true
+ffmpeg_path = "ffmpeg"
+max_workers = 4
+
 [log]
-level = "info"
+level = "debug"
 path = "./logs/media-server.log"
 max_size_mb = 10
 max_files = 5
 
 [log.modules]
-rtsp = "info"
-core = "info"
-webrtc = "info"
+rtsp = "debug"
+rtmp = "debug"
+http = "debug"
+http_flv = "debug"
+hls = "debug"
+webrtc = "debug"
+core = "debug"
+analysis = "debug"
+record = "debug"
+snapshot = "debug"
+transcode = "debug"
+

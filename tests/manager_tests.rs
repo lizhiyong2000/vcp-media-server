@@ -1,11 +1,14 @@
-//! Integration tests for cross-protocol streaming.
+//! Unit tests for cross-protocol streaming core functionality.
 //!
-//! Test matrix coverage:
-//! - Video codecs: H264, H265
-//! - Publish methods: RTMP, RTSP, API Push
-//! - Playback methods: RTMP, RTSP, HTTP-FLV, HLS
+//! These tests use mocked/inner StreamTester to simulate streaming
+//! without requiring actual ffmpeg or server infrastructure.
 //!
-//! WebRTC is tested via browser test page for browser capability verification.
+//! Test coverage:
+//! - Stream management operations
+//! - Frame processing and sequencing
+//! - Dispatch and subscription logic
+//! - Codec detection and validation
+//! - Protocol helper utilities
 
 mod common;
 
@@ -23,14 +26,14 @@ mod tests {
         frame_generators::{generate_h264_idr_frame, generate_h265_idr_frame, generate_h264_sps_pps, generate_h265_vps_sps_pps},
         hls_helper::HlsTestHelper,
         http_flv_helper::HttpFlvTestHelper,
-        rtmp_helper::{create_rtmp_publish_command, RtmpTestHelper},
+        rtmp_helper::RtmpTestHelper,
         rtsp_helper::{create_rtsp_announce_sdp, RtspTestHelper},
         stream_helper::{cleanup_test_streams, setup_test_stream},
         TestCodec, TestConfig,
     };
 
     // =========================================================================
-    // H264 Cross-Protocol Tests
+    // H264 Cross-Protocol Tests (Mocked)
     // =========================================================================
 
     mod h264_rtmp_publish {
@@ -42,7 +45,7 @@ mod tests {
             let manager = Arc::new(StreamManager::new());
 
             // Setup stream
-            let tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
 
             // Publish via API (simulating RTMP publish)
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
@@ -68,7 +71,7 @@ mod tests {
             let config = TestConfig::new("h264_rtmp_rtsp", TestCodec::H264);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
 
             // Publish via API
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
@@ -88,7 +91,7 @@ mod tests {
             let config = TestConfig::new("h264_rtmp_hls", TestCodec::H264);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
 
             // Publish frames
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
@@ -112,7 +115,7 @@ mod tests {
             let config = TestConfig::new("h264_rtsp_flv", TestCodec::H264);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
 
             // Simulate RTSP publish via API
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
@@ -132,7 +135,7 @@ mod tests {
             let config = TestConfig::new("h264_rtsp_rtmp", TestCodec::H264);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
 
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
             tester.push_test_stream(&config.stream_id, 2).await.unwrap();
@@ -151,7 +154,7 @@ mod tests {
             let config = TestConfig::new("h264_rtsp_hls", TestCodec::H264);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
 
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
             tester.push_test_stream(&config.stream_id, 2).await.unwrap();
@@ -173,7 +176,7 @@ mod tests {
             let config = TestConfig::new("h264_api_all", TestCodec::H264);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H264);
 
             // Publish via API
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
@@ -195,7 +198,7 @@ mod tests {
     }
 
     // =========================================================================
-    // H265 Cross-Protocol Tests
+    // H265 Cross-Protocol Tests (Mocked)
     // =========================================================================
 
     mod h265_rtmp_publish {
@@ -206,7 +209,7 @@ mod tests {
             let config = TestConfig::new("h265_rtmp_flv", TestCodec::H265);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
 
             // Publish H265 via API (simulating RTMP publish)
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
@@ -228,7 +231,7 @@ mod tests {
             let config = TestConfig::new("h265_rtmp_rtsp", TestCodec::H265);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
 
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
             tester.push_test_stream(&config.stream_id, 2).await.unwrap();
@@ -246,7 +249,7 @@ mod tests {
             let config = TestConfig::new("h265_rtmp_hls", TestCodec::H265);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
 
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
             tester.push_test_stream(&config.stream_id, 2).await.unwrap();
@@ -268,7 +271,7 @@ mod tests {
             let config = TestConfig::new("h265_rtsp_flv", TestCodec::H265);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
 
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
             tester.push_test_stream(&config.stream_id, 2).await.unwrap();
@@ -286,7 +289,7 @@ mod tests {
             let config = TestConfig::new("h265_rtsp_rtmp", TestCodec::H265);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
 
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
             tester.push_test_stream(&config.stream_id, 2).await.unwrap();
@@ -304,7 +307,7 @@ mod tests {
             let config = TestConfig::new("h265_rtsp_hls", TestCodec::H265);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
 
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
             tester.push_test_stream(&config.stream_id, 2).await.unwrap();
@@ -326,7 +329,7 @@ mod tests {
             let config = TestConfig::new("h265_api_all", TestCodec::H265);
             let manager = Arc::new(StreamManager::new());
 
-            setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
+            let _tracks = setup_test_stream(&manager, &config.stream_id, TestCodec::H265);
 
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
             tester.push_test_stream(&config.stream_id, 2).await.unwrap();
@@ -346,7 +349,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Cross-Codec Matrix Tests
+    // Codec Matrix Tests
     // =========================================================================
 
     mod codec_matrix {
@@ -358,11 +361,11 @@ mod tests {
 
             // H264 stream
             let h264_stream_id = "test_h264_concurrent";
-            setup_test_stream(&manager, h264_stream_id, TestCodec::H264);
+            let _tracks = setup_test_stream(&manager, h264_stream_id, TestCodec::H264);
 
             // H265 stream
             let h265_stream_id = "test_h265_concurrent";
-            setup_test_stream(&manager, h265_stream_id, TestCodec::H265);
+            let _tracks = setup_test_stream(&manager, h265_stream_id, TestCodec::H265);
 
             // Publish to both
             let tester = vcp_media_server::core::StreamTester::new(manager.clone());
@@ -457,7 +460,7 @@ mod tests {
             let manager = Arc::new(StreamManager::new());
             let stream_id = "test_multi_sub";
 
-            setup_test_stream(&manager, stream_id, TestCodec::H264);
+            let _tracks = setup_test_stream(&manager, stream_id, TestCodec::H264);
 
             // Multiple HTTP-FLV subscribers
             let reader1 = manager.dispatch_subscribe(stream_id, DispatchPolicy::LiveCoalesce);
@@ -612,7 +615,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Protocol-Specific Tests
+    // Protocol Helper Tests
     // =========================================================================
 
     mod protocol_helpers {
@@ -623,7 +626,7 @@ mod tests {
             let stream_key = "test_stream";
             let app = "live";
 
-            let command = create_rtmp_publish_command(stream_key, app);
+            let command = crate::common::rtmp_helper::create_rtmp_publish_command(stream_key, app);
             assert!(command.contains("publish"));
             assert!(command.contains(stream_key));
             assert!(command.contains(app));
