@@ -24,7 +24,7 @@ async fn test_rtsp_logging_scenario() {
     manager.create_stream("test_stream", StreamSource::Push, StreamProtocol::Unknown, None);
     
     let peer_addr: std::net::SocketAddr = "127.0.0.1:55444".parse().unwrap();
-    let mut session = RtspSession::new();
+    let mut session = RtspSessionState::new();
     
     info!("=== Starting RTSP logging test scenario ===");
     
@@ -74,7 +74,7 @@ async fn test_rtsp_logging_scenario() {
 async fn test_rtsp_announce_and_record_scenario() {
     let manager = Arc::new(StreamManager::new());
     let peer_addr: std::net::SocketAddr = "127.0.0.1:55555".parse().unwrap();
-    let mut session = RtspSession::new();
+    let mut session = RtspSessionState::new();
     
     info!("=== Starting RTSP ANNOUNCE and RECORD logging test ===");
     
@@ -104,7 +104,7 @@ async fn test_rtsp_announce_and_record_scenario() {
 async fn test_rtsp_error_scenario() {
     let manager = Arc::new(StreamManager::new());
     let peer_addr: std::net::SocketAddr = "127.0.0.1:55666".parse().unwrap();
-    let mut session = RtspSession::new();
+    let mut session = RtspSessionState::new();
     
     info!("=== Starting RTSP error scenario logging test ===");
     
@@ -154,8 +154,8 @@ async fn test_rtsp_concurrent_sessions() {
     let peer_addr1: std::net::SocketAddr = "192.168.1.100:12345".parse().unwrap();
     let peer_addr2: std::net::SocketAddr = "192.168.1.101:54321".parse().unwrap();
     
-    let mut session1 = RtspSession::new();
-    let mut session2 = RtspSession::new();
+    let mut session1 = RtspSessionState::new();
+    let mut session2 = RtspSessionState::new();
     
     info!("=== Session 1 (Client A) ===");
     let _ = RtspServer::process_rtsp_request("OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n", &manager, &mut session1, peer_addr1, None, None).await;

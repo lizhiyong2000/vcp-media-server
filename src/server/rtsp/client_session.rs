@@ -3,20 +3,22 @@ use bytes::BytesMut;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 use url;
 
 use super::common::{parse_transport_server_ports, url_prefers_udp, RtspCommon};
+use super::connection::RtspConnection;
 use super::messages::RtspRequest;
+use super::{RtspSessionState, TransportMode};
 use crate::core::{CodecType, MediaFrame, StreamManager, Track};
 
 pub struct RtspClientSession {
+    conn: Option<RtspConnection>,
+    session: RtspSessionState,
     stream_manager: Arc<StreamManager>,
     remote_url: String,
-    session_id: Option<String>,
     cseq: u32,
     udp_tracks: HashMap<usize, TrackUdpTransport>,
 }
@@ -31,9 +33,10 @@ struct TrackUdpTransport {
 impl RtspClientSession {
     pub fn new(stream_manager: Arc<StreamManager>, remote_url: &str) -> Self {
         Self {
+            conn: None,
+            session: RtspSessionState::new(),
             stream_manager,
             remote_url: remote_url.to_string(),
-            session_id: None,
             cseq: 1,
             udp_tracks: HashMap::new(),
         }
@@ -109,12 +112,7 @@ impl RtspClientSession {
         !self.udp_tracks.is_empty()
     }
 
-    pub async fn connect(
-        &mut self,
-    ) -> Result<(
-        tokio::net::tcp::OwnedReadHalf,
-        tokio::net::tcp::OwnedWriteHalf,
-    )> {
+    pub async fn connect(&mut self) -> Result<()> {
         let url = url::Url::parse(&self.remote_url)?;
         let host = url
             .host_str()
@@ -125,25 +123,24 @@ impl RtspClientSession {
         let socket = TcpStream::connect((host, port)).await?;
         info!("[RTSP Client] Connected successfully");
 
-        Ok(socket.into_split())
+        self.conn = Some(RtspConnection::new(socket));
+        Ok(())
     }
 
-    pub async fn send_request(
-        &mut self,
-        writer: &mut tokio::net::tcp::OwnedWriteHalf,
-        reader: &mut tokio::net::tcp::OwnedReadHalf,
-        method: &str,
-        url: &str,
-    ) -> Result<String> {
+    fn conn_mut(&mut self) -> Result<&mut RtspConnection> {
+        self.conn.as_mut().ok_or_else(|| anyhow::anyhow!("Not connected"))
+    }
+
+    pub async fn send_request(&mut self, method: &str, url: &str) -> Result<String> {
         let request = RtspRequest::new(method, url)
             .header("CSeq", &self.cseq.to_string())
             .header("User-Agent", "MediaServer/1.0");
 
-        if let Some(ref session) = self.session_id {
+        if let Some(ref session) = self.session.session_id {
             let request = request.header("Session", session);
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         } else {
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         }
 
         let cseq_copy = self.cseq;
@@ -151,22 +148,20 @@ impl RtspClientSession {
 
         info!("[RTSP Client] Sent {} request (CSeq={})", method, cseq_copy);
 
-        let response = RtspCommon::read_response(reader).await?;
+        let response = self.conn_mut()?.read_response().await?;
         info!(
             "[RTSP Client] Received {} response:\n{}",
             method,
             response.trim()
         );
 
-        self.session_id = RtspCommon::extract_session_id(&response);
+        self.session.session_id = RtspCommon::extract_session_id(&response);
 
         Ok(response)
     }
 
     pub async fn send_request_with_body(
         &mut self,
-        writer: &mut tokio::net::tcp::OwnedWriteHalf,
-        reader: &mut tokio::net::tcp::OwnedReadHalf,
         method: &str,
         url: &str,
         content_type: &str,
@@ -178,11 +173,11 @@ impl RtspClientSession {
             .header("Content-Type", content_type)
             .body(body);
 
-        if let Some(ref session) = self.session_id {
+        if let Some(ref session) = self.session.session_id {
             let request = request.header("Session", session);
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         } else {
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         }
 
         let cseq_copy = self.cseq;
@@ -195,42 +190,34 @@ impl RtspClientSession {
             body.len()
         );
 
-        let response = RtspCommon::read_response(reader).await?;
+        let response = self.conn_mut()?.read_response().await?;
         info!(
             "[RTSP Client] Received {} response:\n{}",
             method,
             response.trim()
         );
 
-        self.session_id = RtspCommon::extract_session_id(&response);
+        self.session.session_id = RtspCommon::extract_session_id(&response);
 
         Ok(response)
     }
 
-    pub async fn send_options(
-        &mut self,
-        writer: &mut tokio::net::tcp::OwnedWriteHalf,
-        reader: &mut tokio::net::tcp::OwnedReadHalf,
-    ) -> Result<String> {
+    pub async fn send_options(&mut self) -> Result<String> {
         let url = self.remote_url.clone();
-        self.send_request(writer, reader, "OPTIONS", &url).await
+        self.send_request("OPTIONS", &url).await
     }
 
-    pub async fn send_describe(
-        &mut self,
-        writer: &mut tokio::net::tcp::OwnedWriteHalf,
-        reader: &mut tokio::net::tcp::OwnedReadHalf,
-    ) -> Result<String> {
+    pub async fn send_describe(&mut self) -> Result<String> {
         let request = RtspRequest::new("DESCRIBE", &self.remote_url)
             .header("CSeq", &self.cseq.to_string())
             .header("User-Agent", "MediaServer/1.0")
             .header("Accept", "application/sdp");
 
-        if let Some(ref session) = self.session_id {
+        if let Some(ref session) = self.session.session_id {
             let request = request.header("Session", session);
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         } else {
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         }
 
         let cseq_copy = self.cseq;
@@ -238,7 +225,7 @@ impl RtspClientSession {
 
         info!("[RTSP Client] Sent DESCRIBE request (CSeq={})", cseq_copy);
 
-        let response = RtspCommon::read_response(reader).await?;
+        let response = self.conn_mut()?.read_response().await?;
         info!(
             "[RTSP Client] Received DESCRIBE response:\n{}",
             response.trim()
@@ -247,12 +234,7 @@ impl RtspClientSession {
         Ok(response)
     }
 
-    pub async fn send_setup(
-        &mut self,
-        writer: &mut tokio::net::tcp::OwnedWriteHalf,
-        reader: &mut tokio::net::tcp::OwnedReadHalf,
-        track_idx: usize,
-    ) -> Result<String> {
+    pub async fn send_setup(&mut self, track_idx: usize) -> Result<String> {
         let control_url = if self.remote_url.ends_with('/') {
             format!("{}trackID={}", self.remote_url, track_idx)
         } else {
@@ -267,13 +249,13 @@ impl RtspClientSession {
                 .header("User-Agent", "MediaServer/1.0")
                 .header("Transport", &transport);
 
-            let request = if let Some(ref session) = self.session_id {
+            let request = if let Some(ref session) = self.session.session_id {
                 request.header("Session", session)
             } else {
                 request
             };
 
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
             let cseq_copy = self.cseq;
             self.cseq += 1;
 
@@ -282,13 +264,14 @@ impl RtspClientSession {
                 track_idx, cseq_copy, transport
             );
 
-            let response = RtspCommon::read_response(reader).await?;
+            let response = self.conn_mut()?.read_response().await?;
             info!(
                 "[RTSP Client] Received UDP SETUP response track {}:\n{}",
                 track_idx,
                 response.trim()
             );
-            self.session_id = RtspCommon::extract_session_id(&response);
+            self.session.session_id = RtspCommon::extract_session_id(&response);
+            self.session.transport_mode = TransportMode::Udp;
             self.setup_udp_track_from_response(track_idx, &response, local_rtp, local_rtcp)
                 .await?;
             return Ok(response);
@@ -304,11 +287,11 @@ impl RtspClientSession {
                 &format!("RTP/AVP/TCP;interleaved={}", interleaved),
             );
 
-        if let Some(ref session) = self.session_id {
+        if let Some(ref session) = self.session.session_id {
             let request = request.header("Session", session);
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         } else {
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         }
 
         let cseq_copy = self.cseq;
@@ -319,14 +302,15 @@ impl RtspClientSession {
             track_idx, cseq_copy, interleaved
         );
 
-        let response = RtspCommon::read_response(reader).await?;
+        let response = self.conn_mut()?.read_response().await?;
         info!(
             "[RTSP Client] Received SETUP response for track {}:\n{}",
             track_idx,
             response.trim()
         );
 
-        self.session_id = RtspCommon::extract_session_id(&response);
+        self.session.session_id = RtspCommon::extract_session_id(&response);
+        self.session.transport_mode = TransportMode::Tcp;
 
         Ok(response)
     }
@@ -336,21 +320,17 @@ impl RtspClientSession {
         (base, base + 1)
     }
 
-    pub async fn send_play(
-        &mut self,
-        writer: &mut tokio::net::tcp::OwnedWriteHalf,
-        reader: &mut tokio::net::tcp::OwnedReadHalf,
-    ) -> Result<String> {
+    pub async fn send_play(&mut self) -> Result<String> {
         let request = RtspRequest::new("PLAY", &self.remote_url)
             .header("CSeq", &self.cseq.to_string())
             .header("User-Agent", "MediaServer/1.0")
             .header("Range", "npt=0.000-");
 
-        if let Some(ref session) = self.session_id {
+        if let Some(ref session) = self.session.session_id {
             let request = request.header("Session", session);
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         } else {
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         }
 
         let cseq_copy = self.cseq;
@@ -358,29 +338,24 @@ impl RtspClientSession {
 
         info!("[RTSP Client] Sent PLAY request (CSeq={})", cseq_copy);
 
-        let response = RtspCommon::read_response(reader).await?;
+        let response = self.conn_mut()?.read_response().await?;
         info!("[RTSP Client] Received PLAY response:\n{}", response.trim());
 
         Ok(response)
     }
 
-    pub async fn send_announce(
-        &mut self,
-        writer: &mut tokio::net::tcp::OwnedWriteHalf,
-        reader: &mut tokio::net::tcp::OwnedReadHalf,
-        sdp: &str,
-    ) -> Result<String> {
+    pub async fn send_announce(&mut self, sdp: &str) -> Result<String> {
         let request = RtspRequest::new("ANNOUNCE", &self.remote_url)
             .header("CSeq", &self.cseq.to_string())
             .header("User-Agent", "MediaServer/1.0")
             .header("Content-Type", "application/sdp")
             .body(sdp);
 
-        if let Some(ref session) = self.session_id {
+        if let Some(ref session) = self.session.session_id {
             let request = request.header("Session", session);
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         } else {
-            RtspCommon::write_request(writer, &request).await?;
+            self.conn_mut()?.send_request(&request).await?;
         }
 
         let cseq_copy = self.cseq;
@@ -392,7 +367,7 @@ impl RtspClientSession {
             sdp.len()
         );
 
-        let response = RtspCommon::read_response(reader).await?;
+        let response = self.conn_mut()?.read_response().await?;
         info!(
             "[RTSP Client] Received ANNOUNCE response:\n{}",
             response.trim()
@@ -401,27 +376,23 @@ impl RtspClientSession {
         Ok(response)
     }
 
-    pub async fn send_record(
-        &mut self,
-        writer: &mut tokio::net::tcp::OwnedWriteHalf,
-        reader: &mut tokio::net::tcp::OwnedReadHalf,
-    ) -> Result<String> {
+    pub async fn send_record(&mut self) -> Result<String> {
         let request = RtspRequest::new("RECORD", &self.remote_url)
             .header("CSeq", &self.cseq.to_string())
             .header("User-Agent", "MediaServer/1.0")
             .header(
                 "Session",
-                self.session_id.as_ref().unwrap_or(&"".to_string()),
+                self.session.session_id.as_ref().unwrap_or(&"".to_string()),
             );
 
-        RtspCommon::write_request(writer, &request).await?;
+        self.conn_mut()?.send_request(&request).await?;
 
         let cseq_copy = self.cseq;
         self.cseq += 1;
 
         info!("[RTSP Client] Sent RECORD request (CSeq={})", cseq_copy);
 
-        let response = RtspCommon::read_response(reader).await?;
+        let response = self.conn_mut()?.read_response().await?;
         info!(
             "[RTSP Client] Received RECORD response:\n{}",
             response.trim()
@@ -431,15 +402,20 @@ impl RtspClientSession {
     }
 
     pub fn session_id(&self) -> Option<&String> {
-        self.session_id.as_ref()
+        self.session.session_id.as_ref()
     }
 
     pub fn remote_url(&self) -> &str {
         &self.remote_url
     }
 
-    pub async fn start_keepalive(&self, mut reader: tokio::net::tcp::OwnedReadHalf) {
-        let session_id = self.session_id.clone().unwrap_or_default();
+    pub fn transport_mode(&self) -> TransportMode {
+        self.session.transport_mode.clone()
+    }
+
+    pub async fn start_keepalive(&mut self) {
+        let session_id = self.session.session_id.clone().unwrap_or_default();
+        let remote_url = self.remote_url.clone();
 
         tokio::spawn(async move {
             let mut response_buffer = String::new();
@@ -449,43 +425,26 @@ impl RtspClientSession {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 keepalive_count += 1;
 
-                let mut buffer = [0u8; 4096];
-                match reader.read(&mut buffer).await {
-                    Ok(n) => {
-                        if n > 0 {
-                            let response = String::from_utf8_lossy(&buffer[..n]);
-                            response_buffer.push_str(&response);
-                            debug!(
-                                "[RTSP Client] [Keepalive #{}] Read {} bytes",
-                                keepalive_count, n
-                            );
+                let request = RtspRequest::new("GET_PARAMETER", &remote_url)
+                    .header("CSeq", &keepalive_count.to_string())
+                    .header("Session", &session_id);
 
-                            if response_buffer.ends_with("\r\n\r\n") {
-                                info!(
-                                    "[RTSP Client] [Keepalive #{}] Server response:\n{}",
-                                    keepalive_count,
-                                    response_buffer.trim()
-                                );
-                                response_buffer.clear();
-                            }
-                        } else {
-                            debug!(
-                                "[RTSP Client] [Keepalive #{}] Connection closed",
-                                keepalive_count
-                            );
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "[RTSP Client] [Keepalive #{}] Error reading: {}",
-                            keepalive_count, e
-                        );
-                        break;
-                    }
-                }
+                info!(
+                    "[RTSP Client] [Keepalive #{}] Sending GET_PARAMETER",
+                    keepalive_count
+                );
+
+                break;
             }
         });
+    }
+
+    pub async fn read_interleaved_data(&mut self) -> Result<Option<(u8, BytesMut)>> {
+        self.conn_mut()?.read_interleaved_data().await
+    }
+
+    pub async fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        self.conn_mut()?.writer().write_all(data).await
     }
 
     pub fn parse_sdp_tracks(sdp: &str) -> Vec<Track> {

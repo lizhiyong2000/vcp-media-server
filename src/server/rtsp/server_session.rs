@@ -3,7 +3,6 @@ use bytes::BytesMut;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tracing::{debug, error, info, warn};
@@ -11,9 +10,10 @@ use tracing::{debug, error, info, warn};
 use super::common::{
     extract_track_id, extract_transport, format_rtsp_message, is_udp_transport, RtspCommon,
 };
+use super::connection::RtspConnection;
 use super::play_egress::{egress_rtp_packets, is_idr, prime_rtsp_play, PlayRtpTimeline};
 use super::{
-    InterleavedChannel, RtspRequest, RtspResponse, RtspServer, RtspSession, TransportMode,
+    InterleavedChannel, RtspRequest, RtspResponse, RtspServer, RtspSessionState, TransportMode,
 };
 use crate::core::dispatch::DispatchError;
 use crate::core::hevc_sprop_from_nals;
@@ -21,27 +21,24 @@ use crate::core::{
     CodecType, DispatchPolicy, MediaFrame, MetricsRegistry, PlaybackProtocol, StreamManager, Track,
     AAC_DEFAULT_CLOCK_RATE,
 };
+use crate::server::socket_transport::{ChannelSocketWriter, SocketReader, spawn_write_loop};
 use crate::server::webrtc::{H264RtpIngest, HevcRtpIngest};
 
 pub struct RtspServerSession {
-    reader: tokio::net::tcp::OwnedReadHalf,
-    session: RtspSession,
+    conn: RtspConnection,
+    session: RtspSessionState,
     manager: Arc<StreamManager>,
     hls_server: Option<Arc<crate::server::hls::HlsServer>>,
-    peer_addr: SocketAddr,
     rtp_ssrc: u32,
-    write_tx: Sender<Vec<u8>>,
     running: bool,
     udp_tracks: HashMap<u8, UdpTrackTransport>,
     udp_receiver_tracks: std::collections::HashSet<u8>,
     rtp_sender_abort: Option<tokio::task::AbortHandle>,
-    // Video codec parameters
     vps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     sps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     pps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     h264_ingest: Option<H264RtpIngest>,
     hevc_ingest: Option<HevcRtpIngest>,
-    // Track the session state for SDP generation
     sdp_generated: Arc<parking_lot::RwLock<bool>>,
 }
 
@@ -59,24 +56,12 @@ impl RtspServerSession {
         manager: Arc<StreamManager>,
         hls_server: Option<Arc<crate::server::hls::HlsServer>>,
     ) -> Self {
-        let peer_addr = socket
-            .peer_addr()
-            .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
-        let (reader, writer) = socket.into_split();
-        let (write_tx, write_rx) = channel(100);
-
-        tokio::spawn(async move {
-            Self::write_loop(writer, write_rx).await;
-        });
-
         Self {
-            reader,
-            session: RtspSession::new(),
+            conn: RtspConnection::new(socket),
+            session: RtspSessionState::new(),
             manager,
             hls_server,
-            peer_addr,
             rtp_ssrc: rand::random(),
-            write_tx,
             running: true,
             udp_tracks: HashMap::new(),
             udp_receiver_tracks: std::collections::HashSet::new(),
@@ -100,7 +85,7 @@ impl RtspServerSession {
 
         info!(
             "[RTSP] [{}] UDP SETUP track={} client={}-{} server={}-{}",
-            self.peer_addr,
+            self.conn.peer_addr(),
             track_id,
             client_rtp_port,
             client_rtcp_port,
@@ -111,8 +96,8 @@ impl RtspServerSession {
         let rtp_socket = Arc::new(RtspCommon::create_udp_socket(server_rtp_port).await?);
         let rtcp_socket = Arc::new(RtspCommon::create_udp_socket(server_rtcp_port).await?);
 
-        let client_rtp_addr = SocketAddr::new(self.peer_addr.ip(), client_rtp_port);
-        let client_rtcp_addr = SocketAddr::new(self.peer_addr.ip(), client_rtcp_port);
+        let client_rtp_addr = SocketAddr::new(self.conn.peer_addr().ip(), client_rtp_port);
+        let client_rtcp_addr = SocketAddr::new(self.conn.peer_addr().ip(), client_rtcp_port);
 
         self.udp_tracks.insert(
             track_id,
@@ -149,7 +134,7 @@ impl RtspServerSession {
         };
 
         let manager = Arc::clone(&self.manager);
-        let peer_addr = self.peer_addr;
+        let peer_addr = self.conn.peer_addr().clone();
         let session_tracks = self.session.tracks.clone();
 
         tokio::spawn(async move {
@@ -277,57 +262,44 @@ impl RtspServerSession {
     }
 
     pub fn peer_addr(&self) -> &SocketAddr {
-        &self.peer_addr
+        self.conn.peer_addr()
     }
 
-    pub fn session(&self) -> &RtspSession {
+    pub fn session(&self) -> &RtspSessionState {
         &self.session
     }
 
-    pub fn write_sender(&self) -> Sender<Vec<u8>> {
-        self.write_tx.clone()
+    pub fn writer(&self) -> &ChannelSocketWriter {
+        self.conn.writer()
     }
 
-    pub async fn send_response(&self, response: &RtspResponse) -> Result<()> {
-        let data = response.to_string().into_bytes();
-
-        // Log the response in a human-readable format
-        let response_str = response.to_string();
-        debug!(
-            "[RTSP] [{}] Sending response:\n{}",
-            self.peer_addr,
-            format_rtsp_message(&response_str)
-        );
-
-        self.write_tx.send(data).await?;
-        Ok(())
+    pub async fn send_response(&mut self, response: &RtspResponse) -> Result<()> {
+        self.conn.send_response(response).await
     }
 
     pub async fn send_rtp_packet(&self, data: &[u8]) -> Result<()> {
-        self.write_tx.send(data.to_vec()).await?;
-        Ok(())
+        self.conn.send_rtp_packet(data).await
     }
 
     pub async fn start(mut self) {
-        info!("[RTSP] [{}] Starting session handler", self.peer_addr);
+        info!("[RTSP] [{}] Starting session handler", self.conn.peer_addr());
 
         let result = self.read_loop().await;
         self.cleanup_on_disconnect();
 
         if let Err(e) = result {
-            error!("[RTSP] [{}] Session error: {}", self.peer_addr, e);
+            error!("[RTSP] [{}] Session error: {}", self.conn.peer_addr(), e);
         }
 
         self.running = false;
-        info!("[RTSP] [{}] Session handler stopped", self.peer_addr);
+        info!("[RTSP] [{}] Session handler stopped", self.conn.peer_addr());
     }
 
-    /// Stop PLAY egress when the client disconnects without TEARDOWN.
     fn cleanup_on_disconnect(&mut self) {
         if self.rtp_sender_abort.is_some() || self.session.rtp_task_started {
             info!(
                 "[RTSP] [{}] Client disconnected — stopping PLAY RTP sender",
-                self.peer_addr
+                self.conn.peer_addr()
             );
         }
         self.abort_rtp_sender();
@@ -349,9 +321,9 @@ impl RtspServerSession {
         let mut request_count: usize = 0;
 
         while self.running {
-            let n = self.reader.read_buf(&mut buffer).await?;
+            let n = self.conn.read_into(&mut buffer).await?;
             if n == 0 {
-                info!("[RTSP] [{}] Connection closed by peer", self.peer_addr);
+                info!("[RTSP] [{}] Connection closed by peer", self.conn.peer_addr());
                 break;
             }
 
@@ -391,26 +363,6 @@ impl RtspServerSession {
         Ok(())
     }
 
-    async fn write_loop(mut writer: tokio::net::tcp::OwnedWriteHalf, mut rx: Receiver<Vec<u8>>) {
-        while let Some(data) = rx.recv().await {
-            if let Err(e) = writer.write_all(&data).await {
-                error!("[RTSP] Write error: {}", e);
-                break;
-            }
-            if let Err(e) = writer.flush().await {
-                error!("[RTSP] Flush error: {}", e);
-                break;
-            }
-        }
-        info!("[RTSP] Write loop stopped");
-    }
-
-    // Extract SPS/PPS from H264 RTP payload
-    // Handles:
-    // 1. Single NAL units (SPS type 7, PPS type 8)
-    // 2. FU-A fragmentation (type 28)
-    // 3. STAP-A aggregation (type 24)
-    // 4. IDR frames containing embedded SPS/PPS with start codes
     fn extract_h264_sps_pps_from_payload(payload: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
         let mut sps: Option<Vec<u8>> = None;
         let mut pps: Option<Vec<u8>> = None;
@@ -427,9 +379,7 @@ impl RtspServerSession {
         debug!("[RTSP SPS/PPS] Analyzing payload: length={} bytes, first_byte=0x{:02X}, nal_type={}, NRI={}", 
                payload.len(), first_byte, nal_type, nri);
 
-        // Check for FU-A fragmentation (type 28)
         if nal_type == 28 && payload.len() >= 2 {
-            // FU-A format: FU indicator + FU header
             let fu_indicator = payload[0];
             let fu_header = payload[1];
             let start_bit = (fu_header >> 7) & 0x01;
@@ -439,9 +389,7 @@ impl RtspServerSession {
             debug!("[RTSP SPS/PPS] FU-A fragment detected: start_bit={}, end_bit={}, original_nal_type={}", 
                    start_bit, end_bit, original_nal_type);
 
-            // Only process if this is the start of a fragment
             if start_bit == 1 {
-                // Reconstruct the original NAL unit
                 let mut original_nal = Vec::with_capacity(1 + payload.len() - 2);
                 original_nal.push((fu_indicator & 0xE0) | original_nal_type);
                 original_nal.extend_from_slice(&payload[2..]);
@@ -451,7 +399,6 @@ impl RtspServerSession {
                     original_nal.len()
                 );
 
-                // Check if it's SPS or PPS
                 match original_nal_type {
                     7 if sps.is_none() => {
                         info!(
@@ -489,15 +436,12 @@ impl RtspServerSession {
                     "[RTSP SPS/PPS] FU-A fragment is not a start fragment (start_bit=0), skipping"
                 );
             }
-        }
-        // Check for STAP-A aggregation (type 24)
-        else if nal_type == 24 && payload.len() >= 4 {
+        } else if nal_type == 24 && payload.len() >= 4 {
             debug!("[RTSP SPS/PPS] STAP-A aggregation packet detected");
 
-            let mut offset = 1; // Skip STAP-A header byte
+            let mut offset = 1;
 
             while offset + 2 <= payload.len() {
-                // Read 2-byte length prefix
                 let nal_length = ((payload[offset] as usize) << 8) | (payload[offset + 1] as usize);
                 offset += 2;
 
@@ -548,23 +492,18 @@ impl RtspServerSession {
                     break;
                 }
 
-                // Stop early if we have both SPS and PPS
                 if sps.is_some() && pps.is_some() {
                     debug!("[RTSP SPS/PPS] Found both SPS and PPS, stopping STAP-A parsing");
                     break;
                 }
             }
-        }
-        // Check for IDR frame with embedded SPS/PPS (start code format)
-        else if nal_type == 5 && payload.len() >= 4 {
+        } else if nal_type == 5 && payload.len() >= 4 {
             info!(
                 "[RTSP SPS/PPS] IDR frame detected, checking for embedded SPS/PPS with start codes"
             );
 
-            // Search for start codes (0x000001 or 0x00000001)
             let mut offset = 0;
             while offset < payload.len() - 4 {
-                // Check for 3-byte start code (0x000001)
                 if payload[offset] == 0x00
                     && payload[offset + 1] == 0x00
                     && payload[offset + 2] == 0x01
@@ -576,7 +515,6 @@ impl RtspServerSession {
                         let inner_nal_type = payload[nal_start] & 0x1F;
                         let inner_nri = (payload[nal_start] >> 5) & 0x03;
 
-                        // Find next start code or end of payload
                         let mut next_offset = nal_start + 1;
                         while next_offset < payload.len() - 4 {
                             if payload[next_offset] == 0x00 && payload[next_offset + 1] == 0x00 {
@@ -625,9 +563,7 @@ impl RtspServerSession {
                         offset = next_offset;
                         continue;
                     }
-                }
-                // Check for 4-byte start code (0x00000001)
-                else if payload[offset] == 0x00
+                } else if payload[offset] == 0x00
                     && payload[offset + 1] == 0x00
                     && payload[offset + 2] == 0x00
                     && payload[offset + 3] == 0x01
@@ -680,9 +616,7 @@ impl RtspServerSession {
 
                 offset += 1;
             }
-        }
-        // Single NAL unit (non-FU-A, non-STAP-A, non-IDR with embedded)
-        else if payload.len() >= 2 {
+        } else if payload.len() >= 2 {
             info!(
                 "[RTSP SPS/PPS] Single NAL unit detected: length={} bytes, nal_type={}, NRI={}",
                 payload.len(),
@@ -752,7 +686,6 @@ impl RtspServerSession {
         (sps, pps)
     }
 
-    // Check if RTP payload contains H264 IDR frame (keyframe)
     fn is_h264_keyframe(payload: &[u8]) -> bool {
         if payload.is_empty() {
             return false;
@@ -761,15 +694,12 @@ impl RtspServerSession {
         let first_byte = payload[0];
         let nal_type = first_byte & 0x1F;
 
-        // FU-A fragmentation
         if nal_type == 28 && payload.len() >= 2 {
             let fu_header = payload[1];
             let original_nal_type = fu_header & 0x1F;
-            // IDR frame has NAL type 5
             return original_nal_type == 5;
         }
 
-        // Single NAL unit - IDR frame has NAL type 5
         nal_type == 5
     }
 
@@ -787,7 +717,7 @@ impl RtspServerSession {
             if self.session.is_rtcp_channel(channel) {
                 debug!(
                     "[RTSP] [{}] Ignore RTCP interleaved channel={} stream='{}'",
-                    self.peer_addr, channel, stream_id
+                    self.conn.peer_addr(), channel, stream_id
                 );
                 return;
             }
@@ -795,7 +725,7 @@ impl RtspServerSession {
             let Some(track_id) = self.session.rtp_track_for_channel(channel) else {
                 debug!(
                     "[RTSP] [{}] Ignore unknown interleaved channel={} stream='{}'",
-                    self.peer_addr, channel, stream_id
+                    self.conn.peer_addr(), channel, stream_id
                 );
                 return;
             };
@@ -804,7 +734,7 @@ impl RtspServerSession {
             if rtp_payload.len() < 12 {
                 warn!(
                     "[RTSP] [{}] RTP payload too short: {} bytes",
-                    self.peer_addr,
+                    self.conn.peer_addr(),
                     rtp_payload.len()
                 );
                 return;
@@ -855,13 +785,12 @@ impl RtspServerSession {
                 _ => {
                     debug!(
                         "[RTSP] [{}] Ignore unsupported RTP codec {:?} track={} stream='{}'",
-                        self.peer_addr, track_codec, track_id, stream_id
+                        self.conn.peer_addr(), track_codec, track_id, stream_id
                     );
                     return;
                 }
             }
 
-            // Audio / other tracks: pass through as before
             let clock_rate =
                 clock_rate_for_track_or_payload(&self.session.tracks, track_id, payload_type)
                     .unwrap_or(AAC_DEFAULT_CLOCK_RATE);
@@ -892,7 +821,7 @@ impl RtspServerSession {
         } else {
             warn!(
                 "[RTSP] [{}] Received RTP data but stream_id not set, dropping packet",
-                self.peer_addr
+                self.conn.peer_addr()
             );
         }
     }
@@ -931,11 +860,11 @@ impl RtspServerSession {
 
         debug!(
             "[RTSP] [{}] Request #{}, cseq={}",
-            self.peer_addr, request_count, cseq
+            self.conn.peer_addr(), request_count, cseq
         );
         debug!(
             "[RTSP] [{}] Received request:\n{}",
-            self.peer_addr,
+            self.conn.peer_addr(),
             format_rtsp_message(&request)
         );
 
@@ -960,7 +889,7 @@ impl RtspServerSession {
                         .await
                     {
                         Ok(ports) => setup_server_ports = Some(ports),
-                        Err(e) => warn!("[RTSP] [{}] UDP SETUP failed: {}", self.peer_addr, e),
+                        Err(e) => warn!("[RTSP] [{}] UDP SETUP failed: {}", self.conn.peer_addr(), e),
                     }
                 }
             }
@@ -977,7 +906,7 @@ impl RtspServerSession {
             &request,
             &self.manager,
             &mut self.session,
-            self.peer_addr,
+            *self.conn.peer_addr(),
             self.hls_server.clone(),
             setup_server_ports,
         )
@@ -985,14 +914,14 @@ impl RtspServerSession {
 
         info!(
             "[RTSP] [{}] Response #{}, length={}",
-            self.peer_addr,
+            self.conn.peer_addr(),
             request_count,
             response.len()
         );
 
         let parsed_response = RtspResponse::parse(&response)
             .unwrap_or_else(|| RtspResponse::new(500, "Internal Server Error").with_cseq("0"));
-        self.send_response(&parsed_response).await?;
+        self.conn.send_response(&parsed_response).await?;
 
         if method == "RECORD" && self.session.transport_mode == TransportMode::Udp {
             self.ensure_udp_receivers_started().await;
@@ -1018,12 +947,12 @@ impl RtspServerSession {
         self.session.rtp_task_started = true;
 
         let stream_id = self.session.stream_id.clone().unwrap();
-        let write_tx = self.write_tx.clone();
+        let write_tx = self.conn.writer().sender().clone();
         let rtp_ssrc = self.rtp_ssrc;
         let manager = Arc::clone(&self.manager);
         let sps_cache = Arc::clone(&self.sps_cache);
         let pps_cache = Arc::clone(&self.pps_cache);
-        let peer_addr = self.peer_addr;
+        let peer_addr = self.conn.peer_addr().clone();
         let use_udp = self.session.transport_mode == TransportMode::Udp;
         let udp_tracks = self.udp_tracks.clone();
         let interleaved_channels = self.session.interleaved_channels.clone();
@@ -1129,7 +1058,6 @@ impl RtspServerSession {
                             continue;
                         }
                     } else {
-                        // TCP interleaved: one RTP packet per interleaved frame
                         let rtp_channel = rtp_channel_for_track(&interleaved_channels, frame.track_id)
                             .unwrap_or(frame.track_id);
                         for packet in packets {
@@ -1177,7 +1105,7 @@ impl RtspServerSession {
 
     pub async fn close(&mut self) {
         self.running = false;
-        drop(self.write_tx.clone());
+        self.conn.close().await;
     }
 
     pub fn get_sps(&self) -> Option<Vec<u8>> {
@@ -1265,7 +1193,6 @@ impl RtspServerSession {
             }
         }
 
-        // Audio track (AAC)
         sdp.push_str("m=audio 0 RTP/AVP 97\r\n");
         sdp.push_str("c=IN IP4 0.0.0.0\r\n");
         sdp.push_str("t=0 0\r\n");
@@ -1317,57 +1244,16 @@ fn clock_rate_for_track_or_payload(
 }
 
 fn internal_track_id_for_codec(codec: CodecType) -> u8 {
-    if matches!(codec, CodecType::H264 | CodecType::H265) {
-        0
-    } else {
-        1
+    match codec {
+        CodecType::H264 | CodecType::H265 => 0,
+        CodecType::AAC | CodecType::Opus | CodecType::G711 => 1,
+        _ => 0,
     }
 }
 
 fn rtp_channel_for_track(channels: &[InterleavedChannel], track_id: u8) -> Option<u8> {
     channels
         .iter()
-        .find(|entry| entry.track_id == track_id)
-        .map(|entry| entry.rtp_channel)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rtp_channel_lookup_uses_setup_mapping_not_track_id() {
-        let channels = vec![
-            InterleavedChannel {
-                track_id: 0,
-                rtp_channel: 4,
-                rtcp_channel: 5,
-            },
-            InterleavedChannel {
-                track_id: 1,
-                rtp_channel: 6,
-                rtcp_channel: 7,
-            },
-        ];
-
-        assert_eq!(rtp_channel_for_track(&channels, 0), Some(4));
-        assert_eq!(rtp_channel_for_track(&channels, 1), Some(6));
-        assert_eq!(rtp_channel_for_track(&channels, 2), None);
-    }
-
-    #[test]
-    fn codec_lookup_prefers_announced_track_id_for_rtsp_push() {
-        let tracks = vec![
-            Track::new(0, CodecType::AAC, 97, 44_100),
-            Track::new(1, CodecType::H265, 96, 90_000),
-        ];
-
-        assert_eq!(codec_for_track(&tracks, 1), Some(CodecType::H265));
-        assert_eq!(
-            codec_for_track_or_payload(&tracks, 9, 96),
-            Some(CodecType::H265)
-        );
-        assert_eq!(internal_track_id_for_codec(CodecType::H265), 0);
-        assert_eq!(internal_track_id_for_codec(CodecType::AAC), 1);
-    }
+        .find(|c| c.track_id == track_id)
+        .map(|c| c.rtp_channel)
 }

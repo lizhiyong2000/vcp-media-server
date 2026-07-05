@@ -9,6 +9,7 @@ mod stream_hub;
 mod stream_manager;
 mod tester;
 mod timestamp;
+mod transport;
 mod video_codec;
 
 pub use dispatch::{coalesce_flv_batch, DispatchError, DispatchPolicy, DispatchReader};
@@ -36,6 +37,7 @@ pub use live_play::{
 pub use protocol::{ProtocolInfo, ProtocolRegistry, ProtocolType, StreamSink};
 pub use pusher::*;
 pub use tester::StreamTester;
+pub use transport::*;
 pub use timestamp::{
     flv_timestamp_ms, media_frame_timestamp_delta_ms, media_timestamp_delta_ms,
     media_timestamp_delta_ms_with_clock, video_media_timestamp_to_rtp_ticks, FlvPlayTimeline,
@@ -45,12 +47,13 @@ pub use video_codec::{
     build_enhanced_rtmp_hevc_sequence_header, build_rtmp_hevc_sequence_header,
     build_rtmp_video_from_annex_b, contains_h264_idr, contains_hevc_idr, ensure_annex_b,
     extract_h264_sps_pps, extract_hevc_param_sets, hevc_sprop_from_nals, hvcc_payload_to_annex_b,
-    is_enhanced_rtmp_video, is_keyframe_annex_b, is_parameter_set_only, merge_annex_b_nalu_config,
-    packetize_hevc_access_unit_for_rtp, parse_enhanced_hevc_video_message,
-    parse_hevc_decoder_config_record, parse_hevc_sprop_fmtp, prepare_video_au_for_ts,
-    prepend_annex_b_config, prepend_annex_b_config_if_needed, HevcFuReassembler, FLV_FRAME_INTER,
-    FLV_FRAME_KEY, FLV_IS_EX_HEADER, H265_NAL_PPS, H265_NAL_SPS, H265_NAL_VPS, HEVC_FOURCC,
-    RTMP_PKT_CODED_FRAMES, RTMP_PKT_CODED_FRAMES_X, RTMP_PKT_SEQUENCE_START,
+    is_enhanced_rtmp_video, is_keyframe_annex_b, is_parameter_set_only, iter_annex_b_nal_ranges,
+    merge_annex_b_nalu_config, packetize_hevc_access_unit_for_rtp,
+    parse_enhanced_hevc_video_message, parse_hevc_decoder_config_record, parse_hevc_sprop_fmtp,
+    prepare_video_au_for_ts, prepend_annex_b_config, prepend_annex_b_config_if_needed,
+    HevcFuReassembler, FLV_FRAME_INTER, FLV_FRAME_KEY, FLV_IS_EX_HEADER, H265_NAL_PPS,
+    H265_NAL_SPS, H265_NAL_VPS, HEVC_FOURCC, RTMP_PKT_CODED_FRAMES, RTMP_PKT_CODED_FRAMES_X,
+    RTMP_PKT_SEQUENCE_START,
 };
 
 pub type StreamId = String;

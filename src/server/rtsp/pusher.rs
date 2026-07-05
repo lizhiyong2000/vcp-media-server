@@ -1,20 +1,19 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use bytes::BytesMut;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
-use url;
 
 use super::client_session::RtspClientSession;
 use super::common::RtspCommon;
 use crate::core::{
-    CodecType, MediaFrame, PusherId, PusherStatus, StreamManager, StreamProtocol, StreamPusher,
-    Track,
+    CodecType, MediaFrame, MediaTransport, PusherId, StreamManager, StreamProtocol, StreamPusher,
+    Track, TransportStatus,
 };
 
 pub struct RtspPusher {
@@ -23,11 +22,11 @@ pub struct RtspPusher {
     remote_url: String,
     stream_id: String,
     tracks: Option<Vec<Track>>,
-    status: RwLock<PusherStatus>,
+    status: RwLock<TransportStatus>,
     paused: Arc<RwLock<bool>>,
-    // H264 codec parameters cache
     sps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     pps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
+    peer_addr: String,
 }
 
 impl RtspPusher {
@@ -39,10 +38,11 @@ impl RtspPusher {
             remote_url: remote_url.to_string(),
             stream_id: stream_id.to_string(),
             tracks: None,
-            status: RwLock::new(PusherStatus::Idle),
+            status: RwLock::new(TransportStatus::Idle),
             paused: Arc::new(RwLock::new(false)),
             sps_cache: Arc::new(parking_lot::RwLock::new(None)),
             pps_cache: Arc::new(parking_lot::RwLock::new(None)),
+            peer_addr: String::new(),
         }
     }
 
@@ -55,7 +55,7 @@ impl RtspPusher {
         );
     }
 
-    fn set_status(&self, status: PusherStatus) {
+    fn set_status(&self, status: TransportStatus) {
         let mut s = self.status.write();
         info!(
             "[RTSP Pusher] Status changed: {} -> {}",
@@ -83,10 +83,10 @@ impl RtspPusher {
         info!("[RTSP Pusher] Target URL: {}", self.remote_url);
         info!("[RTSP Pusher] =========================================");
 
-        self.set_status(PusherStatus::Starting);
+        self.set_status(TransportStatus::Connecting);
 
         if self.tracks.is_none() {
-            self.set_status(PusherStatus::Error("Tracks not set".to_string()));
+            self.set_status(TransportStatus::Error("Tracks not set".to_string()));
             return Err(anyhow::anyhow!(
                 "Tracks not set. Call set_tracks() before start()"
             ));
@@ -104,22 +104,20 @@ impl RtspPusher {
         let mut session = RtspClientSession::new(self.stream_manager.clone(), &self.remote_url);
 
         info!("[RTSP Pusher] [Step 1/5] Connecting...");
-        let (mut reader, mut writer) = session.connect().await?;
+        session.connect().await?;
 
         info!("[RTSP Pusher] [Step 2/5] Sending OPTIONS...");
-        let response = session.send_options(&mut writer, &mut reader).await?;
+        let response = session.send_options().await?;
         if !response.starts_with("RTSP/1.0 200 OK") {
-            self.set_status(PusherStatus::Error("OPTIONS failed".to_string()));
+            self.set_status(TransportStatus::Error("OPTIONS failed".to_string()));
             return Err(anyhow::anyhow!("OPTIONS failed: {}", response));
         }
 
         let sdp = RtspClientSession::build_sdp(tracks);
         info!("[RTSP Pusher] [Step 3/5] Sending ANNOUNCE...");
-        let response = session
-            .send_announce(&mut writer, &mut reader, &sdp)
-            .await?;
+        let response = session.send_announce(&sdp).await?;
         if !response.starts_with("RTSP/1.0 200 OK") {
-            self.set_status(PusherStatus::Error("ANNOUNCE failed".to_string()));
+            self.set_status(TransportStatus::Error("ANNOUNCE failed".to_string()));
             return Err(anyhow::anyhow!("ANNOUNCE failed: {}", response));
         }
 
@@ -128,9 +126,9 @@ impl RtspPusher {
             tracks.len()
         );
         for (idx, track) in tracks.iter().enumerate() {
-            let response = session.send_setup(&mut writer, &mut reader, idx).await?;
+            let response = session.send_setup(idx).await?;
             if !response.starts_with("RTSP/1.0 200 OK") {
-                self.set_status(PusherStatus::Error(format!(
+                self.set_status(TransportStatus::Error(format!(
                     "SETUP failed for track {}",
                     idx
                 )));
@@ -147,13 +145,13 @@ impl RtspPusher {
         }
 
         info!("[RTSP Pusher] [Step 5/5] Sending RECORD...");
-        let response = session.send_record(&mut writer, &mut reader).await?;
+        let response = session.send_record().await?;
         if !response.starts_with("RTSP/1.0 200 OK") {
-            self.set_status(PusherStatus::Error("RECORD failed".to_string()));
+            self.set_status(TransportStatus::Error("RECORD failed".to_string()));
             return Err(anyhow::anyhow!("RECORD failed: {}", response));
         }
 
-        self.set_status(PusherStatus::Running);
+        self.set_status(TransportStatus::Publishing);
         info!("[RTSP Pusher] =========================================");
         info!(
             "[RTSP Pusher] SUCCESS: RTSP Pusher started for stream {}",
@@ -184,8 +182,7 @@ impl RtspPusher {
 
         tokio::spawn(async move {
             tokio::select! {
-                _ = Self::rtp_send_loop(writer, manager_clone, stream_id_clone, tracks_clone, paused_clone, sps_cache_clone, pps_cache_clone, use_udp, udp_tracks) => (),
-                _ = Self::monitor_connection(reader) => (),
+                _ = Self::rtp_send_loop(manager_clone, stream_id_clone, tracks_clone, paused_clone, sps_cache_clone, pps_cache_clone, use_udp, udp_tracks) => (),
             }
         });
 
@@ -193,7 +190,6 @@ impl RtspPusher {
     }
 
     async fn rtp_send_loop(
-        mut writer: tokio::net::tcp::OwnedWriteHalf,
         manager: Arc<StreamManager>,
         stream_id: String,
         tracks: Vec<Track>,
@@ -230,20 +226,15 @@ impl RtspPusher {
         info!("[RTSP Pusher] [RTP Loop] Waiting for media frames...");
 
         async fn send_rtp_packet(
-            writer: &mut tokio::net::tcp::OwnedWriteHalf,
             use_udp: bool,
             udp_tracks: &HashMap<usize, (Arc<tokio::net::UdpSocket>, SocketAddr)>,
             track_id: usize,
-            channel: u8,
             packet: &[u8],
         ) -> Result<()> {
             if use_udp {
                 if let Some((socket, addr)) = udp_tracks.get(&track_id) {
                     RtspCommon::send_rtp_over_udp(socket, packet, *addr).await?;
                 }
-            } else {
-                let interleaved = RtspClientSession::wrap_interleaved(packet, channel);
-                writer.write_all(&interleaved).await?;
             }
             Ok(())
         }
@@ -275,9 +266,7 @@ impl RtspPusher {
                 }
 
                 let track = track.unwrap();
-                let channel = track.id * 2;
 
-                // Extract and cache SPS/PPS for H264 keyframes
                 if frame.codec == CodecType::H264 && frame.is_keyframe {
                     let (sps, pps) = RtspCommon::extract_sps_pps(&frame.data);
 
@@ -303,7 +292,6 @@ impl RtspPusher {
                         *cached_pps = Some(pps_data);
                     }
 
-                    // Send SPS/PPS before keyframe
                     let sps_copy = sps_cache.read().clone();
                     let pps_copy = pps_cache.read().clone();
 
@@ -311,16 +299,13 @@ impl RtspPusher {
                         let timestamp = frame.timestamp as u32;
                         let seq = sequences[track.id as usize];
 
-                        // Send SPS packet
                         let sps_rtp = RtspClientSession::build_rtp_packet(
                             96, seq, timestamp, 0x12345678, false, &sps_data,
                         );
                         if let Err(e) = send_rtp_packet(
-                            &mut writer,
                             use_udp,
                             &udp_tracks,
                             track.id as usize,
-                            channel,
                             &sps_rtp,
                         )
                         .await
@@ -334,7 +319,6 @@ impl RtspPusher {
                         );
                         sequences[track.id as usize] = sequences[track.id as usize].wrapping_add(1);
 
-                        // Send PPS packet
                         let pps_rtp = RtspClientSession::build_rtp_packet(
                             96,
                             sequences[track.id as usize],
@@ -344,11 +328,9 @@ impl RtspPusher {
                             &pps_data,
                         );
                         if let Err(e) = send_rtp_packet(
-                            &mut writer,
                             use_udp,
                             &udp_tracks,
                             track.id as usize,
-                            channel,
                             &pps_rtp,
                         )
                         .await
@@ -366,9 +348,7 @@ impl RtspPusher {
 
                 let seq = sequences[track.id as usize];
 
-                // Build RTP packet
                 let rtp_payload = if frame.codec == CodecType::H264 {
-                    // Add length prefix for proper RTP payload format
                     let mut payload = Vec::with_capacity(4 + frame.data.len());
                     payload.extend_from_slice(&(frame.data.len() as u32).to_be_bytes());
                     payload.extend_from_slice(&frame.data);
@@ -391,11 +371,9 @@ impl RtspPusher {
                 }
 
                 if let Err(e) = send_rtp_packet(
-                    &mut writer,
                     use_udp,
                     &udp_tracks,
                     track.id as usize,
-                    channel,
                     &rtp_packet,
                 )
                 .await
@@ -432,76 +410,59 @@ impl RtspPusher {
         );
     }
 
-    async fn monitor_connection(mut reader: tokio::net::tcp::OwnedReadHalf) {
-        info!("[RTSP Pusher] [Monitor] Starting connection monitor");
-
-        let mut buffer = [0u8; 4096];
-
-        loop {
-            match reader.read(&mut buffer).await {
-                Ok(n) => {
-                    if n > 0 {
-                        let response = String::from_utf8_lossy(&buffer[..n]);
-                        info!(
-                            "[RTSP Pusher] [Monitor] Received {} bytes: {}",
-                            n,
-                            response.trim()
-                        );
-                    } else {
-                        info!("[RTSP Pusher] [Monitor] Connection closed by server");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!("[RTSP Pusher] [Monitor] Error reading: {}", e);
-                    break;
-                }
-            }
-        }
-
-        info!("[RTSP Pusher] [Monitor] Connection monitor ended");
-    }
-
-    pub fn stop(&mut self) {
-        self.set_status(PusherStatus::Stopped);
-    }
-
     pub fn is_running(&self) -> bool {
-        self.status.read().is_running()
+        matches!(*self.status.read(), TransportStatus::Publishing)
     }
 }
 
-impl StreamPusher for RtspPusher {
-    fn id(&self) -> &PusherId {
-        &self.id
-    }
-
-    fn stream_id(&self) -> &str {
-        &self.stream_id
-    }
-
+#[async_trait]
+impl MediaTransport for RtspPusher {
     fn protocol(&self) -> StreamProtocol {
         StreamProtocol::RTSP
     }
 
-    fn remote_url(&self) -> &str {
-        &self.remote_url
+    fn status(&self) -> TransportStatus {
+        self.status.read().clone()
     }
 
-    fn status(&self) -> PusherStatus {
-        self.status.read().clone()
+    fn peer_addr(&self) -> String {
+        self.peer_addr.clone()
+    }
+
+    fn stream_id(&self) -> String {
+        self.stream_id.clone()
     }
 
     async fn start(&mut self) -> Result<()> {
         Self::start(self).await
     }
 
+    async fn stop(&mut self) -> Result<()> {
+        info!(
+            "[RTSP Pusher] Stopping pusher for stream {}",
+            self.stream_id
+        );
+        self.set_status(TransportStatus::Closed);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl StreamPusher for RtspPusher {
+    fn id(&self) -> &PusherId {
+        &self.id
+    }
+
+    fn remote_url(&self) -> &str {
+        &self.remote_url
+    }
+
     async fn pause(&mut self) -> Result<()> {
         info!("[RTSP Pusher] Pausing pusher for stream {}", self.stream_id);
         self.set_paused(true);
         let current_status = self.status.read().clone();
-        if current_status.is_running() {
-            self.set_status(PusherStatus::Paused);
+        if matches!(current_status, TransportStatus::Publishing) {
+            self.set_status(TransportStatus::Paused);
         }
         Ok(())
     }
@@ -513,18 +474,9 @@ impl StreamPusher for RtspPusher {
         );
         self.set_paused(false);
         let current_status = self.status.read().clone();
-        if current_status.is_paused() {
-            self.set_status(PusherStatus::Running);
+        if current_status == TransportStatus::Paused {
+            self.set_status(TransportStatus::Publishing);
         }
-        Ok(())
-    }
-
-    async fn stop(&mut self) -> Result<()> {
-        info!(
-            "[RTSP Pusher] Stopping pusher for stream {}",
-            self.stream_id
-        );
-        self.set_status(PusherStatus::Stopped);
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
 /// RTMP client puller: connect to remote RTMP server, play a stream,
 /// and relay A/V frames into StreamManager for local RTMP playback.
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,9 +13,9 @@ use super::amf0::{self, Amf0Value};
 use super::chunk::{self, ChunkAssembler, ChunkHeader};
 use crate::core::{
     hvcc_payload_to_annex_b, is_keyframe_annex_b, parse_enhanced_hevc_video_message,
-    parse_hevc_decoder_config_record, CodecType, MediaFrame, StreamManager, StreamProtocol,
-    StreamSourceMode, MILLISECOND_CLOCK_RATE, RTMP_PKT_CODED_FRAMES, RTMP_PKT_CODED_FRAMES_X,
-    RTMP_PKT_SEQUENCE_START,
+    parse_hevc_decoder_config_record, CodecType, MediaFrame, MediaTransport, StreamManager,
+    StreamProtocol, StreamPuller, StreamSourceMode, TransportStatus, MILLISECOND_CLOCK_RATE,
+    RTMP_PKT_CODED_FRAMES, RTMP_PKT_CODED_FRAMES_X, RTMP_PKT_SEQUENCE_START,
 };
 
 #[derive(Debug, Clone)]
@@ -62,14 +63,30 @@ pub fn parse_rtmp_url(url: &str) -> Result<RtmpUrl> {
 
 pub struct RtmpPuller {
     stream_manager: Arc<StreamManager>,
+    remote_url: Option<String>,
+    stream_id: String,
+    peer_addr: String,
+    status: TransportStatus,
 }
 
 impl RtmpPuller {
     pub fn new(stream_manager: Arc<StreamManager>) -> Self {
-        Self { stream_manager }
+        Self {
+            stream_manager,
+            remote_url: None,
+            stream_id: String::new(),
+            peer_addr: String::new(),
+            status: TransportStatus::Idle,
+        }
     }
 
-    pub async fn pull(&self, remote_url: &str, local_stream_id: &str) -> Result<()> {
+    pub fn with_url(mut self, remote_url: &str, stream_id: &str) -> Self {
+        self.remote_url = Some(remote_url.to_string());
+        self.stream_id = stream_id.to_string();
+        self
+    }
+
+    async fn do_pull(&self, remote_url: &str, local_stream_id: &str) -> Result<()> {
         let rtmp_url = parse_rtmp_url(remote_url)?;
 
         info!("[RTMP Puller] =========================================");
@@ -229,6 +246,47 @@ impl RtmpPuller {
     }
 }
 
+#[async_trait]
+impl MediaTransport for RtmpPuller {
+    fn protocol(&self) -> StreamProtocol {
+        StreamProtocol::RTMP
+    }
+
+    fn status(&self) -> TransportStatus {
+        self.status.clone()
+    }
+
+    fn peer_addr(&self) -> String {
+        self.peer_addr.clone()
+    }
+
+    fn stream_id(&self) -> String {
+        self.stream_id.clone()
+    }
+
+    async fn start(&mut self) -> Result<()> {
+        self.status = TransportStatus::Connecting;
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        self.status = TransportStatus::Closed;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl StreamPuller for RtmpPuller {
+    async fn pull(&mut self) -> Result<()> {
+        let url = self.remote_url.clone();
+        if let Some(url) = url {
+            self.status = TransportStatus::Playing;
+            self.do_pull(&url, &self.stream_id).await?;
+        }
+        Ok(())
+    }
+}
+
 async fn client_handshake(stream: &mut TcpStream) -> Result<()> {
     let mut c0c1 = vec![0x03u8];
     c0c1.extend(vec![0u8; 1536]);
@@ -247,7 +305,7 @@ async fn client_handshake(stream: &mut TcpStream) -> Result<()> {
 
 const CLIENT_CHUNK_SIZE: usize = 128;
 
-fn build_connect_command(tx_id: f64, app: &str, tc_url: &str) -> Vec<u8> {
+pub fn build_connect_command(tx_id: f64, app: &str, tc_url: &str) -> Vec<u8> {
     let mut props = HashMap::new();
     props.insert("app".to_string(), Amf0Value::String(app.to_string()));
     props.insert(
@@ -269,7 +327,7 @@ fn build_connect_command(tx_id: f64, app: &str, tc_url: &str) -> Vec<u8> {
     chunk::encode_message(0x14, 0, 0, &payload, CLIENT_CHUNK_SIZE, 3)
 }
 
-fn build_create_stream_command(tx_id: f64) -> Vec<u8> {
+pub fn build_create_stream_command(tx_id: f64) -> Vec<u8> {
     let payload = amf0::encode(&[
         Amf0Value::String("createStream".to_string()),
         Amf0Value::Number(tx_id),
@@ -289,7 +347,7 @@ fn build_play_command(tx_id: f64, stream_name: &str, msg_stream_id: u32) -> Vec<
     chunk::encode_message(0x14, 0, msg_stream_id, &payload, CLIENT_CHUNK_SIZE, 3)
 }
 
-fn handle_control_message(payload: &[u8], msg_type: u8) -> Option<usize> {
+pub fn handle_control_message(payload: &[u8], msg_type: u8) -> Option<usize> {
     match msg_type {
         0x01 if payload.len() >= 4 => {
             let new_size = ((payload[0] as usize) << 24)
@@ -368,7 +426,7 @@ async fn wait_for_play_start(
     Ok(())
 }
 
-async fn wait_for_result(
+pub async fn wait_for_result(
     read_half: &mut tokio::net::tcp::OwnedReadHalf,
     buf: &mut BytesMut,
     chunk_states: &mut HashMap<u32, ChunkAssembler>,
@@ -421,7 +479,7 @@ async fn wait_for_result(
     Err(anyhow!("Timeout waiting for {} _result", phase))
 }
 
-async fn wait_for_create_stream(
+pub async fn wait_for_create_stream(
     read_half: &mut tokio::net::tcp::OwnedReadHalf,
     buf: &mut BytesMut,
     chunk_states: &mut HashMap<u32, ChunkAssembler>,

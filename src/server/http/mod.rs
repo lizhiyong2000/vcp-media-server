@@ -19,8 +19,9 @@ use crate::server::hls::HlsServer;
 use crate::server::http_flv::{
     format_chunk, stream_has_video_sequence_header, HttpFlvServer, HttpFlvSession,
 };
-use crate::server::rtmp::RtmpPuller;
-use crate::server::rtsp::{RtspPuller, RtspPusher};
+use crate::server::transport::TransportAdapterFactory;
+use crate::core::TransportConfig;
+use crate::server::rtsp::RtspPusher;
 use crate::server::webrtc::request_publisher_keyframe;
 
 pub struct HttpServer {
@@ -793,8 +794,14 @@ impl HttpServer {
                 let local_stream_id_clone = local_stream_id.clone();
 
                 tokio::spawn(async move {
-                    let puller = RtspPuller::new(manager_clone);
-                    if let Err(e) = puller.pull(&remote_url_clone, &local_stream_id_clone).await {
+                    let config = TransportConfig::new(manager_clone, StreamProtocol::RTSP, &local_stream_id_clone)
+                        .with_remote_url(&remote_url_clone);
+                    let mut puller = TransportAdapterFactory::create_puller(config);
+                    if let Err(e) = puller.start().await {
+                        error!("[RTSP Puller] Failed to start: {}", e);
+                        return;
+                    }
+                    if let Err(e) = puller.pull().await {
                         error!("[RTSP Puller] Failed to pull stream: {}", e);
                     }
                 });
@@ -847,8 +854,14 @@ impl HttpServer {
                 let local_stream_id_clone = local_stream_id.clone();
 
                 tokio::spawn(async move {
-                    let puller = RtmpPuller::new(manager_clone);
-                    if let Err(e) = puller.pull(&remote_url_clone, &local_stream_id_clone).await {
+                    let config = TransportConfig::new(manager_clone, StreamProtocol::RTMP, &local_stream_id_clone)
+                        .with_remote_url(&remote_url_clone);
+                    let mut puller = TransportAdapterFactory::create_puller(config);
+                    if let Err(e) = puller.start().await {
+                        error!("[RTMP Puller] Failed to start: {}", e);
+                        return;
+                    }
+                    if let Err(e) = puller.pull().await {
                         error!("[RTMP Puller] Failed to pull stream: {}", e);
                     }
                 });

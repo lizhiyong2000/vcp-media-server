@@ -1,77 +1,27 @@
 use crate::core::StreamProtocol;
-use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::info;
 
-pub type PusherId = String;
+use super::transport::{PusherId, TransportStatus};
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum PusherStatus {
-    Idle,
-    Starting,
-    Running,
-    Paused,
-    Error(String),
-    Stopped,
-}
-
-impl PusherStatus {
-    pub fn as_str(&self) -> &str {
-        match self {
-            PusherStatus::Idle => "idle",
-            PusherStatus::Starting => "starting",
-            PusherStatus::Running => "running",
-            PusherStatus::Paused => "paused",
-            PusherStatus::Error(_) => "error",
-            PusherStatus::Stopped => "stopped",
-        }
-    }
-
-    pub fn description(&self) -> String {
-        match self {
-            PusherStatus::Idle => "Not started".to_string(),
-            PusherStatus::Starting => "Starting".to_string(),
-            PusherStatus::Running => "Running".to_string(),
-            PusherStatus::Paused => "Paused".to_string(),
-            PusherStatus::Error(e) => format!("Error: {}", e),
-            PusherStatus::Stopped => "Stopped".to_string(),
-        }
-    }
-
-    pub fn is_running(&self) -> bool {
-        matches!(self, PusherStatus::Running)
-    }
-
-    pub fn is_paused(&self) -> bool {
-        matches!(self, PusherStatus::Paused)
-    }
-
-    pub fn is_terminated(&self) -> bool {
-        matches!(self, PusherStatus::Stopped | PusherStatus::Error(_))
-    }
-}
-
-pub trait StreamPusher: Send + Sync {
-    fn id(&self) -> &PusherId;
-    fn stream_id(&self) -> &str;
-    fn protocol(&self) -> StreamProtocol;
-    fn remote_url(&self) -> &str;
-    fn status(&self) -> PusherStatus;
-
-    async fn start(&mut self) -> Result<()>;
-    async fn pause(&mut self) -> Result<()>;
-    async fn resume(&mut self) -> Result<()>;
-    async fn stop(&mut self) -> Result<()>;
-}
+pub type PullerId = String;
 
 pub struct PusherInfo {
     pub id: PusherId,
     pub stream_id: String,
     pub protocol: StreamProtocol,
     pub remote_url: String,
-    pub status: PusherStatus,
+    pub status: TransportStatus,
+}
+
+pub struct PullerInfo {
+    pub id: PullerId,
+    pub stream_id: String,
+    pub protocol: StreamProtocol,
+    pub remote_url: String,
+    pub status: TransportStatus,
 }
 
 pub struct PusherConfig {
@@ -90,22 +40,48 @@ impl PusherConfig {
     }
 }
 
+pub struct PullerConfig {
+    pub stream_id: String,
+    pub remote_url: String,
+    pub protocol: StreamProtocol,
+}
+
+impl PullerConfig {
+    pub fn new(stream_id: &str, remote_url: &str, protocol: StreamProtocol) -> Self {
+        Self {
+            stream_id: stream_id.to_string(),
+            remote_url: remote_url.to_string(),
+            protocol,
+        }
+    }
+}
+
 pub struct PusherState {
     pub id: PusherId,
     pub stream_id: String,
     pub protocol: StreamProtocol,
     pub remote_url: String,
-    pub status: RwLock<PusherStatus>,
+    pub status: RwLock<TransportStatus>,
 }
 
-pub struct PusherManager {
+pub struct PullerState {
+    pub id: PullerId,
+    pub stream_id: String,
+    pub protocol: StreamProtocol,
+    pub remote_url: String,
+    pub status: RwLock<TransportStatus>,
+}
+
+pub struct PushPullManager {
     pushers: RwLock<HashMap<PusherId, Arc<PusherState>>>,
+    pullers: RwLock<HashMap<PullerId, Arc<PullerState>>>,
 }
 
-impl PusherManager {
+impl PushPullManager {
     pub fn new() -> Self {
         Self {
             pushers: RwLock::new(HashMap::new()),
+            pullers: RwLock::new(HashMap::new()),
         }
     }
 
@@ -123,12 +99,12 @@ impl PusherManager {
             stream_id: stream_id.to_string(),
             protocol,
             remote_url: remote_url.to_string(),
-            status: RwLock::new(PusherStatus::Idle),
+            status: RwLock::new(TransportStatus::Idle),
         });
         let mut pushers = self.pushers.write().await;
         pushers.insert(pusher_id, state);
         info!(
-            "[Pusher Manager] Registered pusher: id={}, stream_id={}, protocol={:?}",
+            "[PushPull Manager] Registered pusher: id={}, stream_id={}, protocol={:?}",
             pusher_id_clone, stream_id, protocol_clone
         );
     }
@@ -136,16 +112,16 @@ impl PusherManager {
     pub async fn unregister_pusher(&self, pusher_id: &PusherId) {
         let mut pushers = self.pushers.write().await;
         if pushers.remove(pusher_id).is_some() {
-            info!("[Pusher Manager] Unregistered pusher: id={}", pusher_id);
+            info!("[PushPull Manager] Unregistered pusher: id={}", pusher_id);
         }
     }
 
-    pub async fn update_status(&self, pusher_id: &PusherId, status: PusherStatus) {
+    pub async fn update_pusher_status(&self, pusher_id: &PusherId, status: TransportStatus) {
         let pushers = self.pushers.read().await;
         if let Some(state) = pushers.get(pusher_id) {
             let mut s = state.status.write().await;
             info!(
-                "[Pusher Manager] Pusher {} status changed: {} -> {}",
+                "[PushPull Manager] Pusher {} status changed: {} -> {}",
                 pusher_id,
                 s.as_str(),
                 status.as_str()
@@ -173,6 +149,80 @@ impl PusherManager {
         for state in pushers.values() {
             let status = state.status.read().await.clone();
             result.push(PusherInfo {
+                id: state.id.clone(),
+                stream_id: state.stream_id.clone(),
+                protocol: state.protocol.clone(),
+                remote_url: state.remote_url.clone(),
+                status,
+            });
+        }
+        result
+    }
+
+    pub async fn register_puller(
+        &self,
+        puller_id: PullerId,
+        stream_id: &str,
+        protocol: StreamProtocol,
+        remote_url: &str,
+    ) {
+        let protocol_clone = protocol.clone();
+        let puller_id_clone = puller_id.clone();
+        let state = Arc::new(PullerState {
+            id: puller_id_clone.clone(),
+            stream_id: stream_id.to_string(),
+            protocol,
+            remote_url: remote_url.to_string(),
+            status: RwLock::new(TransportStatus::Idle),
+        });
+        let mut pullers = self.pullers.write().await;
+        pullers.insert(puller_id, state);
+        info!(
+            "[PushPull Manager] Registered puller: id={}, stream_id={}, protocol={:?}",
+            puller_id_clone, stream_id, protocol_clone
+        );
+    }
+
+    pub async fn unregister_puller(&self, puller_id: &PullerId) {
+        let mut pullers = self.pullers.write().await;
+        if pullers.remove(puller_id).is_some() {
+            info!("[PushPull Manager] Unregistered puller: id={}", puller_id);
+        }
+    }
+
+    pub async fn update_puller_status(&self, puller_id: &PullerId, status: TransportStatus) {
+        let pullers = self.pullers.read().await;
+        if let Some(state) = pullers.get(puller_id) {
+            let mut s = state.status.write().await;
+            info!(
+                "[PushPull Manager] Puller {} status changed: {} -> {}",
+                puller_id,
+                s.as_str(),
+                status.as_str()
+            );
+            *s = status;
+        }
+    }
+
+    pub async fn get_puller_info(&self, puller_id: &PullerId) -> Option<PullerInfo> {
+        let pullers = self.pullers.read().await;
+        let state = pullers.get(puller_id)?;
+        let status = state.status.read().await.clone();
+        Some(PullerInfo {
+            id: state.id.clone(),
+            stream_id: state.stream_id.clone(),
+            protocol: state.protocol.clone(),
+            remote_url: state.remote_url.clone(),
+            status,
+        })
+    }
+
+    pub async fn list_pullers(&self) -> Vec<PullerInfo> {
+        let pullers = self.pullers.read().await;
+        let mut result = Vec::new();
+        for state in pullers.values() {
+            let status = state.status.read().await.clone();
+            result.push(PullerInfo {
                 id: state.id.clone(),
                 stream_id: state.stream_id.clone(),
                 protocol: state.protocol.clone(),

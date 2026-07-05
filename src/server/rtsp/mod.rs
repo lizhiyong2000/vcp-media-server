@@ -12,12 +12,12 @@ use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSo
 
 pub mod client_session;
 pub mod common;
+pub mod connection;
 pub mod messages;
 pub mod play_egress;
 mod puller;
 pub mod pusher;
 pub mod server_session;
-pub mod session;
 
 pub use client_session::RtspClientSession;
 pub use common::format_rtsp_message;
@@ -26,11 +26,11 @@ pub use common::{
     parse_transport_server_ports, url_prefers_udp, TransportInfo,
 };
 pub use common::{RtpHeader, RtspCommon, UdpTransport};
+pub use common::{InterleavedChannel, RtspSessionState, TransportMode};
 pub use messages::{RtspRequest, RtspResponse};
 pub use puller::RtspPuller;
 pub use pusher::RtspPusher;
 pub use server_session::RtspServerSession;
-pub use session::{InterleavedChannel, RtspSession, TransportMode};
 
 pub struct RtspServer {
     stream_manager: Arc<StreamManager>,
@@ -79,7 +79,7 @@ impl RtspServer {
     pub async fn process_rtsp_request(
         request: &str,
         manager: &StreamManager,
-        session: &mut RtspSession,
+        session: &mut RtspSessionState,
         peer_addr: std::net::SocketAddr,
         hls_server: Option<Arc<crate::server::hls::HlsServer>>,
         setup_server_ports: Option<(u16, u16)>,

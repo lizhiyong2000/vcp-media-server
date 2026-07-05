@@ -1,16 +1,20 @@
 pub mod amf0;
 pub mod chunk;
+pub mod connection;
 pub mod puller;
+pub mod pusher;
 pub mod session;
 
 pub use puller::RtmpPuller;
+pub use pusher::RtmpPusher;
+pub use connection::{RtmpConnection, RtmpHandshake};
 
 use anyhow::Result;
 use bytes::{Buf, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -20,6 +24,7 @@ use crate::core::{
     MediaFrame, MetricsRegistry, PlaybackProtocol, StreamManager, StreamProtocol, StreamSourceMode,
     StreamStatus, MILLISECOND_CLOCK_RATE,
 };
+use crate::server::socket_transport::SocketReader;
 use crate::server::webrtc::request_publisher_keyframe;
 use chunk::RtmpMessage;
 use session::{RtmpSession, SessionState};
@@ -131,12 +136,12 @@ fn fmt_amf0(val: &amf0::Amf0Value) -> String {
     }
 }
 
-struct RtmpConnection {
+struct RtmpServerConnection {
+    reader: SocketReader<tokio::net::tcp::OwnedReadHalf>,
+    writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     stream_manager: Arc<StreamManager>,
     hls_server: Option<Arc<crate::server::hls::HlsServer>>,
     session: RtmpSession,
-    writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-    chunk_size: usize,
     chunk_states: HashMap<u32, chunk::ChunkAssembler>,
     chunk_message_headers: HashMap<u32, chunk::ChunkHeader>,
     frames_received: usize,
@@ -146,19 +151,20 @@ struct RtmpConnection {
     play_abort: Option<tokio::task::AbortHandle>,
 }
 
-impl RtmpConnection {
+impl RtmpServerConnection {
     fn new(
+        reader: SocketReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
         stream_manager: Arc<StreamManager>,
         hls_server: Option<Arc<crate::server::hls::HlsServer>>,
-        writer: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
         peer_addr: &str,
     ) -> Self {
         Self {
+            reader,
+            writer,
             stream_manager,
             hls_server,
             session: RtmpSession::new(peer_addr),
-            writer,
-            chunk_size: 4096,
             chunk_states: HashMap::new(),
             chunk_message_headers: HashMap::new(),
             frames_received: 0,
@@ -237,13 +243,15 @@ impl RtmpServer {
         hls_server: Option<Arc<crate::server::hls::HlsServer>>,
         peer_addr: std::net::SocketAddr,
     ) -> Result<()> {
-        let (mut reader, writer) = socket.into_split();
+        let (reader, writer) = socket.into_split();
+        let mut reader = SocketReader::new(reader);
         let writer = Arc::new(Mutex::new(writer));
         let mut buf = BytesMut::with_capacity(8192);
-        let mut conn = RtmpConnection::new(
+        let mut conn = RtmpServerConnection::new(
+            reader,
+            writer.clone(),
             manager.clone(),
             hls_server,
-            writer.clone(),
             &peer_addr.to_string(),
         );
         let mut chunk_size: usize = 128;
@@ -254,8 +262,7 @@ impl RtmpServer {
         info!("[RTMP] [{}] Starting connection handling", peer_addr);
 
         loop {
-            let mut read_buf = [0u8; 8192];
-            let len = match reader.read(&mut read_buf).await {
+            let len = match conn.reader.read_into(&mut buf).await {
                 Ok(len) => len,
                 Err(e) => {
                     Self::release_publish_connection(&mut conn);
@@ -276,7 +283,6 @@ impl RtmpServer {
             }
 
             bytes_received += len;
-            buf.extend_from_slice(&read_buf[..len]);
             debug!(
                 "[RTMP] [{}] Read {} bytes, buf_len={}, chunk_size={}",
                 peer_addr,
@@ -303,7 +309,6 @@ impl RtmpServer {
                 }
             }
 
-            // Parse chunks using the chunk module
             let initial_buf_len = buf.len();
             let mut messages_parsed = 0;
             let mut pending_chunk_size = None;
@@ -324,12 +329,9 @@ impl RtmpServer {
                 );
                 if let Some(new_size) = Self::handle_rtmp_message(&mut conn, msg, peer_addr).await?
                 {
-                    // Defer chunk_size update until all messages in this batch are parsed
-                    // because remaining data was encoded with the old chunk_size
                     pending_chunk_size = Some(new_size);
                 }
             }
-            // Apply deferred chunk_size update
             if let Some(new_size) = pending_chunk_size {
                 chunk_size = new_size;
                 info!(
@@ -337,7 +339,6 @@ impl RtmpServer {
                     peer_addr, chunk_size
                 );
             }
-            // Always log buffer state after parsing
             if buf.len() > 0 {
                 let preview_len = std::cmp::min(64, buf.len());
                 let preview: Vec<String> = buf[..preview_len]
@@ -405,7 +406,7 @@ impl RtmpServer {
         Ok(false)
     }
 
-    fn release_publish_connection(conn: &mut RtmpConnection) {
+    fn release_publish_connection(conn: &mut RtmpServerConnection) {
         if !conn.is_publishing {
             return;
         }
@@ -422,7 +423,7 @@ impl RtmpServer {
     }
 
     async fn handle_rtmp_message(
-        conn: &mut RtmpConnection,
+        conn: &mut RtmpServerConnection,
         msg: RtmpMessage,
         peer_addr: std::net::SocketAddr,
     ) -> Result<Option<usize>> {
@@ -740,7 +741,6 @@ impl RtmpServer {
                         | ((msg.payload[1] as usize) << 16)
                         | ((msg.payload[2] as usize) << 8)
                         | msg.payload[3] as usize;
-                    conn.chunk_size = new_size;
                     new_chunk_size = Some(new_size);
                     info!("[RTMP] [{}] <<< SetChunkSize({})", peer_addr, new_size);
                 }
@@ -788,7 +788,7 @@ impl RtmpServer {
     }
 
     async fn handle_amf0_command(
-        conn: &mut RtmpConnection,
+        conn: &mut RtmpServerConnection,
         command: &str,
         args: &[amf0::Amf0Value],
         peer_addr: std::net::SocketAddr,
