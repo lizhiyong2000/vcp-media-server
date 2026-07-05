@@ -909,6 +909,51 @@ mod tests {
     }
 
     #[test]
+    fn webrtc_mime_type_returns_h265_for_chrome_safari_offer() {
+        let chrome_offer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 127\r\na=rtpmap:127 H265/90000\r\na=fmtp:127 profile-level-id=1\r\n";
+        assert_eq!(
+            webrtc_mime_type(CodecType::H265, chrome_offer),
+            MIME_TYPE_H265
+        );
+    }
+
+    #[test]
+    fn webrtc_mime_type_returns_hevc_for_firefox_offer() {
+        let firefox_offer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 126\r\na=rtpmap:126 HEVC/90000\r\na=fmtp:126 profile-level-id=1\r\n";
+        assert_eq!(
+            webrtc_mime_type(CodecType::H265, firefox_offer),
+            MIME_TYPE_HEVC
+        );
+    }
+
+    #[test]
+    fn webrtc_mime_type_returns_h264_for_h264_codec() {
+        let h264_offer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\n";
+        assert_eq!(
+            webrtc_mime_type(CodecType::H264, h264_offer),
+            MIME_TYPE_H264
+        );
+    }
+
+    #[test]
+    fn webrtc_mime_type_prefers_h265_over_hevc_in_offer() {
+        let mixed_offer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 126 127\r\na=rtpmap:126 HEVC/90000\r\na=rtpmap:127 H265/90000\r\n";
+        assert_eq!(
+            webrtc_mime_type(CodecType::H265, mixed_offer),
+            MIME_TYPE_H265
+        );
+    }
+
+    #[test]
+    fn webrtc_mime_type_falls_back_to_hevc_when_no_h265() {
+        let hevc_only_offer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 126\r\na=rtpmap:126 HEVC/90000\r\n";
+        assert_eq!(
+            webrtc_mime_type(CodecType::H265, hevc_only_offer),
+            MIME_TYPE_HEVC
+        );
+    }
+
+    #[test]
     fn h265_prepend_stream_config_includes_vps_sps_pps() {
         let manager = StreamManager::new();
         manager.create_stream("s", StreamSourceMode::Push, StreamProtocol::RTMP, None);

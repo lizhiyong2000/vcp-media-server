@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
+use webrtc::sdp::description::session::SessionDescription;
 
 use crate::core::{CodecType, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track};
 
@@ -720,55 +721,6 @@ impl RtspServer {
             .collect::<Vec<_>>()
             .join(",")
     }
-
-    fn parse_sdp_tracks(sdp: &str) -> Vec<Track> {
-        let mut tracks = Vec::new();
-        let mut track_id = 0;
-
-        for line in sdp.lines() {
-            if line.starts_with("m=") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 {
-                    let media_type = parts[0].strip_prefix("m=").unwrap_or("video");
-                    let payload_type: u8 = parts[3].parse().unwrap_or(96);
-
-                    let codec = if media_type == "video" {
-                        let payload_codec = sdp.lines().find_map(|line| {
-                            let line = line.trim();
-                            if !line.starts_with(&format!("a=rtpmap:{} ", payload_type)) {
-                                return None;
-                            }
-                            line.split_whitespace()
-                                .nth(1)
-                                .and_then(|codec| codec.split('/').next())
-                        });
-                        match payload_codec.map(|codec| codec.to_ascii_lowercase()) {
-                            Some(codec) if codec == "h265" || codec == "hevc" => CodecType::H265,
-                            _ => CodecType::H264,
-                        }
-                    } else if media_type == "audio" {
-                        CodecType::AAC
-                    } else {
-                        CodecType::H264
-                    };
-
-                    let clock_rate = if media_type == "video" { 90000 } else { 44100 };
-
-                    tracks.push(Track {
-                        id: track_id as u8,
-                        codec,
-                        payload_type,
-                        clock_rate,
-                        extra_params: std::collections::HashMap::new(),
-                    });
-
-                    track_id += 1;
-                }
-            }
-        }
-
-        tracks
-    }
 }
 
 fn normalize_announced_tracks_for_publish(tracks: &[Track]) -> Vec<Track> {
@@ -803,14 +755,20 @@ fn normalize_announced_tracks_for_publish(tracks: &[Track]) -> Vec<Track> {
 }
 
 fn parse_hevc_params_from_sdp(sdp: &str) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    for line in sdp.lines() {
-        if !line.starts_with("a=fmtp:") {
-            continue;
-        }
-        let (vps, sps, pps) = crate::core::parse_hevc_sprop_fmtp(line);
-        if let (Some(vps), Some(sps), Some(pps)) = (vps, sps, pps) {
-            if !vps.is_empty() && !sps.is_empty() && !pps.is_empty() {
-                return Some((vps, sps, pps));
+    let result: std::result::Result<SessionDescription, _> = SessionDescription::try_from(sdp.to_string());
+    if let Ok(sdp) = result {
+        for md in &sdp.media_descriptions {
+            for attr in &md.attributes {
+                if attr.key == "fmtp" {
+                    if let Some(value) = &attr.value {
+                        let (vps, sps, pps) = crate::core::parse_hevc_sprop_fmtp(value);
+                        if let (Some(vps), Some(sps), Some(pps)) = (vps, sps, pps) {
+                            if !vps.is_empty() && !sps.is_empty() && !pps.is_empty() {
+                                return Some((vps, sps, pps));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -871,12 +829,15 @@ mod tests {
 
     #[test]
     fn announce_sdp_hevc_alias_is_parsed_as_h265() {
-        let sdp = "v=0\r\n\
-                   m=video 0 RTP/AVP 96\r\n\
-                   a=rtpmap:96 HEVC/90000\r\n\
-                   a=control:trackID=0\r\n\
-                   m=audio 0 RTP/AVP 97\r\n\
-                   a=rtpmap:97 mpeg4-generic/44100/2\r\n";
+        let sdp = "v=0\n\
+                   o=- 0 0 IN IP4 127.0.0.1\n\
+                   s=Test Session\n\
+                   t=0 0\n\
+                   m=video 0 RTP/AVP 96\n\
+                   a=rtpmap:96 HEVC/90000\n\
+                   a=control:trackID=0\n\
+                   m=audio 0 RTP/AVP 97\n\
+                   a=rtpmap:97 mpeg4-generic/44100/2\n";
 
         let (tracks, _, _) = RtspCommon::parse_sdp_with_sps_pps(sdp);
 
@@ -910,10 +871,13 @@ mod tests {
         let pps = vec![0x44, 0x01, 0xc0, 0x73];
         let fmtp = crate::core::hevc_sprop_from_nals(&vps, &sps, &pps);
         let sdp = format!(
-            "v=0\r\n\
-             m=video 0 RTP/AVP 96\r\n\
-             a=rtpmap:96 HEVC/90000\r\n\
-             a=fmtp:96 {}\r\n",
+            "v=0\n\
+             o=- 0 0 IN IP4 127.0.0.1\n\
+             s=Test Session\n\
+             t=0 0\n\
+             m=video 0 RTP/AVP 96\n\
+             a=rtpmap:96 HEVC/90000\n\
+             a=fmtp:96 {}\n",
             fmtp
         );
 

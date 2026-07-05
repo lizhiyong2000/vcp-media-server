@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
+use webrtc::sdp::description::session::SessionDescription;
 
 use super::client_session::RtspClientSession;
 use super::common::RtspCommon;
@@ -103,17 +104,23 @@ impl RtspPuller {
             .iter()
             .any(|track| track.codec == CodecType::H265)
         {
-            for line in sdp.lines() {
-                if line.starts_with("a=fmtp:") {
-                    let (vps, sps, pps) = crate::core::parse_hevc_sprop_fmtp(line);
-                    if sps.is_some() {
-                        self.stream_manager.set_stream_hevc_params(
-                            local_stream_id,
-                            vps.unwrap_or_default(),
-                            sps.unwrap_or_default(),
-                            pps.unwrap_or_default(),
-                        );
-                        break;
+            if let Ok(sdp_parsed) = SessionDescription::try_from(sdp.to_string()) {
+                for md in &sdp_parsed.media_descriptions {
+                    for attr in &md.attributes {
+                        if attr.key == "fmtp" {
+                            if let Some(value) = &attr.value {
+                                let (vps, sps, pps) = crate::core::parse_hevc_sprop_fmtp(value);
+                                if sps.is_some() {
+                                    self.stream_manager.set_stream_hevc_params(
+                                        local_stream_id,
+                                        vps.unwrap_or_default(),
+                                        sps.unwrap_or_default(),
+                                        pps.unwrap_or_default(),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -1,9 +1,12 @@
 use anyhow::Result;
+use base64::Engine;
 use bytes::BytesMut;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
+use webrtc::sdp::description::media::MediaDescription;
+use webrtc::sdp::description::session::SessionDescription;
 
 use super::messages::RtspRequest;
 use crate::core::{CodecType, Track};
@@ -254,249 +257,155 @@ impl RtspCommon {
     }
 
     pub fn parse_sdp_tracks(sdp: &str) -> Vec<Track> {
-        let mut tracks = Vec::new();
-        let lines: Vec<&str> = sdp.lines().collect();
-        let mut i = 0;
+        let result: std::result::Result<SessionDescription, _> = SessionDescription::try_from(sdp.to_string());
+        if let Ok(sdp) = result {
+            let mut tracks = Vec::new();
+            for md in &sdp.media_descriptions {
+                let payload_type = md.media_name.formats.first()
+                    .and_then(|f| f.parse::<u8>().ok())
+                    .unwrap_or(96);
 
-        while i < lines.len() {
-            let line = lines[i];
-            i += 1;
+                let (codec, clock_rate) = Self::extract_codec_from_media_description(md);
 
-            if line.starts_with("m=") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 {
-                    let payload_type: u8 = parts[3].parse().unwrap_or(96);
-
-                    let mut codec = CodecType::H264;
-                    let mut clock_rate = 90000;
-
-                    while i < lines.len() {
-                        let next_line = lines[i];
-
-                        if next_line.starts_with("a=rtpmap:") {
-                            let rtpmap_parts: Vec<&str> = next_line.split_whitespace().collect();
-                            if rtpmap_parts.len() >= 2 {
-                                let codec_info = rtpmap_parts[1];
-                                let codec_parts: Vec<&str> = codec_info.split('/').collect();
-                                if codec_parts.len() >= 2 {
-                                    codec = match codec_parts[0].to_lowercase().as_str() {
-                                        "h264" => CodecType::H264,
-                                        "h265" | "hevc" => CodecType::H265,
-                                        "mpeg4-generic" | "aac" => CodecType::AAC,
-                                        "opus" => CodecType::Opus,
-                                        "pcmu" => CodecType::G711,
-                                        _ => CodecType::H264,
-                                    };
-                                    clock_rate = codec_parts[1].parse().unwrap_or(90000);
-                                }
-                            }
-                            i += 1;
-                        } else if next_line.starts_with("m=") || next_line.starts_with("s=") {
-                            break;
-                        } else {
-                            i += 1;
-                        }
-                    }
-
-                    let track_id = tracks.len() as u8;
-                    tracks.push(Track {
-                        id: track_id,
-                        codec,
-                        payload_type,
-                        clock_rate,
-                        extra_params: std::collections::HashMap::new(),
-                    });
-                }
+                let track_id = tracks.len() as u8;
+                tracks.push(Track {
+                    id: track_id,
+                    codec,
+                    payload_type,
+                    clock_rate,
+                    extra_params: std::collections::HashMap::new(),
+                });
             }
+            tracks
+        } else {
+            Vec::new()
         }
-
-        tracks
     }
 
-    // Parse SDP and extract SPS/PPS from fmtp line
-    pub fn parse_sdp_with_sps_pps(sdp: &str) -> (Vec<Track>, Option<Vec<u8>>, Option<Vec<u8>>) {
-        let mut tracks = Vec::new();
-        let mut sps: Option<Vec<u8>> = None;
-        let mut pps: Option<Vec<u8>> = None;
-        let lines: Vec<&str> = sdp.lines().collect();
-        let mut i = 0;
-
-        debug!(
-            "[RTSP Common] parse_sdp_with_sps_pps called, {} lines total",
-            lines.len()
-        );
-
-        while i < lines.len() {
-            let line = lines[i];
-            debug!("[RTSP Common] Line {}: '{}'", i, line);
-
-            // Extract SPS/PPS from a=fmtp line
-            if line.starts_with("a=fmtp:") {
-                debug!("[RTSP Common] Found fmtp line: {}", line);
-                let fmtp_parts: Vec<&str> = line.split_whitespace().collect();
-                debug!("[RTSP Common] fmtp_parts count: {}", fmtp_parts.len());
-                for (idx, part) in fmtp_parts.iter().enumerate() {
-                    debug!("[RTSP Common] fmtp_part[{}] = '{}'", idx, part);
-                    if part.starts_with("sprop-parameter-sets=") {
-                        let params = part.strip_prefix("sprop-parameter-sets=").unwrap_or("");
-                        debug!("[RTSP Common] params after strip: '{}'", params);
-                        // Remove trailing semicolon if present
-                        let params = params.trim_end_matches(';');
-                        debug!("[RTSP Common] params after trim: '{}'", params);
-                        // SPS and PPS are comma-separated
-                        let param_parts: Vec<&str> = params.split(',').collect();
-                        debug!(
-                            "[RTSP Common] Found sprop-parameter-sets: {} parts",
-                            param_parts.len()
-                        );
-
-                        for (idx, param) in param_parts.iter().enumerate() {
-                            debug!(
-                                "[RTSP Common] param[{}] = '{}', is_empty={}",
-                                idx,
-                                param,
-                                param.is_empty()
-                            );
-                            if !param.is_empty() {
-                                use base64::Engine;
-                                match base64::engine::general_purpose::STANDARD.decode(param) {
-                                    Ok(decoded) => {
-                                        if decoded.len() >= 2 {
-                                            let nal_type = decoded[0] & 0x1F;
-                                            debug!("[RTSP Common] Decoded parameter set {}: length={} bytes, nal_type={}", 
-                                                   idx, decoded.len(), nal_type);
-                                            if nal_type == 7 && sps.is_none() {
-                                                info!(
-                                                    "[RTSP Common] Found SPS in SDP: {} bytes",
-                                                    decoded.len()
-                                                );
-                                                debug!(
-                                                    "[RTSP Common] SPS first 16 bytes: {:02X?}",
-                                                    &decoded[..std::cmp::min(16, decoded.len())]
-                                                );
-                                                sps = Some(decoded);
-                                            } else if nal_type == 8 && pps.is_none() {
-                                                info!(
-                                                    "[RTSP Common] Found PPS in SDP: {} bytes",
-                                                    decoded.len()
-                                                );
-                                                debug!(
-                                                    "[RTSP Common] PPS first 16 bytes: {:02X?}",
-                                                    &decoded[..std::cmp::min(16, decoded.len())]
-                                                );
-                                                pps = Some(decoded);
-                                            }
-                                        } else {
-                                            warn!("[RTSP Common] Decoded parameter set too short: {} bytes", decoded.len());
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("[RTSP Common] Failed to decode base64 parameter: {}, error: {}", param, e);
-                                    }
-                                }
-                            }
+    fn extract_codec_from_media_description(md: &MediaDescription) -> (CodecType, u32) {
+        for attr in &md.attributes {
+            if attr.key == "rtpmap" {
+                if let Some(value) = &attr.value {
+                    let parts: Vec<&str> = value.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let codec_info = parts[1];
+                        let codec_parts: Vec<&str> = codec_info.split('/').collect();
+                        if codec_parts.len() >= 2 {
+                            let codec = match codec_parts[0].to_lowercase().as_str() {
+                                "h264" => CodecType::H264,
+                                "h265" | "hevc" => CodecType::H265,
+                                "mpeg4-generic" | "aac" => CodecType::AAC,
+                                "opus" => CodecType::Opus,
+                                "pcmu" => CodecType::G711,
+                                _ => CodecType::H264,
+                            };
+                            let clock_rate = codec_parts[1].parse().unwrap_or(90000);
+                            return (codec, clock_rate);
                         }
                     }
                 }
-                i += 1;
-                continue;
             }
-
-            if line.starts_with("m=") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 {
-                    let payload_type: u8 = parts[3].parse().unwrap_or(96);
-                    let mut codec = CodecType::H264;
-                    let mut clock_rate = 90000;
-
-                    i += 1;
-                    while i < lines.len() {
-                        let next_line = lines[i];
-
-                        if next_line.starts_with("a=rtpmap:") {
-                            let rtpmap_parts: Vec<&str> = next_line.split_whitespace().collect();
-                            if rtpmap_parts.len() >= 2 {
-                                let codec_info = rtpmap_parts[1];
-                                let codec_parts: Vec<&str> = codec_info.split('/').collect();
-                                if codec_parts.len() >= 2 {
-                                    codec = match codec_parts[0].to_lowercase().as_str() {
-                                        "h264" => CodecType::H264,
-                                        "h265" | "hevc" => CodecType::H265,
-                                        "mpeg4-generic" | "aac" => CodecType::AAC,
-                                        "opus" => CodecType::Opus,
-                                        "pcmu" => CodecType::G711,
-                                        _ => CodecType::H264,
-                                    };
-                                    clock_rate = codec_parts[1].parse().unwrap_or(90000);
-                                }
-                            }
-                            i += 1;
-                        } else if next_line.starts_with("a=fmtp:") && sps.is_none() {
-                            // Extract SPS/PPS from fmtp line for H264
-                            debug!(
-                                "[RTSP Common] Found fmtp line inside m= loop: {}",
-                                next_line
-                            );
-                            let fmtp_parts: Vec<&str> = next_line.split_whitespace().collect();
-                            for part in fmtp_parts {
-                                if part.starts_with("sprop-parameter-sets=") {
-                                    let params =
-                                        part.strip_prefix("sprop-parameter-sets=").unwrap_or("");
-                                    let params = params.trim_end_matches(';');
-                                    let param_parts: Vec<&str> = params.split(',').collect();
-                                    debug!("[RTSP Common] Found sprop-parameter-sets inside m= loop: {} parts", param_parts.len());
-
-                                    for (idx, param) in param_parts.iter().enumerate() {
-                                        debug!("[RTSP Common] param[{}] = '{}'", idx, param);
-                                        if !param.is_empty() {
-                                            use base64::Engine;
-                                            match base64::engine::general_purpose::STANDARD
-                                                .decode(param)
-                                            {
-                                                Ok(decoded) => {
-                                                    if decoded.len() >= 2 {
-                                                        let nal_type = decoded[0] & 0x1F;
-                                                        debug!("[RTSP Common] Decoded parameter set {}: length={} bytes, nal_type={}", 
-                                                               idx, decoded.len(), nal_type);
-                                                        if nal_type == 7 && sps.is_none() {
-                                                            info!("[RTSP Common] Found SPS in SDP: {} bytes", decoded.len());
-                                                            sps = Some(decoded);
-                                                        } else if nal_type == 8 && pps.is_none() {
-                                                            info!("[RTSP Common] Found PPS in SDP: {} bytes", decoded.len());
-                                                            pps = Some(decoded);
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!("[RTSP Common] Failed to decode base64 parameter: {}, error: {}", param, e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            i += 1;
-                        } else if next_line.starts_with("m=") || next_line.starts_with("s=") {
-                            break;
-                        } else {
-                            i += 1;
-                        }
-                    }
-
-                    tracks.push(Track {
-                        id: (tracks.len()) as u8,
-                        codec,
-                        payload_type,
-                        clock_rate,
-                        extra_params: std::collections::HashMap::new(),
-                    });
-                    continue;
-                }
-            }
-            i += 1;
         }
 
-        (tracks, sps, pps)
+        let media_type = md.media_name.media.as_str();
+        if media_type == "video" {
+            (CodecType::H264, 90000)
+        } else {
+            (CodecType::AAC, 44100)
+        }
+    }
+
+    pub fn parse_sdp_with_sps_pps(sdp: &str) -> (Vec<Track>, Option<Vec<u8>>, Option<Vec<u8>>) {
+        let result: std::result::Result<SessionDescription, _> = SessionDescription::try_from(sdp.to_string());
+        if let Ok(sdp) = result {
+            let mut tracks = Vec::new();
+            let mut sps: Option<Vec<u8>> = None;
+            let mut pps: Option<Vec<u8>> = None;
+
+            debug!(
+                "[RTSP Common] parse_sdp_with_sps_pps called, {} media descriptions",
+                sdp.media_descriptions.len()
+            );
+
+            for md in &sdp.media_descriptions {
+                let payload_type = md.media_name.formats.first()
+                    .and_then(|f| f.parse::<u8>().ok())
+                    .unwrap_or(96);
+
+                let (codec, clock_rate) = Self::extract_codec_from_media_description(md);
+
+                if sps.is_none() || pps.is_none() {
+                    Self::extract_sps_pps_from_fmtp(md, &mut sps, &mut pps);
+                }
+
+                tracks.push(Track {
+                    id: tracks.len() as u8,
+                    codec,
+                    payload_type,
+                    clock_rate,
+                    extra_params: std::collections::HashMap::new(),
+                });
+            }
+
+            (tracks, sps, pps)
+        } else {
+            (Vec::new(), None, None)
+        }
+    }
+
+    fn extract_sps_pps_from_fmtp(md: &MediaDescription, sps: &mut Option<Vec<u8>>, pps: &mut Option<Vec<u8>>) {
+        for attr in &md.attributes {
+            if attr.key == "fmtp" {
+                if let Some(value) = &attr.value {
+                    debug!("[RTSP Common] Found fmtp line: {}", value);
+                    let fmtp_content = value.split_whitespace().last().unwrap_or(value);
+                    for part in fmtp_content.split(';') {
+                        if let Some(params) = part.strip_prefix("sprop-parameter-sets=") {
+                            debug!("[RTSP Common] Found sprop-parameter-sets: {}", params);
+                            for (idx, param) in params.split(',').enumerate() {
+                                if !param.is_empty() {
+                                    match base64::engine::general_purpose::STANDARD.decode(param) {
+                                        Ok(decoded) => {
+                                            if decoded.len() >= 2 {
+                                                let nal_type = decoded[0] & 0x1F;
+                                                debug!("[RTSP Common] Decoded parameter set {}: length={} bytes, nal_type={}", 
+                                                       idx, decoded.len(), nal_type);
+                                                if nal_type == 7 && sps.is_none() {
+                                                    info!(
+                                                        "[RTSP Common] Found SPS in SDP: {} bytes",
+                                                        decoded.len()
+                                                    );
+                                                    debug!(
+                                                        "[RTSP Common] SPS first 16 bytes: {:02X?}",
+                                                        &decoded[..std::cmp::min(16, decoded.len())]
+                                                    );
+                                                    *sps = Some(decoded);
+                                                } else if nal_type == 8 && pps.is_none() {
+                                                    info!(
+                                                        "[RTSP Common] Found PPS in SDP: {} bytes",
+                                                        decoded.len()
+                                                    );
+                                                    debug!(
+                                                        "[RTSP Common] PPS first 16 bytes: {:02X?}",
+                                                        &decoded[..std::cmp::min(16, decoded.len())]
+                                                    );
+                                                    *pps = Some(decoded);
+                                                }
+                                            } else {
+                                                warn!("[RTSP Common] Decoded parameter set too short: {} bytes", decoded.len());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("[RTSP Common] Failed to decode base64 parameter: {}, error: {}", param, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn build_sdp(tracks: &[Track]) -> String {

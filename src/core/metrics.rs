@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use super::StreamManager;
 
-static GLOBAL: OnceLock<Arc<MetricsRegistry>> = OnceLock::new();
+static GLOBAL: parking_lot::Mutex<Option<Arc<MetricsRegistry>>> = parking_lot::const_mutex(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -186,11 +186,11 @@ impl MetricsRegistry {
     }
 
     pub fn install_global(registry: Arc<Self>) {
-        let _ = GLOBAL.set(registry);
+        *GLOBAL.lock() = Some(registry);
     }
 
     pub fn global() -> Option<Arc<Self>> {
-        GLOBAL.get().cloned()
+        GLOBAL.lock().clone()
     }
 
     fn stream(&self, stream_id: &str) -> Arc<StreamMetrics> {
