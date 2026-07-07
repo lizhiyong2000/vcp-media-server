@@ -169,6 +169,8 @@ pub enum StreamProtocol {
     RTMP,
     WebRTC,
     HTTP,
+    HLS,
+    HTTP_FLV,
     Unknown,
 }
 

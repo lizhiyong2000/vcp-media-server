@@ -77,6 +77,15 @@ impl StreamManager {
     }
 
     pub fn set_stream_sps_pps(&self, stream_id: &str, sps: Vec<u8>, pps: Vec<u8>) {
+        if sps.is_empty() || pps.is_empty() {
+            warn!(
+                "[Core] Ignoring empty SPS/PPS for stream {} (sps={} pps={})",
+                stream_id,
+                sps.len(),
+                pps.len()
+            );
+            return;
+        }
         if let Some(hub) = self.get_hub(stream_id) {
             hub.update_stream(|stream| {
                 if stream.sps.is_none() {

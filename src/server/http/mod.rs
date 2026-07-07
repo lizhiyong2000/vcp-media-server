@@ -77,6 +77,8 @@ impl HttpServer {
         info!("[HTTP]   POST /api/rtsp/pull      - RTSP pull from remote URL");
         info!("[HTTP]   POST /api/rtsp/push      - RTSP push to remote URL");
         info!("[HTTP]   POST /api/rtmp/pull      - RTMP pull from remote URL");
+        info!("[HTTP]   POST /api/pull/hls       - HLS pull from remote URL");
+        info!("[HTTP]   POST /api/pull/flv       - HTTP-FLV pull from remote URL");
         info!("[HTTP]   GET  /api/metrics         - Operational metrics (all streams)");
         info!("[HTTP]   GET  /api/metrics/<id>    - Per-stream metrics");
         if self.recorder.is_some() {
@@ -875,6 +877,12 @@ impl HttpServer {
                 .to_string();
                 Ok(Self::http_response(200, "OK", &body))
             }
+            ("POST", "/api/pull/hls") => {
+                Self::handle_pull_request(request, &manager, StreamProtocol::HLS, "HLS")
+            }
+            ("POST", "/api/pull/flv") => {
+                Self::handle_pull_request(request, &manager, StreamProtocol::HTTP_FLV, "HTTP-FLV")
+            }
             ("POST", "/api/rtsp/push") => {
                 let body_start = request
                     .find("\r\n\r\n")
@@ -1419,6 +1427,14 @@ impl HttpServer {
                     json!("Start RTMP pull from remote URL"),
                 );
                 endpoints.insert(
+                    "POST /api/pull/hls".to_string(),
+                    json!("Start HLS pull from remote URL"),
+                );
+                endpoints.insert(
+                    "POST /api/pull/flv".to_string(),
+                    json!("Start HTTP-FLV pull from remote URL"),
+                );
+                endpoints.insert(
                     "POST /api/rtsp/push".to_string(),
                     json!("Start RTSP push to remote URL"),
                 );
@@ -1491,6 +1507,76 @@ impl HttpServer {
             }
             _ => Ok(Self::http_response(404, "Not Found", "")),
         }
+    }
+
+    fn handle_pull_request(
+        request: &str,
+        manager: &Arc<StreamManager>,
+        protocol: StreamProtocol,
+        label: &str,
+    ) -> Result<String> {
+        let body_start = Self::json_body(request);
+        let label_str = label.to_string();
+        let parse_result = serde_json::from_str::<serde_json::Value>(body_start);
+
+        let (remote_url, local_stream_id) = if let Ok(json) = &parse_result {
+            let url = json.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let stream_id = json
+                .get("stream_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pulled_stream");
+            (url.to_string(), stream_id.to_string())
+        } else {
+            return Ok(Self::http_response(
+                400,
+                "Bad Request",
+                "{\"error\":\"Invalid JSON body\"}",
+            ));
+        };
+
+        if remote_url.is_empty() {
+            return Ok(Self::http_response(
+                400,
+                "Bad Request",
+                "{\"error\":\"Missing 'url' parameter\"}",
+            ));
+        }
+
+        info!(
+            "[HTTP] Starting {} pull from {} to stream {}",
+            label_str, remote_url, local_stream_id
+        );
+
+        let manager_clone = manager.clone();
+        let remote_url_clone = remote_url.clone();
+        let local_stream_id_clone = local_stream_id.clone();
+        let proto = protocol.clone();
+        let lbl = label_str.clone();
+
+        tokio::spawn(async move {
+            let config = TransportConfig::new(
+                manager_clone,
+                proto,
+                &local_stream_id_clone,
+            )
+            .with_remote_url(&remote_url_clone);
+            let mut puller = TransportAdapterFactory::create_puller(config);
+            if let Err(e) = puller.start().await {
+                error!("[{} Puller] Failed to start: {}", lbl, e);
+                return;
+            }
+            if let Err(e) = puller.pull().await {
+                error!("[{} Puller] Failed to pull stream: {}", lbl, e);
+            }
+        });
+
+        let body = json!({
+            "stream_id": local_stream_id,
+            "remote_url": remote_url,
+            "message": format!("{} pull started", label)
+        })
+        .to_string();
+        Ok(Self::http_response(200, "OK", &body))
     }
 
     fn http_response(code: u32, reason: &str, body: &str) -> String {

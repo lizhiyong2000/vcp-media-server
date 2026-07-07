@@ -1,8 +1,10 @@
 /// HLS (HTTP Live Streaming) module
 /// Subscribes to streams and generates HLS segments (MPEG-TS) with M3U8 playlists.
 pub mod m3u8;
+pub mod puller;
 pub mod timing;
 pub mod ts_muxer;
+pub mod ts_parser;
 
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -875,8 +877,23 @@ impl HlsServer {
     pub fn get_segment_path(&self, stream_id: &str, filename: &str) -> Option<PathBuf> {
         self.touch(stream_id);
         let sessions = self.sessions.read();
+        let has_session = sessions.contains_key(stream_id);
+        info!(
+            "[HLS] get_segment_path: stream_id={} filename={} has_session={} session_count={}",
+            stream_id,
+            filename,
+            has_session,
+            sessions.len()
+        );
         if let Some(s) = sessions.get(stream_id) {
-            let path = s.read().output_dir().join(filename);
+            let output_dir = s.read().output_dir.clone();
+            let path = output_dir.join(filename);
+            info!(
+                "[HLS] get_segment_path: session output_dir={} full_path={} exists={}",
+                output_dir.display(),
+                path.display(),
+                path.exists()
+            );
             if path.exists() {
                 return Some(path);
             }
@@ -884,6 +901,12 @@ impl HlsServer {
         let path = PathBuf::from(&self.config.output_dir)
             .join(stream_id)
             .join(filename);
+        info!(
+            "[HLS] get_segment_path: fallback config_dir={} full_path={} exists={}",
+            self.config.output_dir,
+            path.display(),
+            path.exists()
+        );
         if path.exists() {
             Some(path)
         } else {
