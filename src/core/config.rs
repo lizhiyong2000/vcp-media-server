@@ -98,6 +98,7 @@ pub struct SnapshotConfig {
     pub output_dir: Option<String>,
     pub ffmpeg_path: Option<String>,
     pub wait_keyframe_ms: Option<u64>,
+    pub ffmpeg_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -223,6 +224,7 @@ impl Default for Config {
                 output_dir: Some(DEFAULT_SNAPSHOT_OUTPUT_DIR.to_string()),
                 ffmpeg_path: Some("ffmpeg".to_string()),
                 wait_keyframe_ms: Some(1_000),
+                ffmpeg_timeout_secs: Some(10),
             }),
             transcode: Some(TranscodeConfig {
                 enabled: false,

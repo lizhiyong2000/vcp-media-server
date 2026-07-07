@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use time::{OffsetDateTime, UtcOffset};
-use tokio::process::Command;
-use tokio::time::{sleep, Instant};
+use time::OffsetDateTime;
+use tokio::sync::Semaphore;
+use tokio::time::{timeout, Instant};
 use tracing::{error, info, warn};
 
 use crate::core::live_play::{is_idr_frame, is_playable_video_frame};
@@ -17,7 +17,11 @@ use crate::core::{
 };
 use crate::server::webrtc::request_publisher_keyframe;
 
-const DEFAULT_WAIT_KEYFRAME_MS: u64 = 1_000;
+const DEFAULT_WAIT_KEYFRAME_MS: u64 = 5_000;
+const DEFAULT_FFMPEG_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_CAPTURE_JOB_TIMEOUT_SECS: u64 = 30;
+const MAX_CONCURRENT_FFMPEG: usize = 2;
+const SNAPSHOT_RING_LOOKBACK: u64 = 600;
 
 #[derive(Debug, Clone)]
 pub struct SnapshotConfig {
@@ -25,6 +29,7 @@ pub struct SnapshotConfig {
     pub base_dir: PathBuf,
     pub ffmpeg_path: String,
     pub wait_keyframe: Duration,
+    pub ffmpeg_timeout: Duration,
 }
 
 impl Default for SnapshotConfig {
@@ -34,6 +39,7 @@ impl Default for SnapshotConfig {
             base_dir: PathBuf::from(DEFAULT_SNAPSHOT_DIR),
             ffmpeg_path: "ffmpeg".to_string(),
             wait_keyframe: Duration::from_millis(DEFAULT_WAIT_KEYFRAME_MS),
+            ffmpeg_timeout: Duration::from_secs(DEFAULT_FFMPEG_TIMEOUT_SECS),
         }
     }
 }
@@ -63,6 +69,7 @@ pub struct SnapshotManager {
     stream_manager: Arc<StreamManager>,
     config: SnapshotConfig,
     index: Arc<RwLock<Vec<SnapshotEntry>>>,
+    ffmpeg_slots: Arc<Semaphore>,
 }
 
 impl SnapshotManager {
@@ -71,6 +78,7 @@ impl SnapshotManager {
             stream_manager,
             config,
             index: Arc::new(RwLock::new(Vec::new())),
+            ffmpeg_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_FFMPEG)),
         }
     }
 
@@ -131,6 +139,17 @@ impl SnapshotManager {
     }
 
     async fn capture_job(&self, id: String, req: CaptureSnapshotRequest) -> Result<()> {
+        let job_timeout = Duration::from_secs(DEFAULT_CAPTURE_JOB_TIMEOUT_SECS);
+        match timeout(job_timeout, self.capture_job_inner(id.clone(), req)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "snapshot job timed out after {}s",
+                job_timeout.as_secs()
+            )),
+        }
+    }
+
+    async fn capture_job_inner(&self, id: String, req: CaptureSnapshotRequest) -> Result<()> {
         self.update_status(&id, "running");
         let frame = self.wait_latest_idr(&req.stream_id).await?;
         if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
@@ -155,28 +174,30 @@ impl SnapshotManager {
             .await
             .with_context(|| format!("write {}", raw_path.display()))?;
 
-        let output = Command::new(&self.config.ffmpeg_path)
-            .arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-y")
-            .arg("-f")
-            .arg(input_format)
-            .arg("-i")
-            .arg(&raw_path)
-            .arg("-frames:v")
-            .arg("1")
-            .arg("-q:v")
-            .arg("2")
-            .arg(&image_path)
-            .output()
+        let _permit = self
+            .ffmpeg_slots
+            .acquire()
             .await
-            .with_context(|| format!("run {}", self.config.ffmpeg_path))?;
+            .map_err(|_| anyhow!("snapshot ffmpeg pool closed"))?;
+
+        let ffmpeg_path = self.config.ffmpeg_path.clone();
+        let ffmpeg_timeout = self.config.ffmpeg_timeout;
+        let raw_for_ffmpeg = raw_path.clone();
+        let image_for_ffmpeg = image_path.clone();
+        let input_format_owned = input_format.to_string();
+        tokio::task::spawn_blocking(move || {
+            run_ffmpeg_snapshot_blocking(
+                ffmpeg_path,
+                input_format_owned,
+                raw_for_ffmpeg,
+                image_for_ffmpeg,
+                ffmpeg_timeout,
+            )
+        })
+        .await
+        .context("ffmpeg worker join failed")??;
+
         let _ = tokio::fs::remove_file(&raw_path).await;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("ffmpeg snapshot failed: {}", stderr.trim()));
-        }
 
         let bytes = tokio::fs::metadata(&image_path)
             .await
@@ -195,42 +216,64 @@ impl SnapshotManager {
     }
 
     async fn wait_latest_idr(&self, stream_id: &str) -> Result<MediaFrame> {
-        if let Some(frame) = self.latest_snapshot_frame(stream_id) {
+        if let Some(frame) = self.find_snapshot_frame(stream_id) {
             return Ok(frame);
         }
+
+        let Some(hub) = self.stream_manager.get_hub(stream_id) else {
+            return Err(anyhow!("stream hub not found"));
+        };
+        let mut notify = hub.subscribe_notify();
+        let _baseline = *notify.borrow();
 
         let requested = request_publisher_keyframe(stream_id);
         info!(
             "[Snapshot] waiting fresh IDR stream='{}' requested_keyframe={}",
             stream_id, requested
         );
+
         let deadline = Instant::now() + self.config.wait_keyframe;
         while Instant::now() < deadline {
-            if let Some(frame) = self.latest_snapshot_frame(stream_id) {
+            if let Some(frame) = self.find_snapshot_frame(stream_id) {
                 return Ok(frame);
             }
-            sleep(Duration::from_millis(50)).await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let wait_for = remaining.min(Duration::from_millis(200));
+            let _ = timeout(wait_for, notify.changed()).await;
+        }
+
+        if let Some(frame) = self.find_snapshot_frame(stream_id) {
+            return Ok(frame);
         }
         Err(anyhow!("no playable H264/H265 keyframe available"))
     }
 
-    fn latest_snapshot_frame(&self, stream_id: &str) -> Option<MediaFrame> {
+    fn find_snapshot_frame(&self, stream_id: &str) -> Option<MediaFrame> {
         let hub = self.stream_manager.get_hub(stream_id)?;
-        let frame = hub.latest_idr_frame()?;
-        if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
-            warn!(
-                "[Snapshot] unsupported codec stream='{}' codec={:?}",
-                stream_id, frame.codec
-            );
+        if let Some(frame) = hub.latest_idr_frame() {
+            if Self::is_snapshot_candidate(&frame) {
+                return Some(frame);
+            }
+        }
+
+        let latest = hub.latest_seq();
+        if hub.is_empty() {
             return None;
         }
-        if is_playable_video_frame(&frame) && is_idr_frame(&frame) {
-            Some(frame)
-        } else {
-            None
-        }
+        let oldest = hub.oldest_seq().unwrap_or(0);
+        let from = latest.saturating_sub(SNAPSHOT_RING_LOOKBACK).max(oldest);
+        hub.frames_from(from, latest)
+            .into_iter()
+            .rev()
+            .find(|frame| Self::is_snapshot_candidate(frame) && is_idr_frame(frame))
     }
 
+    fn is_snapshot_candidate(frame: &MediaFrame) -> bool {
+        is_playable_video_frame(frame) && !frame.data.is_empty()
+    }
     fn upsert(&self, entry: SnapshotEntry) {
         let mut index = self.index.write();
         if let Some(existing) = index.iter_mut().find(|existing| existing.id == entry.id) {
@@ -263,8 +306,64 @@ impl SnapshotManager {
         let mut index = self.index.write();
         if let Some(entry) = index.iter_mut().find(|entry| entry.id == id) {
             entry.completed_at_ms = Some(now_ms());
-            entry.status = "failed".to_string();
+            entry.status = "error".to_string();
             entry.error = Some(error);
+        }
+    }
+}
+
+fn run_ffmpeg_snapshot_blocking(
+    ffmpeg_path: String,
+    input_format: String,
+    raw_path: PathBuf,
+    image_path: PathBuf,
+    timeout_budget: Duration,
+) -> Result<()> {
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Instant as StdInstant;
+
+    let mut child = Command::new(&ffmpeg_path)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-f")
+        .arg(&input_format)
+        .arg("-i")
+        .arg(&raw_path)
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-q:v")
+        .arg("2")
+        .arg("-strict")
+        .arg("-2")
+        .arg(&image_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn {ffmpeg_path}"))?;
+
+    let started = StdInstant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(anyhow!("ffmpeg snapshot failed: exit {status}"));
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout_budget {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!(
+                        "ffmpeg snapshot timed out after {}s",
+                        timeout_budget.as_secs()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(anyhow!("ffmpeg wait error: {e}")),
         }
     }
 }
@@ -340,14 +439,12 @@ fn now_ms() -> u64 {
 }
 
 fn date_dir_yyyymmdd(timestamp_ms: u64) -> String {
-    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-    date_dir_yyyymmdd_with_offset(timestamp_ms, offset)
+    date_dir_yyyymmdd_utc(timestamp_ms)
 }
 
-fn date_dir_yyyymmdd_with_offset(timestamp_ms: u64, offset: UtcOffset) -> String {
+fn date_dir_yyyymmdd_utc(timestamp_ms: u64) -> String {
     let dt = OffsetDateTime::from_unix_timestamp((timestamp_ms / 1_000) as i64)
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        .to_offset(offset);
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
     format!("{:04}{:02}{:02}", dt.year(), dt.month() as u8, dt.day())
 }
 
@@ -363,11 +460,8 @@ mod tests {
 
     #[test]
     fn date_dir_uses_yyyymmdd_not_epoch_day() {
-        assert_eq!(date_dir_yyyymmdd_with_offset(0, UtcOffset::UTC), "19700101");
-        assert_eq!(
-            date_dir_yyyymmdd_with_offset(1_782_921_600_000, UtcOffset::from_hms(8, 0, 0).unwrap()),
-            "20260702"
-        );
+        assert_eq!(date_dir_yyyymmdd_utc(0), "19700101");
+        assert_eq!(date_dir_yyyymmdd_utc(1_782_921_600_000), "20260701");
     }
 
     #[test]

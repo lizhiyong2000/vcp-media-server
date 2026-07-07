@@ -22,6 +22,37 @@ use crate::server::http_flv::{
 use crate::server::transport::TransportAdapterFactory;
 use crate::core::TransportConfig;
 use crate::server::rtsp::RtspPusher;
+
+/// Percent-decode a URL path segment.
+/// Handles percent-encoded UTF-8 sequences (e.g. %E4%B8%9C → 东).
+fn url_decode_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_val(bytes[i + 1]);
+            let lo = hex_val(bytes[i + 2]);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
 use crate::server::webrtc::request_publisher_keyframe;
 
 pub struct HttpServer {
@@ -525,10 +556,11 @@ impl HttpServer {
                     socket.flush().await?;
                     return Ok(());
                 };
-                let id = path
-                    .trim_start_matches("/api/snapshots/")
-                    .trim_end_matches(".jpg");
-                if let Some(entry) = snapshot.get(id) {
+                let id = url_decode_path(
+                    path.trim_start_matches("/api/snapshots/")
+                        .trim_end_matches(".jpg"),
+                );
+                if let Some(entry) = snapshot.get(&id) {
                     if entry.status == "completed" {
                         if let Some(path) = entry.path {
                             if let Ok(data) = tokio::fs::read(path).await {
@@ -632,7 +664,7 @@ impl HttpServer {
                 Ok(Self::http_response(200, "OK", &body))
             }
             ("GET", path) if path.starts_with("/api/stream/") => {
-                let stream_id = path.trim_start_matches("/api/stream/");
+                let stream_id = url_decode_path(path.trim_start_matches("/api/stream/"));
                 if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
                     let tracks: Vec<serde_json::Value> = stream
                         .tracks
@@ -677,8 +709,8 @@ impl HttpServer {
                 Ok(Self::http_response(200, "OK", &body))
             }
             ("GET", path) if path.starts_with("/api/metrics/") => {
-                let stream_id = path.trim_start_matches("/api/metrics/");
-                if let Some(snap) = metrics.stream_snapshot(&manager, stream_id) {
+                let stream_id = url_decode_path(path.trim_start_matches("/api/metrics/"));
+                if let Some(snap) = metrics.stream_snapshot(&manager, &stream_id) {
                     Ok(Self::http_response(
                         200,
                         "OK",
@@ -1053,10 +1085,11 @@ impl HttpServer {
                         "{\"error\":\"recording API disabled\"}",
                     ));
                 };
-                let id = path
-                    .trim_start_matches("/api/recordings/")
-                    .trim_end_matches("/playback")
-                    .trim_end_matches('/');
+                let id = url_decode_path(
+                    path.trim_start_matches("/api/recordings/")
+                        .trim_end_matches("/playback")
+                        .trim_end_matches('/'),
+                );
                 let recording = recorder
                     .list_recordings(None)
                     .into_iter()
@@ -1160,11 +1193,12 @@ impl HttpServer {
                         "{\"error\":\"analysis API disabled\"}",
                     ));
                 };
-                let stream_id = path
-                    .trim_start_matches("/api/analysis/")
-                    .trim_end_matches("/metrics")
-                    .trim_end_matches('/');
-                if let Some(metrics) = analysis.metrics(stream_id) {
+                let stream_id = url_decode_path(
+                    path.trim_start_matches("/api/analysis/")
+                        .trim_end_matches("/metrics")
+                        .trim_end_matches('/'),
+                );
+                if let Some(metrics) = analysis.metrics(&stream_id) {
                     Ok(Self::http_response(200, "OK", &json!(metrics).to_string()))
                 } else {
                     Ok(Self::http_response(
@@ -1182,11 +1216,12 @@ impl HttpServer {
                         "{\"error\":\"analysis API disabled\"}",
                     ));
                 };
-                let stream_id = path
-                    .trim_start_matches("/api/analysis/")
-                    .trim_end_matches("/events")
-                    .trim_end_matches('/');
-                let body = json!({"events": analysis.events(stream_id)}).to_string();
+                let stream_id = url_decode_path(
+                    path.trim_start_matches("/api/analysis/")
+                        .trim_end_matches("/events")
+                        .trim_end_matches('/'),
+                );
+                let body = json!({"events": analysis.events(&stream_id)}).to_string();
                 Ok(Self::http_response(200, "OK", &body))
             }
             ("POST", "/api/snapshot") => {
@@ -1240,10 +1275,11 @@ impl HttpServer {
                         "{\"error\":\"snapshot API disabled\"}",
                     ));
                 };
-                let id = path
-                    .trim_start_matches("/api/snapshots/")
-                    .trim_end_matches('/')
-                    .trim_end_matches(".jpg");
+                let id = url_decode_path(
+                    path.trim_start_matches("/api/snapshots/")
+                        .trim_end_matches('/')
+                        .trim_end_matches(".jpg"),
+                );
                 if id.is_empty() {
                     return Ok(Self::http_response(
                         400,
@@ -1251,7 +1287,7 @@ impl HttpServer {
                         "{\"error\":\"missing snapshot id\"}",
                     ));
                 }
-                if let Some(info) = snapshot.get(id) {
+                if let Some(info) = snapshot.get(&id) {
                     Ok(Self::http_response(
                         200,
                         "OK",
@@ -1341,9 +1377,9 @@ impl HttpServer {
                 Ok(Self::http_response(200, "OK", &body))
             }
             ("DELETE", path) if path.starts_with("/api/stream/") => {
-                let stream_id = path.trim_start_matches("/api/stream/");
+                let stream_id = url_decode_path(path.trim_start_matches("/api/stream/"));
                 if manager.remove_stream(&stream_id.to_string()).is_some() {
-                    MetricsRegistry::remove_stream(stream_id);
+                    MetricsRegistry::remove_stream(&stream_id);
                     Ok(Self::http_response(200, "OK", ""))
                 } else {
                     Ok(Self::http_response(404, "Not Found", ""))
@@ -1364,7 +1400,7 @@ impl HttpServer {
                 Ok(Self::http_response(200, "OK", &body))
             }
             ("GET", path) if path.starts_with("/api/play-urls/") => {
-                let stream_id = path.trim_start_matches("/api/play-urls/").trim_end_matches('/');
+                let stream_id = url_decode_path(path.trim_start_matches("/api/play-urls/").trim_end_matches('/'));
                 if stream_id.is_empty() {
                     return Ok(Self::http_response(
                         400,

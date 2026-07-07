@@ -304,6 +304,9 @@ async fn main() -> Result<()> {
             wait_keyframe: std::time::Duration::from_millis(
                 c.wait_keyframe_ms.unwrap_or(1_000).max(1),
             ),
+            ffmpeg_timeout: std::time::Duration::from_secs(
+                c.ffmpeg_timeout_secs.unwrap_or(10).max(1),
+            ),
         })
         .unwrap_or_else(|| snapshot::SnapshotConfig {
             base_dir: config.snapshot_output_dir(),

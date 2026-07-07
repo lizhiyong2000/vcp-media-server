@@ -9,8 +9,9 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::core::{
-    default_live_tracks, CodecType, MediaFrame, MediaTransport, StreamManager, StreamProtocol,
-    StreamPuller, StreamSourceMode, TransportStatus, MILLISECOND_CLOCK_RATE,
+    default_live_tracks, ensure_annex_b, is_keyframe_annex_b, CodecType, MediaFrame,
+    MediaTransport, StreamManager, StreamProtocol, StreamPuller, StreamSourceMode,
+    TransportStatus, MILLISECOND_CLOCK_RATE,
 };
 
 use crate::server::http_flv::puller::{parse_m3u8_for_segment, resolve_relative_url};
@@ -387,11 +388,7 @@ async fn process_ts_segment_hls(
             let h265_type = (nal_header & 0x7E) >> 1;
             let codec = actual_codec;
 
-            let is_keyframe = match codec {
-                CodecType::H265 => matches!(h265_type, 19 | 20),
-                CodecType::H264 => h264_type == 5,
-                _ => false,
-            };
+            let is_keyframe = is_keyframe_annex_b(codec, data);
 
             // Store SPS/PPS/VPS (order-independent pairing)
             if !*sps_pps_stored {
