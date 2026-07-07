@@ -24,6 +24,7 @@ pub struct RtspPusher {
     tracks: Option<Vec<Track>>,
     status: RwLock<TransportStatus>,
     paused: Arc<RwLock<bool>>,
+    vps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     sps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     pps_cache: Arc<parking_lot::RwLock<Option<Vec<u8>>>>,
     peer_addr: String,
@@ -40,6 +41,7 @@ impl RtspPusher {
             tracks: None,
             status: RwLock::new(TransportStatus::Idle),
             paused: Arc::new(RwLock::new(false)),
+            vps_cache: Arc::new(parking_lot::RwLock::new(None)),
             sps_cache: Arc::new(parking_lot::RwLock::new(None)),
             pps_cache: Arc::new(parking_lot::RwLock::new(None)),
             peer_addr: String::new(),
@@ -113,7 +115,13 @@ impl RtspPusher {
             return Err(anyhow::anyhow!("OPTIONS failed: {}", response));
         }
 
-        let sdp = RtspClientSession::build_sdp(tracks);
+        let vps = self.stream_manager.get_stream(&self.stream_id)
+            .and_then(|s| s.vps.clone());
+        let sps = self.stream_manager.get_stream(&self.stream_id)
+            .and_then(|s| s.sps.clone());
+        let pps = self.stream_manager.get_stream(&self.stream_id)
+            .and_then(|s| s.pps.clone());
+        let sdp = RtspClientSession::build_sdp(tracks, vps.as_deref(), sps.as_deref(), pps.as_deref());
         info!("[RTSP Pusher] [Step 3/5] Sending ANNOUNCE...");
         let response = session.send_announce(&sdp).await?;
         if !response.starts_with("RTSP/1.0 200 OK") {

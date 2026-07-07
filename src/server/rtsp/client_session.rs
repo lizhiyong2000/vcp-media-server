@@ -451,8 +451,8 @@ impl RtspClientSession {
         RtspCommon::parse_sdp_tracks(sdp)
     }
 
-    pub fn build_sdp(tracks: &[Track]) -> String {
-        RtspCommon::build_sdp(tracks)
+    pub fn build_sdp(tracks: &[Track], vps: Option<&[u8]>, sps: Option<&[u8]>, pps: Option<&[u8]>) -> String {
+        RtspCommon::build_sdp(tracks, vps, sps, pps)
     }
 
     pub fn build_rtp_packet(

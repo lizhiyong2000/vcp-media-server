@@ -17,6 +17,7 @@ pub mod messages;
 pub mod play_egress;
 mod puller;
 pub mod pusher;
+pub mod sdp_builder;
 pub mod server_session;
 
 pub use client_session::RtspClientSession;
@@ -281,16 +282,24 @@ impl RtspServer {
                     format_rtsp_message(body)
                 );
 
-                // Parse SDP and extract tracks, SPS, PPS
-                let (tracks, sps, pps) = RtspCommon::parse_sdp_with_sps_pps(body);
+                // Parse SDP and extract tracks, VPS, SPS, PPS
+                let (tracks, vps, sps, pps) = RtspCommon::parse_sdp_with_sps_pps(body);
                 info!(
-                    "[RTSP] [{}] ANNOUNCE parsed SDP: {} tracks, SPS={}, PPS={}",
+                    "[RTSP] [{}] ANNOUNCE parsed SDP: {} tracks, VPS={}, SPS={}, PPS={}",
                     peer_addr,
                     tracks.len(),
+                    vps.is_some(),
                     sps.is_some(),
                     pps.is_some()
                 );
 
+                if let Some(vps_data) = &vps {
+                    info!(
+                        "[RTSP] [{}] ANNOUNCE VPS: {} bytes",
+                        peer_addr,
+                        vps_data.len()
+                    );
+                }
                 if let Some(sps_data) = &sps {
                     info!(
                         "[RTSP] [{}] ANNOUNCE SPS: {} bytes",
@@ -306,7 +315,8 @@ impl RtspServer {
                     );
                 }
 
-                // Save SPS/PPS to session
+                // Save VPS/SPS/PPS to session
+                session.vps = vps.clone();
                 session.sps = sps.clone();
                 session.pps = pps.clone();
 
@@ -577,113 +587,24 @@ impl RtspServer {
     }
 
     fn build_sdp(stream_id: &str, manager: &StreamManager) -> String {
-        use base64::Engine;
+        let vps = manager.get_stream(&stream_id.to_string())
+            .and_then(|s| s.vps.clone());
+        let sps = manager.get_stream(&stream_id.to_string())
+            .and_then(|s| s.sps.clone());
+        let pps = manager.get_stream(&stream_id.to_string())
+            .and_then(|s| s.pps.clone());
 
-        let mut sdp = format!(
-            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=MediaServer Session: {}\r\nt=0 0\r\n",
-            stream_id
-        );
-
-        // Get VPS/SPS/PPS from stream if available
-        let (vps, sps, pps) = if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
-            (stream.vps.clone(), stream.sps.clone(), stream.pps.clone())
-        } else {
-            (None, None, None)
-        };
-
-        let h265_fmtp = |payload_type: u8| {
-            if let (Some(vps_data), Some(sps_data), Some(pps_data)) = (&vps, &sps, &pps) {
-                format!(
-                    "a=fmtp:{} {}\r\n",
-                    payload_type,
-                    crate::core::hevc_sprop_from_nals(vps_data, sps_data, pps_data)
-                )
-            } else {
-                warn!(
-                    "[RTSP] [{}] Building H265 SDP without VPS/SPS/PPS",
-                    stream_id
-                );
-                format!(
-                    "a=fmtp:{} profile-space=0;profile-id=1;tier-flag=0;level-id=93\r\n",
-                    payload_type
-                )
-            }
-        };
-
-        let h264_fmtp = |payload_type: u8| {
-            if let (Some(sps_data), Some(pps_data)) = (&sps, &pps) {
-                let sps_b64 = base64::engine::general_purpose::STANDARD.encode(sps_data);
-                let pps_b64 = base64::engine::general_purpose::STANDARD.encode(pps_data);
-                let profile_level_id = if sps_data.len() >= 4 {
-                    format!("{:02X}{:02X}{:02X}", sps_data[1], sps_data[2], sps_data[3])
-                } else {
-                    "42E01F".to_string()
-                };
-                info!("[RTSP] [{}] Building SDP with SPS ({} bytes) and PPS ({} bytes), profile-level-id={}", 
-                  stream_id, sps_data.len(), pps_data.len(), profile_level_id);
-                format!(
-                "a=fmtp:{} packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}\r\n",
-                payload_type, profile_level_id, sps_b64, pps_b64
-            )
-            } else {
-                warn!(
-                    "[RTSP] [{}] Building SDP with default SPS/PPS (not yet received)",
-                    stream_id
-                );
-                format!("a=fmtp:{} packetization-mode=1;profile-level-id=42E01F;sprop-parameter-sets=Z0LAHukBQBbsAAADAAQAAAMABAAAAwHNgYI=\r\n", payload_type)
-            }
-        };
-
-        if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
-            let tracks = if stream.tracks.is_empty() {
+        let tracks = if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
+            if stream.tracks.is_empty() {
                 crate::core::default_live_tracks()
             } else {
                 stream.tracks.clone()
-            };
-            for (idx, track) in tracks.iter().enumerate() {
-                let (media_type, codec_name, clock_rate) = match track.codec {
-                    CodecType::H264 => ("video", "H264", 90000),
-                    CodecType::H265 => ("video", "H265", 90000),
-                    CodecType::AAC => ("audio", "mpeg4-generic", 44100),
-                    CodecType::Opus => ("audio", "opus", 48000),
-                    CodecType::G711 => ("audio", "PCMU", 8000),
-                    _ => ("video", "H264", 90000),
-                };
-
-                sdp.push_str(&format!(
-                    "m={} 0 RTP/AVP {}\r\n",
-                    media_type, track.payload_type
-                ));
-                sdp.push_str(&format!("c=IN IP4 0.0.0.0\r\n"));
-                sdp.push_str(&format!(
-                    "a=rtpmap:{} {}/{}\r\n",
-                    track.payload_type, codec_name, clock_rate
-                ));
-                sdp.push_str(&format!("a=control:trackID={}\r\n", idx));
-
-                if track.codec == CodecType::H264 {
-                    sdp.push_str(&h264_fmtp(track.payload_type));
-                } else if track.codec == CodecType::H265 {
-                    sdp.push_str(&h265_fmtp(track.payload_type));
-                } else if track.codec == CodecType::AAC {
-                    sdp.push_str(&format!("a=fmtp:{} profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;\r\n", track.payload_type));
-                }
             }
         } else {
-            sdp.push_str("m=video 0 RTP/AVP 96\r\n");
-            sdp.push_str("c=IN IP4 0.0.0.0\r\n");
-            sdp.push_str("a=rtpmap:96 H264/90000\r\n");
-            sdp.push_str("a=control:trackID=0\r\n");
-            sdp.push_str(&h264_fmtp(96));
+            crate::core::default_live_tracks()
+        };
 
-            sdp.push_str("m=audio 0 RTP/AVP 97\r\n");
-            sdp.push_str("c=IN IP4 0.0.0.0\r\n");
-            sdp.push_str("a=rtpmap:97 mpeg4-generic/44100/2\r\n");
-            sdp.push_str("a=control:trackID=1\r\n");
-            sdp.push_str("a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;\r\n");
-        }
-
-        sdp
+        sdp_builder::build_sdp_for_stream(stream_id, &tracks, vps.as_deref(), sps.as_deref(), pps.as_deref())
     }
 
     fn extract_cseq(request: &str) -> &str {
@@ -839,7 +760,7 @@ mod tests {
                    m=audio 0 RTP/AVP 97\n\
                    a=rtpmap:97 mpeg4-generic/44100/2\n";
 
-        let (tracks, _, _) = RtspCommon::parse_sdp_with_sps_pps(sdp);
+        let (tracks, _, _, _) = RtspCommon::parse_sdp_with_sps_pps(sdp);
 
         assert_eq!(tracks[0].codec, CodecType::H265);
         assert_eq!(tracks[0].payload_type, 96);

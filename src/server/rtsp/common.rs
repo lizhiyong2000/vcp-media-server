@@ -315,10 +315,11 @@ impl RtspCommon {
         }
     }
 
-    pub fn parse_sdp_with_sps_pps(sdp: &str) -> (Vec<Track>, Option<Vec<u8>>, Option<Vec<u8>>) {
+    pub fn parse_sdp_with_sps_pps(sdp: &str) -> (Vec<Track>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
         let result: std::result::Result<SessionDescription, _> = SessionDescription::try_from(sdp.to_string());
         if let Ok(sdp) = result {
             let mut tracks = Vec::new();
+            let mut vps: Option<Vec<u8>> = None;
             let mut sps: Option<Vec<u8>> = None;
             let mut pps: Option<Vec<u8>> = None;
 
@@ -334,8 +335,8 @@ impl RtspCommon {
 
                 let (codec, clock_rate) = Self::extract_codec_from_media_description(md);
 
-                if sps.is_none() || pps.is_none() {
-                    Self::extract_sps_pps_from_fmtp(md, &mut sps, &mut pps);
+                if vps.is_none() || sps.is_none() || pps.is_none() {
+                    Self::extract_vps_sps_pps_from_fmtp(md, &mut vps, &mut sps, &mut pps);
                 }
 
                 tracks.push(Track {
@@ -347,13 +348,13 @@ impl RtspCommon {
                 });
             }
 
-            (tracks, sps, pps)
+            (tracks, vps, sps, pps)
         } else {
-            (Vec::new(), None, None)
+            (Vec::new(), None, None, None)
         }
     }
 
-    fn extract_sps_pps_from_fmtp(md: &MediaDescription, sps: &mut Option<Vec<u8>>, pps: &mut Option<Vec<u8>>) {
+    fn extract_vps_sps_pps_from_fmtp(md: &MediaDescription, vps: &mut Option<Vec<u8>>, sps: &mut Option<Vec<u8>>, pps: &mut Option<Vec<u8>>) {
         for attr in &md.attributes {
             if attr.key == "fmtp" {
                 if let Some(value) = &attr.value {
@@ -370,7 +371,17 @@ impl RtspCommon {
                                                 let nal_type = decoded[0] & 0x1F;
                                                 debug!("[RTSP Common] Decoded parameter set {}: length={} bytes, nal_type={}", 
                                                        idx, decoded.len(), nal_type);
-                                                if nal_type == 7 && sps.is_none() {
+                                                if nal_type == 32 && vps.is_none() {
+                                                    info!(
+                                                        "[RTSP Common] Found VPS in SDP: {} bytes",
+                                                        decoded.len()
+                                                    );
+                                                    debug!(
+                                                        "[RTSP Common] VPS first 16 bytes: {:02X?}",
+                                                        &decoded[..std::cmp::min(16, decoded.len())]
+                                                    );
+                                                    *vps = Some(decoded);
+                                                } else if nal_type == 7 && sps.is_none() {
                                                     info!(
                                                         "[RTSP Common] Found SPS in SDP: {} bytes",
                                                         decoded.len()
@@ -408,43 +419,8 @@ impl RtspCommon {
         }
     }
 
-    pub fn build_sdp(tracks: &[Track]) -> String {
-        let mut sdp = String::new();
-        sdp.push_str("v=0\r\n");
-        sdp.push_str("o=- 0 0 IN IP4 127.0.0.1\r\n");
-        sdp.push_str("s=MediaServer Session\r\n");
-        sdp.push_str("t=0 0\r\n");
-
-        for (idx, track) in tracks.iter().enumerate() {
-            let (media_type, codec_name) = match track.codec {
-                CodecType::H264 => ("video", "H264"),
-                CodecType::H265 => ("video", "H265"),
-                CodecType::AAC => ("audio", "mpeg4-generic"),
-                CodecType::Opus => ("audio", "opus"),
-                CodecType::G711 => ("audio", "PCMU"),
-                _ => ("video", "H264"),
-            };
-
-            sdp.push_str(&format!(
-                "m={} 0 RTP/AVP {}\r\n",
-                media_type, track.payload_type
-            ));
-            sdp.push_str("c=IN IP4 0.0.0.0\r\n");
-            sdp.push_str("t=0 0\r\n");
-            sdp.push_str(&format!(
-                "a=rtpmap:{} {}/{}\r\n",
-                track.payload_type, codec_name, track.clock_rate
-            ));
-            sdp.push_str(&format!("a=control:trackID={}\r\n", idx));
-
-            if track.codec == CodecType::H264 {
-                sdp.push_str("a=fmtp:96 packetization-mode=1;profile-level-id=42E01F;sprop-parameter-sets=Z0LAHukBQBbsAAADAAQAAAMABAAAAwHNgYI=\r\n");
-            } else if track.codec == CodecType::AAC {
-                sdp.push_str("a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;\r\n");
-            }
-        }
-
-        sdp
+    pub fn build_sdp(tracks: &[Track], vps: Option<&[u8]>, sps: Option<&[u8]>, pps: Option<&[u8]>) -> String {
+        super::sdp_builder::build_sdp_for_stream("", tracks, vps, sps, pps)
     }
 
     pub fn extract_session_id(response: &str) -> Option<String> {
@@ -1100,6 +1076,7 @@ pub struct RtspSessionState {
     pub interleaved_channels: Vec<InterleavedChannel>,
     pub tracks: Vec<Track>,
     pub rtp_task_started: bool,
+    pub vps: Option<Vec<u8>>,
     pub sps: Option<Vec<u8>>,
     pub pps: Option<Vec<u8>>,
 }
@@ -1128,6 +1105,7 @@ impl RtspSessionState {
             interleaved_channels: Vec::new(),
             tracks: Vec::new(),
             rtp_task_started: false,
+            vps: None,
             sps: None,
             pps: None,
         }
