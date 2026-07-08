@@ -137,7 +137,7 @@ ffmpeg -re -f lavfi -i testsrc=size=640x360:rate=25 \
   -f flv rtmp://127.0.0.1:1935/live/{src_id}
 
 # 终端 3：触发拉流，转发到 {stream_id}
-curl -X POST http://127.0.0.1:8081/api/rtmp/pull \
+curl -X POST http://127.0.0.1:8081/api/pull/rtmp \
   -H 'Content-Type: application/json' \
   -d '{"url":"rtmp://127.0.0.1:1935/live/{src_id}","stream_id":"{stream_id}"}'
 ```
@@ -172,7 +172,7 @@ ffmpeg -re -f lavfi -i testsrc=size=640x360:rate=25 \
   -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:554/{src_id}
 
 # 终端 3：触发拉流
-curl -X POST http://127.0.0.1:8081/api/rtsp/pull \
+curl -X POST http://127.0.0.1:8081/api/pull/rtsp \
   -H 'Content-Type: application/json' \
   -d '{"url":"rtsp://127.0.0.1:554/{src_id}","stream_id":"{stream_id}"}'
 ```
@@ -187,7 +187,7 @@ ffmpeg -re -f lavfi -i testsrc=size=640x360:rate=25 \
   -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:554/{src_id}
 
 # 终端 3：UDP 拉流
-curl -X POST http://127.0.0.1:8081/api/rtsp/pull \
+curl -X POST http://127.0.0.1:8081/api/pull/rtsp \
   -H 'Content-Type: application/json' \
   -d '{"url":"rtsp://127.0.0.1:554/{src_id}?transport=udp","stream_id":"{stream_id}"}'
 ```
@@ -223,7 +223,7 @@ ffmpeg -re -f lavfi -i testsrc=size=640x360:rate=25 \
   -f flv -rtmp_enhanced_codecs hvc1 rtmp://127.0.0.1:1935/live/{src_id}
 
 # 终端 3：触发拉流
-curl -X POST http://127.0.0.1:8081/api/rtmp/pull \
+curl -X POST http://127.0.0.1:8081/api/pull/rtmp \
   -H 'Content-Type: application/json' \
   -d '{"url":"rtmp://127.0.0.1:1935/live/{src_id}","stream_id":"{stream_id}"}'
 ```
@@ -259,7 +259,7 @@ ffmpeg -re -f lavfi -i testsrc=size=640x360:rate=25 \
   -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:554/{src_id}
 
 # 终端 3：触发拉流
-curl -X POST http://127.0.0.1:8081/api/rtsp/pull \
+curl -X POST http://127.0.0.1:8081/api/pull/rtsp \
   -H 'Content-Type: application/json' \
   -d '{"url":"rtsp://127.0.0.1:554/{src_id}","stream_id":"{stream_id}"}'
 ```
@@ -275,7 +275,7 @@ ffmpeg -re -f lavfi -i testsrc=size=640x360:rate=25 \
   -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:554/{src_id}
 
 # 终端 3：UDP 拉流
-curl -X POST http://127.0.0.1:8081/api/rtsp/pull \
+curl -X POST http://127.0.0.1:8081/api/pull/rtsp \
   -H 'Content-Type: application/json' \
   -d '{"url":"rtsp://127.0.0.1:554/{src_id}?transport=udp","stream_id":"{stream_id}"}'
 ```

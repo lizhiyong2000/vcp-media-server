@@ -183,6 +183,7 @@ impl FlvPuller {
         );
 
         // Register stream
+        let session = self.stream_manager.begin_pull_loop(local_stream_id);
         self.stream_manager.create_stream(
             local_stream_id,
             StreamSourceMode::Pull,
@@ -195,6 +196,7 @@ impl FlvPuller {
 
         let manager = self.stream_manager.clone();
         let local_id = local_stream_id.to_string();
+        let session = session.clone();
 
         // Check if content is MPEG-TS (for TS segment pull)
         if content_type.contains("video/mp2t") || actual_url.ends_with(".ts") {
@@ -206,6 +208,7 @@ impl FlvPuller {
                     error!("[FLV Puller] TS processing error: {}", e);
                 }
                 let _ = manager.set_stopped(&local_id);
+                manager.end_pull_loop(&local_id, &session);
             });
         } else {
             // FLV streaming - read as byte stream
@@ -214,6 +217,7 @@ impl FlvPuller {
                     error!("[FLV Puller] Stream processing error: {}", e);
                 }
                 let _ = manager.set_stopped(&local_id);
+                manager.end_pull_loop(&local_id, &session);
             });
         }
 

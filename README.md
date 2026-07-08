@@ -106,7 +106,7 @@ Rust 实现的轻量级流媒体服务，以 `StreamManager` 为媒体中枢，�
 | 流创建 / 删除    | `POST /api/streams`、`DELETE /api/stream/<id>`                                    | 已支持 |
 | 健康检查        | `GET /health`                                                                    | 已支持 |
 | 运行指标        | `GET /api/metrics`、`GET /api/metrics/<id>` — 关键帧请求、首帧耗时、播放器数、HLS 切片、ring/RTP gap | 已支持 |
-| 拉流 / 推流 API | `POST /api/rtmp/pull`、`POST /api/rtsp/pull`、`POST /api/rtsp/push`                | 已支持 |
+| 拉流 / 推流 API | `POST /api/pull/rtmp`、`POST /api/pull/rtsp`、`POST /api/push/rtsp`                | 已支持 |
 | 录制控制 API    | 启停录制、查询录制列表与回放                                                                   | 已支持 |
 | 转码 API      | 转码会话管理、H.264/H.265 互转、分辨率/码率/帧率调整                                                | 已支持 |
 | 分析 API      | 衍生流配置、分析任务与事件查询                                                                  | 规划中 |

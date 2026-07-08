@@ -107,9 +107,9 @@ impl HttpServer {
         info!("[HTTP]   GET  /api/stream/<id>    - Get stream info");
         info!("[HTTP]   POST /api/streams        - Create new stream");
         info!("[HTTP]   DELETE /api/stream/<id>  - Delete stream");
-        info!("[HTTP]   POST /api/rtsp/pull      - RTSP pull from remote URL");
-        info!("[HTTP]   POST /api/rtsp/push      - RTSP push to remote URL");
-        info!("[HTTP]   POST /api/rtmp/pull      - RTMP pull from remote URL");
+        info!("[HTTP]   POST /api/pull/rtsp      - RTSP pull from remote URL");
+        info!("[HTTP]   POST /api/push/rtsp      - RTSP push to remote URL");
+        info!("[HTTP]   POST /api/pull/rtmp      - RTMP pull from remote URL");
         info!("[HTTP]   POST /api/pull/hls       - HLS pull from remote URL");
         info!("[HTTP]   POST /api/pull/flv       - HTTP-FLV pull from remote URL");
         info!("[HTTP]   POST /api/pull/mp4       - MP4 pull from remote URL");
@@ -797,7 +797,7 @@ impl HttpServer {
                 .to_string();
                 Ok(Self::http_response(201, "Created", &body))
             }
-            ("POST", "/api/rtsp/pull") => {
+            ("POST", "/api/pull/rtsp") => {
                 let body_start = request
                     .find("\r\n\r\n")
                     .map(|i| &request[i + 4..])
@@ -861,7 +861,7 @@ impl HttpServer {
                 .to_string();
                 Ok(Self::http_response(200, "OK", &body))
             }
-            ("POST", "/api/rtmp/pull") => {
+            ("POST", "/api/pull/rtmp") => {
                 let body_start = request
                     .find("\r\n\r\n")
                     .map(|i| &request[i + 4..])
@@ -935,7 +935,7 @@ impl HttpServer {
             ("POST", "/api/pull/mp4") => {
                 Self::handle_pull_request(request, &manager, StreamProtocol::MP4, "MP4")
             }
-            ("POST", "/api/rtsp/push") => {
+            ("POST", "/api/push/rtsp") => {
                 let body_start = request
                     .find("\r\n\r\n")
                     .map(|i| &request[i + 4..])
@@ -1509,11 +1509,11 @@ impl HttpServer {
                     json!("Delete a stream"),
                 );
                 endpoints.insert(
-                    "POST /api/rtsp/pull".to_string(),
+                    "POST /api/pull/rtsp".to_string(),
                     json!("Start RTSP pull from remote URL"),
                 );
                 endpoints.insert(
-                    "POST /api/rtmp/pull".to_string(),
+                    "POST /api/pull/rtmp".to_string(),
                     json!("Start RTMP pull from remote URL"),
                 );
                 endpoints.insert(
@@ -1529,7 +1529,7 @@ impl HttpServer {
                     json!("Start MP4 pull from remote URL"),
                 );
                 endpoints.insert(
-                    "POST /api/rtsp/push".to_string(),
+                    "POST /api/push/rtsp".to_string(),
                     json!("Start RTSP push to remote URL"),
                 );
                 endpoints.insert(

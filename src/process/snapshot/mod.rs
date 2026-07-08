@@ -18,10 +18,11 @@ use crate::core::{
 use crate::server::webrtc::request_publisher_keyframe;
 
 const DEFAULT_WAIT_KEYFRAME_MS: u64 = 5_000;
-const PULL_WAIT_KEYFRAME_MS: u64 = 60_000;
+const PULL_WAIT_KEYFRAME_MS: u64 = 120_000;
 const DEFAULT_FFMPEG_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_CAPTURE_JOB_TIMEOUT_SECS: u64 = 30;
-const PULL_CAPTURE_JOB_TIMEOUT_SECS: u64 = 75;
+const PULL_CAPTURE_JOB_TIMEOUT_SECS: u64 = 130;
+const PULL_KEYFRAME_WAIT_BUFFER: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_FFMPEG: usize = 2;
 const SNAPSHOT_MAX_VIDEO_FRAMES: usize = 120;
 const SNAPSHOT_MAX_RAW_BYTES: usize = 4 * 1024 * 1024;
@@ -626,7 +627,11 @@ impl SnapshotManager {
             .map(|hub| hub.stream().source == StreamSourceMode::Pull)
             .unwrap_or(false);
         if is_pull {
-            base.max(Duration::from_millis(PULL_WAIT_KEYFRAME_MS))
+            let job_budget = self.capture_job_timeout_for(stream_id);
+            let ffmpeg_budget = self.config.ffmpeg_timeout + PULL_KEYFRAME_WAIT_BUFFER;
+            base
+                .max(Duration::from_millis(PULL_WAIT_KEYFRAME_MS))
+                .min(job_budget.saturating_sub(ffmpeg_budget))
         } else {
             base
         }

@@ -148,6 +148,7 @@ impl RtmpPuller {
         tx_id += 1.0;
 
         // Register local stream before play so relay is ready
+        let session = self.stream_manager.begin_pull_loop(local_stream_id);
         self.stream_manager.create_stream(
             local_stream_id,
             StreamSourceMode::Pull,
@@ -189,9 +190,18 @@ impl RtmpPuller {
 
         let manager = self.stream_manager.clone();
         let local_id = local_stream_id.to_string();
+        let session = session.clone();
         let mut frames_received: u64 = 0;
 
         loop {
+            if session.is_stopped() {
+                info!(
+                    "[RTMP Puller] Pull stopped for stream '{}', exiting relay loop",
+                    local_id
+                );
+                break;
+            }
+
             let mut read_buf = [0u8; 8192];
             let len = match read_half.read(&mut read_buf).await {
                 Ok(0) => {
@@ -238,6 +248,7 @@ impl RtmpPuller {
         }
 
         let _ = self.stream_manager.set_stopped(local_stream_id);
+        self.stream_manager.end_pull_loop(local_stream_id, &session);
         info!(
             "[RTMP Puller] Pull ended for stream '{}', total frames={}",
             local_stream_id, frames_received

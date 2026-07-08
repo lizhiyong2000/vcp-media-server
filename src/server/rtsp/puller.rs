@@ -106,6 +106,7 @@ impl RtspPuller {
             local_stream_id,
             tracks_to_create.len()
         );
+        let pull_session = self.stream_manager.begin_pull_loop(local_stream_id);
         self.stream_manager.create_stream(
             local_stream_id,
             StreamSourceMode::Pull,
@@ -198,11 +199,12 @@ impl RtspPuller {
             if use_udp { "UDP" } else { "TCP" }
         );
 
+        let pull_session = pull_session.clone();
         tokio::spawn(async move {
             if use_udp {
                 tokio::select! {
                     _ = Self::udp_receive_loop(udp_sockets, manager_clone.clone(), stream_id_clone.clone(), receive_tracks.clone()) => (),
-                    _ = Self::send_keepalive(remote_url_clone) => (),
+                    _ = Self::send_keepalive(remote_url_clone.clone()) => (),
                 }
             } else {
                 tokio::select! {
@@ -210,6 +212,7 @@ impl RtspPuller {
                     _ = Self::send_keepalive(remote_url_clone) => (),
                 }
             }
+            manager_clone.end_pull_loop(&stream_id_clone, &pull_session);
         });
 
         Ok(())

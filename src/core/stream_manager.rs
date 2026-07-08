@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -15,15 +16,91 @@ use super::{
     VIDEO_RTP_CLOCK_RATE,
 };
 
+/// Per-pull-loop cancellation handle.
+pub struct PullSessionHandle {
+    stop: AtomicBool,
+}
+
+impl PullSessionHandle {
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    pub fn new_active() -> Arc<Self> {
+        Arc::new(Self {
+            stop: AtomicBool::new(false),
+        })
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
 pub struct StreamManager {
     hubs: RwLock<HashMap<StreamId, Arc<StreamHub>>>,
+    pull_sessions: RwLock<HashMap<StreamId, Arc<PullSessionHandle>>>,
 }
 
 impl StreamManager {
     pub fn new() -> Self {
         Self {
             hubs: RwLock::new(HashMap::new()),
+            pull_sessions: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Start a new pull loop for `stream_id`, stopping any previous loop on the same id.
+    pub fn begin_pull_loop(&self, stream_id: &str) -> Arc<PullSessionHandle> {
+        let mut sessions = self.pull_sessions.write();
+        if let Some(existing) = sessions.get(stream_id) {
+            existing.stop();
+            info!(
+                "[Core] Stopping previous pull loop for stream '{}'",
+                stream_id
+            );
+        }
+        let session = Arc::new(PullSessionHandle {
+            stop: AtomicBool::new(false),
+        });
+        sessions.insert(stream_id.to_string(), session.clone());
+        session
+    }
+
+    pub fn end_pull_loop(&self, stream_id: &str, session: &Arc<PullSessionHandle>) {
+        let mut sessions = self.pull_sessions.write();
+        if sessions
+            .get(stream_id)
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            sessions.remove(stream_id);
+        }
+    }
+
+    pub fn request_pull_stop(&self, stream_id: &str) {
+        if let Some(session) = self.pull_sessions.read().get(stream_id) {
+            session.stop();
+            info!("[Core] Pull stop requested for stream '{}'", stream_id);
+        }
+    }
+
+    pub fn is_pull_stop_requested(&self, stream_id: &str) -> bool {
+        self.pull_sessions
+            .read()
+            .get(stream_id)
+            .is_some_and(|session| session.is_stopped())
+    }
+
+    pub fn should_publish_to_stream(&self, stream_id: &str) -> bool {
+        if self
+            .pull_sessions
+            .read()
+            .get(stream_id)
+            .is_some_and(|session| session.is_stopped())
+        {
+            return false;
+        }
+        self.get_hub(stream_id).is_some()
     }
 
     pub fn create_stream(
@@ -296,6 +373,7 @@ impl StreamManager {
     }
 
     pub fn remove_stream(&self, stream_id: &StreamId) -> Option<Stream> {
+        self.request_pull_stop(stream_id);
         self.hubs.write().remove(stream_id).map(|hub| hub.stream())
     }
 
@@ -612,16 +690,19 @@ impl StreamManager {
             );
         }
 
+        if !self.should_publish_to_stream(&stream_id) {
+            debug!(
+                "[Core] publish_frame: stream_id={} skipped (hub removed or pull stopped)",
+                stream_id
+            );
+            return;
+        }
+
         if let Some(hub) = self.get_or_create_hub(&stream_id) {
             let seq = hub.publish(frame);
             debug!(
                 "[Core] publish_frame: stream_id={} ring_seq={}",
                 stream_id, seq
-            );
-        } else {
-            warn!(
-                "[Core] publish_frame: No StreamHub for stream_id={}",
-                stream_id
             );
         }
 
@@ -838,6 +919,22 @@ mod tests {
         let stream = manager.get_stream(&"s".to_string()).unwrap();
         assert_eq!(stream.sps.as_deref(), Some(&[0x67, 0x01][..]));
         assert_eq!(stream.pps.as_deref(), Some(&[0x68, 0x02][..]));
+    }
+
+    #[test]
+    fn remove_stream_requests_pull_stop_and_skips_publish() {
+        let manager = StreamManager::new();
+        create_test_stream(&manager, "s");
+        let session = manager.begin_pull_loop("s");
+        manager.set_publishing("s").unwrap();
+
+        manager.publish_frame(h264_frame("s", 1000, true));
+        manager.remove_stream(&"s".to_string());
+
+        assert!(manager.get_hub("s").is_none());
+        assert!(session.is_stopped());
+        manager.publish_frame(h264_frame("s", 2000, false));
+        assert!(manager.get_hub("s").is_none());
     }
 
     #[test]

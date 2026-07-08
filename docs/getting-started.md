@@ -41,11 +41,11 @@ RUST_LOG=debug cargo run
 curl http://127.0.0.1:8081/health
 curl http://127.0.0.1:8081/api/streams
 
-curl -X POST http://127.0.0.1:8081/api/rtsp/pull \
+curl -X POST http://127.0.0.1:8081/api/pull/rtsp \
   -H 'Content-Type: application/json' \
   -d '{"url":"rtsp://127.0.0.1:554/live?transport=udp","stream_id":"pull_test"}'
 
-curl -X POST http://127.0.0.1:8081/api/rtmp/pull \
+curl -X POST http://127.0.0.1:8081/api/pull/rtmp \
   -H 'Content-Type: application/json' \
   -d '{"url":"rtmp://127.0.0.1:1935/live/source1","stream_id":"pull_test"}'
 ```

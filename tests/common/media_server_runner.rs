@@ -148,7 +148,7 @@ impl MediaServer {
         self.ports.http
     }
 
-    /// POST JSON to an HTTP API path (e.g. `/api/rtmp/pull`).
+    /// POST JSON to an HTTP API path (e.g. `/api/pull/rtmp`).
     pub async fn post_json(&self, path: &str, json_body: &str) -> Result<HttpResponse, String> {
         http_post_json(self.http_host(), self.http_port(), path, json_body).await
     }
@@ -177,7 +177,7 @@ impl MediaServer {
         let body = format!(
             r#"{{"url":"{remote_url}","stream_id":"{stream_id}"}}"#
         );
-        self.post_json("/api/rtmp/pull", &body).await
+        self.post_json("/api/pull/rtmp", &body).await
     }
 
     /// Start RTSP pull via HTTP API.
@@ -189,7 +189,7 @@ impl MediaServer {
         let body = format!(
             r#"{{"url":"{remote_url}","stream_id":"{stream_id}"}}"#
         );
-        self.post_json("/api/rtsp/pull", &body).await
+        self.post_json("/api/pull/rtsp", &body).await
     }
 
 /// Trigger HLS generation with a single playlist request (avoid repeated m3u8 polling).

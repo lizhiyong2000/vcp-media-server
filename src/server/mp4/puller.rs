@@ -58,6 +58,7 @@ impl Mp4Puller {
             .timeout(Duration::from_secs(30))
             .build()?;
 
+        let session = self.stream_manager.begin_pull_loop(stream_id);
         self.stream_manager.create_stream(
             stream_id,
             StreamSourceMode::Pull,
@@ -91,6 +92,14 @@ impl Mp4Puller {
         let mut published = 0usize;
         let mut last_dts_ms = None;
         for sample in &movie.video.samples {
+            if session.is_stopped() {
+                info!(
+                    "[MP4 Puller] Pull stopped for stream '{}', exiting sample loop",
+                    stream_id
+                );
+                break;
+            }
+
             if sample.size == 0 || sample.size > MAX_SAMPLE_BYTES {
                 warn!(
                     "[MP4 Puller] Skip invalid sample stream='{}' offset={} size={}",
@@ -161,6 +170,7 @@ impl Mp4Puller {
             stream_id, published
         );
         let _ = self.stream_manager.set_stopped(stream_id);
+        self.stream_manager.end_pull_loop(stream_id, &session);
         Ok(())
     }
 }

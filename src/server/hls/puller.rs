@@ -16,7 +16,7 @@ use crate::core::{
 
 use crate::server::http_flv::puller::{is_m3u8_url, parse_m3u8_for_segment, resolve_relative_url};
 
-const HLS_CONCURRENT_SEGMENTS: usize = 3;
+const HLS_CONCURRENT_SEGMENTS: usize = 8;
 const DECODE_BATCH_PACKETS: usize = 128;
 /// ~5MB TS @ 188 bytes/packet needs ~27k packets → ~210 batches of 128.
 const MAX_DECODE_BATCHES_PER_SEGMENT: usize = 512;
@@ -117,6 +117,7 @@ impl HlsPuller {
         info!("[HLS Puller] =========================================");
 
         // Register the stream
+        let session = self.stream_manager.begin_pull_loop(local_stream_id);
         self.stream_manager.create_stream(
             local_stream_id,
             StreamSourceMode::Pull,
@@ -137,7 +138,10 @@ impl HlsPuller {
         let url = remote_url.to_string();
 
         tokio::spawn(async move {
-            if let Err(e) = run_hls_pull_loop(url, manager, local_id).await {
+            let stream_id = local_id.clone();
+            let result = run_hls_pull_loop(url, manager.clone(), local_id, session.clone()).await;
+            manager.end_pull_loop(&stream_id, &session);
+            if let Err(e) = result {
                 error!("[HLS Puller] Loop error: {}", e);
             }
         });
@@ -151,6 +155,7 @@ async fn run_hls_pull_loop(
     playlist_url: String,
     manager: Arc<StreamManager>,
     stream_id: String,
+    session: Arc<crate::core::PullSessionHandle>,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -253,6 +258,14 @@ async fn run_hls_pull_loop(
     );
 
     loop {
+        if session.is_stopped() {
+            info!(
+                "[HLS Puller] Pull stopped for stream '{}', exiting segment loop",
+                stream_id
+            );
+            break;
+        }
+
         loop_count += 1;
         debug!(
             "[HLS Puller] playlist loop start stream='{}' loop={} media_url='{}' downloaded_segments={}",
@@ -329,6 +342,15 @@ async fn run_hls_pull_loop(
         let mut playlist_expired = false;
 
         for seg in &segments {
+            if session.is_stopped() {
+                info!(
+                    "[HLS Puller] Pull stopped for stream '{}' while downloading segments",
+                    stream_id
+                );
+                playlist_expired = true;
+                break;
+            }
+
             info!(
                 "[HLS Puller] Downloading segment (duration={}s): {}",
                 seg.duration, &seg.url
@@ -363,6 +385,7 @@ async fn run_hls_pull_loop(
                     &mut sps_pps_stored,
                     is_h265,
                     audio_codec_known,
+                    session.clone(),
                 )
                 .await
                 {
@@ -527,8 +550,9 @@ fn select_live_segments(
 }
 
 fn segment_download_timeout(duration_secs: f64) -> Duration {
-    // Large TS segments over slow links can take 30s+; scale with declared duration.
-    let secs = (duration_secs * 12.0).ceil().max(45.0).min(120.0);
+    // Keep timeouts short so one bad segment does not block the global download pool
+    // for minutes during batch IPTV pull validation.
+    let secs = (duration_secs * 4.0).ceil().max(12.0).min(25.0);
     Duration::from_secs_f64(secs)
 }
 
@@ -551,6 +575,7 @@ async fn download_and_process_segment_streaming(
     sps_pps_stored: &mut bool,
     is_h265: bool,
     has_audio: bool,
+    session: Arc<crate::core::PullSessionHandle>,
 ) -> Result<()> {
     use super::ts_parser::TsStreamDecoder;
 
@@ -592,6 +617,7 @@ async fn download_and_process_segment_streaming(
         sps_pps_stored,
         is_h265,
         has_audio,
+        session,
     );
 
     use futures_util::StreamExt;
@@ -602,6 +628,14 @@ async fn download_and_process_segment_streaming(
     let mut next_progress_log = 512 * 1024usize;
 
     while let Some(chunk) = stream.next().await {
+        if publisher.is_stopped() {
+            debug!(
+                "[HLS Puller] abort segment streaming stream='{}' url='{}' (pull stopped)",
+                stream_id,
+                url
+            );
+            break;
+        }
         let chunk = chunk.map_err(|e| {
             anyhow!(
                 "error reading segment body (timeout={}s): {} — {}",
@@ -815,6 +849,7 @@ struct HlsSegmentPublisher<'a> {
     sps_pps_stored: &'a mut bool,
     is_h265_hint: bool,
     has_audio: bool,
+    session: Arc<crate::core::PullSessionHandle>,
     actual_codec: CodecType,
     h265_vps: Option<Vec<u8>>,
     h265_sps: Option<Vec<u8>>,
@@ -836,6 +871,7 @@ impl<'a> HlsSegmentPublisher<'a> {
         sps_pps_stored: &'a mut bool,
         is_h265_hint: bool,
         has_audio: bool,
+        session: Arc<crate::core::PullSessionHandle>,
     ) -> Self {
         Self {
             manager,
@@ -844,6 +880,7 @@ impl<'a> HlsSegmentPublisher<'a> {
             sps_pps_stored,
             is_h265_hint,
             has_audio,
+            session,
             actual_codec: if is_h265_hint {
                 CodecType::H265
             } else {
@@ -884,12 +921,19 @@ impl<'a> HlsSegmentPublisher<'a> {
         self.tracks_ready = true;
     }
 
+    fn is_stopped(&self) -> bool {
+        self.session.is_stopped() || self.manager.get_hub(self.stream_id).is_none()
+    }
+
     fn publish_nal(
         &mut self,
         ts_codec: super::ts_parser::TsCodec,
         _is_key_hint: bool,
         data: &[u8],
     ) {
+        if self.is_stopped() {
+            return;
+        }
         if matches!(ts_codec, super::ts_parser::TsCodec::Mpeg2Video) {
             debug!(
                 "[HLS Puller] skip unsupported MPEG2 video frame stream='{}' bytes={}",
@@ -1156,6 +1200,7 @@ async fn process_ts_segment_hls(
     }
 
     let mut decoder = TsStreamDecoder::new(is_h265);
+    let session = crate::core::PullSessionHandle::new_active();
     let mut publisher = HlsSegmentPublisher::new(
         manager,
         stream_id,
@@ -1163,6 +1208,7 @@ async fn process_ts_segment_hls(
         sps_pps_stored,
         is_h265,
         has_audio,
+        session,
     );
 
     let mut published_frames = 0usize;
@@ -1258,8 +1304,8 @@ mod tests {
 
     #[test]
     fn segment_download_timeout_scales_with_duration() {
-        assert_eq!(segment_download_timeout(4.2).as_secs(), 51);
-        assert_eq!(segment_download_timeout(10.0).as_secs(), 120);
+        assert_eq!(segment_download_timeout(4.2).as_secs(), 17);
+        assert_eq!(segment_download_timeout(10.0).as_secs(), 25);
     }
 
     #[test]
