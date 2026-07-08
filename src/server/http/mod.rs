@@ -3,14 +3,14 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{sleep, Duration, Instant};
 use tracing::{error, info, warn};
 
 use crate::core::TransportConfig;
 use crate::core::{
-    CodecType, Config, DispatchError, DispatchPolicy, MetricsRegistry, MetricsSnapshot,
-    PlaybackProtocol, StreamManager, StreamProtocol, StreamSourceMode, Track, WallclockMsTimeline,
-    is_idr_frame, prime_live_play,
+    is_idr_frame, prime_live_play, CodecType, Config, DispatchError, DispatchPolicy,
+    MetricsRegistry, MetricsSnapshot, PlaybackProtocol, StreamManager, StreamProtocol,
+    StreamSourceMode, Track, WallclockMsTimeline,
 };
 use crate::process::analysis::{AnalysisManager, StartAnalysisRequest, StopAnalysisRequest};
 use crate::process::record::{RecorderManager, StartRecordRequest, StopRecordRequest};
@@ -19,8 +19,9 @@ use crate::process::transcode::{StartTranscodeRequest, StopTranscodeRequest, Tra
 use crate::server::hls::HlsServer;
 use crate::server::http_flv::puller::is_m3u8_url;
 use crate::server::http_flv::{
-    HttpFlvServer, HttpFlvSession, format_chunk, stream_has_video_sequence_header,
+    format_chunk, stream_has_video_sequence_header, HttpFlvServer, HttpFlvSession,
 };
+use crate::server::mp4::puller::is_mp4_url;
 use crate::server::rtsp::RtspPusher;
 use crate::server::transport::TransportAdapterFactory;
 
@@ -111,6 +112,7 @@ impl HttpServer {
         info!("[HTTP]   POST /api/rtmp/pull      - RTMP pull from remote URL");
         info!("[HTTP]   POST /api/pull/hls       - HLS pull from remote URL");
         info!("[HTTP]   POST /api/pull/flv       - HTTP-FLV pull from remote URL");
+        info!("[HTTP]   POST /api/pull/mp4       - MP4 pull from remote URL");
         info!("[HTTP]   GET  /api/metrics         - Operational metrics (all streams)");
         info!("[HTTP]   GET  /api/metrics/<id>    - Per-stream metrics");
         if self.recorder.is_some() {
@@ -762,6 +764,7 @@ impl HttpServer {
                             "RTMP" => StreamProtocol::RTMP,
                             "WEBRTC" => StreamProtocol::WebRTC,
                             "HTTP" => StreamProtocol::HTTP,
+                            "MP4" => StreamProtocol::MP4,
                             _ => StreamProtocol::Unknown,
                         },
                     );
@@ -928,6 +931,9 @@ impl HttpServer {
             }
             ("POST", "/api/pull/flv") => {
                 Self::handle_pull_request(request, &manager, StreamProtocol::HTTP_FLV, "HTTP-FLV")
+            }
+            ("POST", "/api/pull/mp4") => {
+                Self::handle_pull_request(request, &manager, StreamProtocol::MP4, "MP4")
             }
             ("POST", "/api/rtsp/push") => {
                 let body_start = request
@@ -1519,6 +1525,10 @@ impl HttpServer {
                     json!("Start HTTP-FLV pull from remote URL"),
                 );
                 endpoints.insert(
+                    "POST /api/pull/mp4".to_string(),
+                    json!("Start MP4 pull from remote URL"),
+                );
+                endpoints.insert(
                     "POST /api/rtsp/push".to_string(),
                     json!("Start RTSP push to remote URL"),
                 );
@@ -1669,6 +1679,9 @@ impl HttpServer {
         if protocol == StreamProtocol::HTTP_FLV && is_m3u8_url(remote_url) {
             return (StreamProtocol::HLS, "HLS".to_string());
         }
+        if protocol != StreamProtocol::MP4 && is_mp4_url(remote_url) {
+            return (StreamProtocol::MP4, "MP4".to_string());
+        }
         (protocol, label.to_string())
     }
 
@@ -1723,5 +1736,17 @@ mod tests {
 
         assert_eq!(protocol, StreamProtocol::HTTP_FLV);
         assert_eq!(label, "HTTP-FLV");
+    }
+
+    #[test]
+    fn pull_endpoint_routes_mp4_url_to_mp4() {
+        let (protocol, label) = HttpServer::effective_pull_protocol(
+            StreamProtocol::HTTP_FLV,
+            "HTTP-FLV",
+            "https://example.com/video.mp4?token=abc",
+        );
+
+        assert_eq!(protocol, StreamProtocol::MP4);
+        assert_eq!(label, "MP4");
     }
 }

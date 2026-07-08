@@ -31,6 +31,7 @@ pub enum ProtocolType {
     RTMP,
     HLS,
     HTTP_FLV,
+    MP4,
     WebRTC,
     HTTP_API,
 }
@@ -42,6 +43,7 @@ impl ProtocolType {
             ProtocolType::RTMP => "RTMP",
             ProtocolType::HLS => "HLS",
             ProtocolType::HTTP_FLV => "HTTP-FLV",
+            ProtocolType::MP4 => "MP4",
             ProtocolType::WebRTC => "WebRTC",
             ProtocolType::HTTP_API => "HTTP-API",
         }
@@ -53,6 +55,7 @@ impl ProtocolType {
             "RTMP" => Some(ProtocolType::RTMP),
             "HLS" => Some(ProtocolType::HLS),
             "HTTP-FLV" | "HTTPFLV" | "FLV" => Some(ProtocolType::HTTP_FLV),
+            "MP4" => Some(ProtocolType::MP4),
             "WEBRTC" => Some(ProtocolType::WebRTC),
             "HTTP" | "HTTP-API" => Some(ProtocolType::HTTP_API),
             _ => None,

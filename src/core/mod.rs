@@ -22,27 +22,27 @@ use std::collections::HashMap;
 
 pub use config::{
     AnalysisConfig, Config, HttpConfig, RecordConfig, RtmpConfig, RtspConfig, ServerConfig,
-    SnapshotConfig, StorageConfig, TranscodeConfig, WebrtcConfig, DEFAULT_HLS_DIR, DEFAULT_HLS_OUTPUT_DIR,
-    DEFAULT_RECORD_DIR, DEFAULT_RECORD_OUTPUT_DIR, DEFAULT_SNAPSHOT_DIR,
+    SnapshotConfig, StorageConfig, TranscodeConfig, WebrtcConfig, DEFAULT_HLS_DIR,
+    DEFAULT_HLS_OUTPUT_DIR, DEFAULT_RECORD_DIR, DEFAULT_RECORD_OUTPUT_DIR, DEFAULT_SNAPSHOT_DIR,
     DEFAULT_SNAPSHOT_OUTPUT_DIR, DEFAULT_STORAGE_BASE_DIR,
-};
-pub use metrics::{
-    FirstFrameStats, HlsMetricsSnapshot, MetricsRegistry, MetricsSnapshot, PlaybackProtocol,
-    PlayerCounts, RingStats, StreamMetricsSnapshot,
 };
 pub use live_play::{
     is_idr_frame, is_playable_video_frame, prepend_video_config, prime_live_play,
     recv_coalesced_play_frame,
 };
+pub use metrics::{
+    FirstFrameStats, HlsMetricsSnapshot, MetricsRegistry, MetricsSnapshot, PlaybackProtocol,
+    PlayerCounts, RingStats, StreamMetricsSnapshot,
+};
 pub use protocol::{ProtocolInfo, ProtocolRegistry, ProtocolType, StreamSink};
 pub use pusher::*;
 pub use tester::StreamTester;
-pub use transport::*;
 pub use timestamp::{
     flv_timestamp_ms, media_frame_timestamp_delta_ms, media_timestamp_delta_ms,
     media_timestamp_delta_ms_with_clock, video_media_timestamp_to_rtp_ticks, FlvPlayTimeline,
     WallclockMsTimeline, AAC_DEFAULT_CLOCK_RATE, MILLISECOND_CLOCK_RATE, VIDEO_RTP_CLOCK_RATE,
 };
+pub use transport::*;
 pub use video_codec::{
     build_enhanced_rtmp_hevc_sequence_header, build_rtmp_hevc_sequence_header,
     build_rtmp_video_from_annex_b, contains_h264_idr, contains_hevc_idr, ensure_annex_b,
@@ -171,6 +171,7 @@ pub enum StreamProtocol {
     HTTP,
     HLS,
     HTTP_FLV,
+    MP4,
     Unknown,
 }
 
