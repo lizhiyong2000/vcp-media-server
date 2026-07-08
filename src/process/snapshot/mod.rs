@@ -8,20 +8,33 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::core::live_play::{is_idr_frame, is_playable_video_frame};
 use crate::core::{
-    ensure_annex_b, prepend_annex_b_config_if_needed, CodecType, MediaFrame, StreamManager,
-    DEFAULT_SNAPSHOT_DIR,
+    ensure_annex_b, iter_annex_b_nal_ranges, prepend_annex_b_config_if_needed, CodecType,
+    MediaFrame, StreamManager, StreamSourceMode, DEFAULT_SNAPSHOT_DIR,
 };
 use crate::server::webrtc::request_publisher_keyframe;
 
 const DEFAULT_WAIT_KEYFRAME_MS: u64 = 5_000;
+const PULL_WAIT_KEYFRAME_MS: u64 = 60_000;
 const DEFAULT_FFMPEG_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_CAPTURE_JOB_TIMEOUT_SECS: u64 = 30;
+const PULL_CAPTURE_JOB_TIMEOUT_SECS: u64 = 75;
 const MAX_CONCURRENT_FFMPEG: usize = 2;
+const SNAPSHOT_MAX_VIDEO_FRAMES: usize = 120;
+const SNAPSHOT_MAX_RAW_BYTES: usize = 4 * 1024 * 1024;
 const SNAPSHOT_RING_LOOKBACK: u64 = 600;
+const SNAPSHOT_H264_INTRA_PREROLL_FRAMES: u64 = 120;
+const SNAPSHOT_H264_INTRA_SKIP_DECODED_FRAMES: usize = 30;
+
+#[derive(Debug, Clone)]
+struct SnapshotSelection {
+    frame: MediaFrame,
+    seq: u64,
+    h264_intra_fallback: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct SnapshotConfig {
@@ -111,7 +124,15 @@ impl SnapshotManager {
         }
 
         let now = now_ms();
-        let id = format!("snap_{}_{}", req.stream_id, now);
+        let id = format!("snap_{}_{}", snapshot_id_component(&req.stream_id), now);
+        debug!(
+            "[Snapshot] submit accepted stream='{}' id='{}' base_dir='{}' wait_keyframe_ms={} ffmpeg_timeout_ms={}",
+            req.stream_id,
+            id,
+            self.config.base_dir.display(),
+            self.config.wait_keyframe.as_millis(),
+            self.config.ffmpeg_timeout.as_millis()
+        );
         let entry = SnapshotEntry {
             id: id.clone(),
             stream_id: req.stream_id.clone(),
@@ -139,52 +160,138 @@ impl SnapshotManager {
     }
 
     async fn capture_job(&self, id: String, req: CaptureSnapshotRequest) -> Result<()> {
-        let job_timeout = Duration::from_secs(DEFAULT_CAPTURE_JOB_TIMEOUT_SECS);
+        let stream_id = req.stream_id.clone();
+        let job_timeout = self.capture_job_timeout_for(&stream_id);
+        debug!(
+            "[Snapshot] job start stream='{}' id='{}' timeout_ms={}",
+            stream_id,
+            id,
+            job_timeout.as_millis()
+        );
         match timeout(job_timeout, self.capture_job_inner(id.clone(), req)).await {
             Ok(result) => result,
-            Err(_) => Err(anyhow!(
-                "snapshot job timed out after {}s",
-                job_timeout.as_secs()
-            )),
+            Err(_) => {
+                debug!(
+                    "[Snapshot] job timeout stream='{}' id='{}' timeout_ms={}",
+                    stream_id,
+                    id,
+                    job_timeout.as_millis()
+                );
+                Err(anyhow!(
+                    "snapshot job timed out after {}s",
+                    job_timeout.as_secs()
+                ))
+            }
         }
     }
 
     async fn capture_job_inner(&self, id: String, req: CaptureSnapshotRequest) -> Result<()> {
+        let started = Instant::now();
         self.update_status(&id, "running");
-        let frame = self.wait_latest_idr(&req.stream_id).await?;
-        if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
-            return Err(anyhow!("snapshot only supports H264/H265 video stream"));
-        }
-        let input_format = ffmpeg_raw_video_format(frame.codec)?;
-        let input_extension = raw_video_extension(frame.codec)?;
-        let prepared = prepare_video_snapshot_frame(&self.stream_manager, &req.stream_id, frame);
+        debug!(
+            "[Snapshot] status running stream='{}' id='{}'",
+            req.stream_id, id
+        );
         let now = now_ms();
         let dir = self
             .config
             .base_dir
             .join(sanitize_path_component(&req.stream_id))
             .join(date_dir_yyyymmdd(now));
+        debug!(
+            "[Snapshot] ensure output dir stream='{}' id='{}' dir='{}'",
+            req.stream_id,
+            id,
+            dir.display()
+        );
         tokio::fs::create_dir_all(&dir)
             .await
             .with_context(|| format!("create {}", dir.display()))?;
-
-        let raw_path = dir.join(format!("{id}.{input_extension}"));
         let image_path = dir.join(format!("{id}.jpg"));
+
+        let selection = self.wait_latest_idr(&req.stream_id).await?;
+        let frame = selection.frame;
+        debug!(
+            "[Snapshot] selected frame stream='{}' id='{}' seq={} codec={:?} ts={} keyframe={} bytes={} clock_rate={:?} wait_elapsed_ms={}",
+            req.stream_id,
+            id,
+            selection.seq,
+            frame.codec,
+            frame.timestamp,
+            frame.is_keyframe,
+            frame.data.len(),
+            frame.clock_rate,
+            started.elapsed().as_millis()
+        );
+        if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
+            return Err(anyhow!("snapshot only supports H264/H265 video stream"));
+        }
+        let input_format = ffmpeg_raw_video_format(frame.codec)?;
+        let input_extension = raw_video_extension(frame.codec)?;
+        let original_frame_bytes = frame.data.len();
+        let h264_intra_fallback = selection.h264_intra_fallback;
+        let prepared = prepare_video_snapshot_frame(
+            &self.stream_manager,
+            &req.stream_id,
+            frame,
+            selection.seq,
+        );
+        debug!(
+            "[Snapshot] prepared frame stream='{}' id='{}' codec={:?} ts={} input_format='{}' raw_ext='{}' original_bytes={} prepared_bytes={}",
+            req.stream_id,
+            id,
+            prepared.codec,
+            prepared.timestamp,
+            input_format,
+            input_extension,
+            original_frame_bytes,
+            prepared.data.len()
+        );
+        let raw_path = dir.join(format!("{id}.{input_extension}"));
+        debug!(
+            "[Snapshot] write raw frame stream='{}' id='{}' path='{}' bytes={}",
+            req.stream_id,
+            id,
+            raw_path.display(),
+            prepared.data.len()
+        );
         tokio::fs::write(&raw_path, &prepared.data)
             .await
             .with_context(|| format!("write {}", raw_path.display()))?;
 
+        debug!(
+            "[Snapshot] waiting ffmpeg slot stream='{}' id='{}' available_permits={}",
+            req.stream_id,
+            id,
+            self.ffmpeg_slots.available_permits()
+        );
         let _permit = self
             .ffmpeg_slots
             .acquire()
             .await
             .map_err(|_| anyhow!("snapshot ffmpeg pool closed"))?;
+        debug!(
+            "[Snapshot] acquired ffmpeg slot stream='{}' id='{}' available_permits={}",
+            req.stream_id,
+            id,
+            self.ffmpeg_slots.available_permits()
+        );
 
         let ffmpeg_path = self.config.ffmpeg_path.clone();
         let ffmpeg_timeout = self.config.ffmpeg_timeout;
         let raw_for_ffmpeg = raw_path.clone();
         let image_for_ffmpeg = image_path.clone();
         let input_format_owned = input_format.to_string();
+        debug!(
+            "[Snapshot] spawn ffmpeg worker stream='{}' id='{}' ffmpeg='{}' input_format='{}' raw='{}' image='{}' timeout_ms={}",
+            req.stream_id,
+            id,
+            ffmpeg_path,
+            input_format,
+            raw_path.display(),
+            image_path.display(),
+            ffmpeg_timeout.as_millis()
+        );
         tokio::task::spawn_blocking(move || {
             run_ffmpeg_snapshot_blocking(
                 ffmpeg_path,
@@ -192,17 +299,37 @@ impl SnapshotManager {
                 raw_for_ffmpeg,
                 image_for_ffmpeg,
                 ffmpeg_timeout,
+                h264_intra_fallback,
             )
         })
         .await
         .context("ffmpeg worker join failed")??;
+        debug!(
+            "[Snapshot] ffmpeg worker finished stream='{}' id='{}' elapsed_ms={}",
+            req.stream_id,
+            id,
+            started.elapsed().as_millis()
+        );
 
         let _ = tokio::fs::remove_file(&raw_path).await;
+        debug!(
+            "[Snapshot] removed raw frame stream='{}' id='{}' raw='{}'",
+            req.stream_id,
+            id,
+            raw_path.display()
+        );
 
         let bytes = tokio::fs::metadata(&image_path)
             .await
             .map(|m| m.len())
             .unwrap_or_default();
+        debug!(
+            "[Snapshot] output metadata stream='{}' id='{}' image='{}' bytes={}",
+            req.stream_id,
+            id,
+            image_path.display(),
+            bytes
+        );
         if bytes == 0 {
             return Err(anyhow!("snapshot output is empty"));
         }
@@ -215,9 +342,17 @@ impl SnapshotManager {
         Ok(())
     }
 
-    async fn wait_latest_idr(&self, stream_id: &str) -> Result<MediaFrame> {
-        if let Some(frame) = self.find_snapshot_frame(stream_id) {
-            return Ok(frame);
+    async fn wait_latest_idr(&self, stream_id: &str) -> Result<SnapshotSelection> {
+        if let Some(selection) = self.find_snapshot_frame(stream_id) {
+            debug!(
+                "[Snapshot] using cached IDR stream='{}' seq={} codec={:?} ts={} bytes={}",
+                stream_id,
+                selection.seq,
+                selection.frame.codec,
+                selection.frame.timestamp,
+                selection.frame.data.len()
+            );
+            return Ok(selection);
         }
 
         let Some(hub) = self.stream_manager.get_hub(stream_id) else {
@@ -232,10 +367,31 @@ impl SnapshotManager {
             stream_id, requested
         );
 
-        let deadline = Instant::now() + self.config.wait_keyframe;
+        let wait_budget = self.keyframe_wait_for(stream_id);
+        debug!(
+            "[Snapshot] wait fresh IDR stream='{}' wait_budget_ms={} latest_seq={} oldest_seq={:?} empty={}",
+            stream_id,
+            wait_budget.as_millis(),
+            hub.latest_seq(),
+            hub.oldest_seq(),
+            hub.is_empty()
+        );
+        let wait_started = Instant::now();
+        let deadline = wait_started + wait_budget;
+        let mut polls = 0u64;
         while Instant::now() < deadline {
-            if let Some(frame) = self.find_snapshot_frame(stream_id) {
-                return Ok(frame);
+            if let Some(selection) = self.find_snapshot_frame(stream_id) {
+                debug!(
+                    "[Snapshot] fresh IDR ready stream='{}' seq={} codec={:?} ts={} bytes={} waited_ms={} polls={}",
+                    stream_id,
+                    selection.seq,
+                    selection.frame.codec,
+                    selection.frame.timestamp,
+                    selection.frame.data.len(),
+                    wait_started.elapsed().as_millis(),
+                    polls
+                );
+                return Ok(selection);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -243,37 +399,172 @@ impl SnapshotManager {
             }
             let wait_for = remaining.min(Duration::from_millis(200));
             let _ = timeout(wait_for, notify.changed()).await;
-        }
-
-        if let Some(frame) = self.find_snapshot_frame(stream_id) {
-            return Ok(frame);
-        }
-        Err(anyhow!("no playable H264/H265 keyframe available"))
-    }
-
-    fn find_snapshot_frame(&self, stream_id: &str) -> Option<MediaFrame> {
-        let hub = self.stream_manager.get_hub(stream_id)?;
-        if let Some(frame) = hub.latest_idr_frame() {
-            if Self::is_snapshot_candidate(&frame) {
-                return Some(frame);
+            polls = polls.saturating_add(1);
+            if polls == 1 || polls % 5 == 0 {
+                debug!(
+                    "[Snapshot] still waiting IDR stream='{}' waited_ms={} remaining_ms={} latest_seq={} polls={}",
+                    stream_id,
+                    wait_started.elapsed().as_millis(),
+                    remaining.as_millis(),
+                    hub.latest_seq(),
+                    polls
+                );
             }
         }
 
-        let latest = hub.latest_seq();
+        if let Some(selection) = self.find_snapshot_frame(stream_id) {
+            debug!(
+                "[Snapshot] IDR found at deadline stream='{}' seq={} codec={:?} ts={} bytes={} waited_ms={} polls={}",
+                stream_id,
+                selection.seq,
+                selection.frame.codec,
+                selection.frame.timestamp,
+                selection.frame.data.len(),
+                wait_started.elapsed().as_millis(),
+                polls
+            );
+            return Ok(selection);
+        }
+        debug!(
+            "[Snapshot] no IDR after wait stream='{}' waited_ms={} latest_seq={} oldest_seq={:?} empty={} polls={}",
+            stream_id,
+            wait_started.elapsed().as_millis(),
+            hub.latest_seq(),
+            hub.oldest_seq(),
+            hub.is_empty(),
+            polls
+        );
+        Err(anyhow!("no playable H264/H265 keyframe available"))
+    }
+
+    fn find_snapshot_frame(&self, stream_id: &str) -> Option<SnapshotSelection> {
+        let hub = self.stream_manager.get_hub(stream_id)?;
+        if let Some(seq) = hub.latest_idr_seq() {
+            if let Some(frame) = hub.get(seq) {
+                if Self::is_snapshot_candidate(&frame) && is_idr_frame(&frame) {
+                    debug!(
+                        "[Snapshot] found latest playable IDR stream='{}' seq={} codec={:?} ts={} bytes={}",
+                        stream_id,
+                        seq,
+                        frame.codec,
+                        frame.timestamp,
+                        frame.data.len()
+                    );
+                    return Some(SnapshotSelection {
+                        frame,
+                        seq,
+                        h264_intra_fallback: false,
+                    });
+                }
+            }
+        }
+
         if hub.is_empty() {
             return None;
         }
+        let latest = hub.latest_seq();
         let oldest = hub.oldest_seq().unwrap_or(0);
-        let from = latest.saturating_sub(SNAPSHOT_RING_LOOKBACK).max(oldest);
-        hub.frames_from(from, latest)
-            .into_iter()
-            .rev()
-            .find(|frame| Self::is_snapshot_candidate(frame) && is_idr_frame(frame))
+        let from = latest.saturating_sub(120).max(oldest);
+        for seq in (from..=latest).rev() {
+            let Some(stored) = hub.get_stored(seq) else {
+                continue;
+            };
+            if !stored.is_keyframe || stored.data.is_empty() {
+                continue;
+            }
+            let frame = stored.to_media_frame();
+            if Self::is_snapshot_candidate(&frame) && is_idr_frame(&frame) {
+                debug!(
+                    "[Snapshot] found fallback IDR stream='{}' seq={} from_seq={} to_seq={} codec={:?} ts={} bytes={}",
+                    stream_id,
+                    seq,
+                    from,
+                    latest,
+                    frame.codec,
+                    frame.timestamp,
+                    frame.data.len()
+                );
+                return Some(SnapshotSelection {
+                    frame,
+                    seq,
+                    h264_intra_fallback: false,
+                });
+            }
+        }
+
+        if hub.stream().source == StreamSourceMode::Pull {
+            let stream = hub.stream();
+            let has_h264_config = stream.sps.is_some() && stream.pps.is_some();
+            if !has_h264_config {
+                debug!(
+                    "[Snapshot] skip H264 intra fallback without SPS/PPS stream='{}' latest_seq={} oldest_seq={:?}",
+                    stream_id,
+                    latest,
+                    hub.oldest_seq()
+                );
+                return None;
+            }
+            let from = latest.saturating_sub(SNAPSHOT_RING_LOOKBACK).max(oldest);
+            for seq in (from..=latest).rev() {
+                let Some(stored) = hub.get_stored(seq) else {
+                    continue;
+                };
+                if stored.data.is_empty() {
+                    continue;
+                }
+                let frame = stored.to_media_frame();
+                if Self::is_snapshot_candidate(&frame) && is_snapshot_h264_intra_candidate(&frame) {
+                    debug!(
+                        "[Snapshot] found H264 intra fallback stream='{}' seq={} from_seq={} to_seq={} ts={} bytes={}",
+                        stream_id,
+                        seq,
+                        from,
+                        latest,
+                        frame.timestamp,
+                        frame.data.len()
+                    );
+                    return Some(SnapshotSelection {
+                        frame,
+                        seq,
+                        h264_intra_fallback: true,
+                    });
+                }
+            }
+        }
+        None
     }
 
     fn is_snapshot_candidate(frame: &MediaFrame) -> bool {
         is_playable_video_frame(frame) && !frame.data.is_empty()
     }
+
+    fn keyframe_wait_for(&self, stream_id: &str) -> Duration {
+        let base = self.config.wait_keyframe;
+        let is_pull = self
+            .stream_manager
+            .get_hub(stream_id)
+            .map(|hub| hub.stream().source == StreamSourceMode::Pull)
+            .unwrap_or(false);
+        if is_pull {
+            base.max(Duration::from_millis(PULL_WAIT_KEYFRAME_MS))
+        } else {
+            base
+        }
+    }
+
+    fn capture_job_timeout_for(&self, stream_id: &str) -> Duration {
+        let is_pull = self
+            .stream_manager
+            .get_hub(stream_id)
+            .map(|hub| hub.stream().source == StreamSourceMode::Pull)
+            .unwrap_or(false);
+        if is_pull {
+            Duration::from_secs(PULL_CAPTURE_JOB_TIMEOUT_SECS)
+        } else {
+            Duration::from_secs(DEFAULT_CAPTURE_JOB_TIMEOUT_SECS)
+        }
+    }
+
     fn upsert(&self, entry: SnapshotEntry) {
         let mut index = self.index.write();
         if let Some(existing) = index.iter_mut().find(|existing| existing.id == entry.id) {
@@ -299,6 +590,14 @@ impl SnapshotManager {
             entry.bytes = bytes;
             entry.status = "completed".to_string();
             entry.error = None;
+            debug!(
+                "[Snapshot] status completed stream='{}' id='{}' source_ts={} path='{}' bytes={}",
+                entry.stream_id,
+                id,
+                source_timestamp,
+                image_path.display(),
+                bytes
+            );
         }
     }
 
@@ -308,6 +607,12 @@ impl SnapshotManager {
             entry.completed_at_ms = Some(now_ms());
             entry.status = "error".to_string();
             entry.error = Some(error);
+            debug!(
+                "[Snapshot] status error stream='{}' id='{}' error='{}'",
+                entry.stream_id,
+                id,
+                entry.error.as_deref().unwrap_or("")
+            );
         }
     }
 }
@@ -318,20 +623,48 @@ fn run_ffmpeg_snapshot_blocking(
     raw_path: PathBuf,
     image_path: PathBuf,
     timeout_budget: Duration,
+    h264_intra_fallback: bool,
 ) -> Result<()> {
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::Instant as StdInstant;
 
-    let mut child = Command::new(&ffmpeg_path)
+    debug!(
+        "[Snapshot] ffmpeg command start ffmpeg='{}' input_format='{}' raw='{}' image='{}' timeout_ms={}",
+        ffmpeg_path,
+        input_format,
+        raw_path.display(),
+        image_path.display(),
+        timeout_budget.as_millis()
+    );
+    let mut command = Command::new(&ffmpeg_path);
+    command
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
-        .arg("-y")
+        .arg("-y");
+    if input_format == "h264" {
+        command
+            .arg("-err_detect")
+            .arg("ignore_err")
+            .arg("-max_error_rate")
+            .arg("2")
+            .arg("-flags2")
+            .arg("+showall");
+    }
+    let mut child = command
         .arg("-f")
-        .arg(&input_format)
+        .arg(input_format)
         .arg("-i")
         .arg(&raw_path)
+        .args(if h264_intra_fallback {
+            vec![
+                "-vf".to_string(),
+                format!("select=gte(n\\,{SNAPSHOT_H264_INTRA_SKIP_DECODED_FRAMES})"),
+            ]
+        } else {
+            Vec::new()
+        })
         .arg("-frames:v")
         .arg("1")
         .arg("-q:v")
@@ -341,31 +674,84 @@ fn run_ffmpeg_snapshot_blocking(
         .arg(&image_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawn {ffmpeg_path}"))?;
 
     let started = StdInstant::now();
+    debug!(
+        "[Snapshot] ffmpeg process spawned pid={:?} raw='{}' image='{}'",
+        child.id(),
+        raw_path.display(),
+        image_path.display()
+    );
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) if status.success() => {
+                let stderr = read_child_stderr(&mut child);
+                debug!(
+                    "[Snapshot] ffmpeg process exited successfully status={} elapsed_ms={} image='{}' stderr='{}'",
+                    status,
+                    started.elapsed().as_millis(),
+                    image_path.display(),
+                    stderr
+                );
+                return Ok(());
+            }
             Ok(Some(status)) => {
-                return Err(anyhow!("ffmpeg snapshot failed: exit {status}"));
+                let stderr = read_child_stderr(&mut child);
+                debug!(
+                    "[Snapshot] ffmpeg process failed status={} elapsed_ms={} raw='{}' image='{}' stderr='{}'",
+                    status,
+                    started.elapsed().as_millis(),
+                    raw_path.display(),
+                    image_path.display(),
+                    stderr
+                );
+                return Err(anyhow!("ffmpeg snapshot failed: exit {status}: {stderr}"));
             }
             Ok(None) => {
                 if started.elapsed() >= timeout_budget {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let stderr = read_child_stderr(&mut child);
+                    debug!(
+                        "[Snapshot] ffmpeg process timeout elapsed_ms={} timeout_ms={} raw='{}' image='{}' stderr='{}'",
+                        started.elapsed().as_millis(),
+                        timeout_budget.as_millis(),
+                        raw_path.display(),
+                        image_path.display(),
+                        stderr
+                    );
                     return Err(anyhow!(
-                        "ffmpeg snapshot timed out after {}s",
-                        timeout_budget.as_secs()
+                        "ffmpeg snapshot timed out after {}s: {}",
+                        timeout_budget.as_secs(),
+                        stderr
                     ));
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(anyhow!("ffmpeg wait error: {e}")),
+            Err(e) => {
+                debug!(
+                    "[Snapshot] ffmpeg wait error raw='{}' image='{}' error='{}'",
+                    raw_path.display(),
+                    image_path.display(),
+                    e
+                );
+                return Err(anyhow!("ffmpeg wait error: {e}"));
+            }
         }
     }
+}
+
+fn read_child_stderr(child: &mut std::process::Child) -> String {
+    use std::io::Read;
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    stderr.trim().replace('\n', " | ")
 }
 
 fn ffmpeg_raw_video_format(codec: CodecType) -> Result<&'static str> {
@@ -388,8 +774,9 @@ fn prepare_video_snapshot_frame(
     manager: &StreamManager,
     stream_id: &str,
     frame: MediaFrame,
+    idr_seq: u64,
 ) -> MediaFrame {
-    let au = ensure_annex_b(&frame.data);
+    let au = collect_snapshot_video_annex_b(manager, stream_id, &frame, idr_seq);
     let data = manager
         .get_stream(&stream_id.to_string())
         .map(|stream| {
@@ -418,8 +805,181 @@ fn prepare_video_snapshot_frame(
     }
 }
 
+fn collect_snapshot_video_annex_b(
+    manager: &StreamManager,
+    stream_id: &str,
+    selected: &MediaFrame,
+    idr_seq: u64,
+) -> Vec<u8> {
+    let Some(hub) = manager.get_hub(stream_id) else {
+        return ensure_annex_b(&selected.data);
+    };
+
+    let latest = hub.latest_seq();
+    let oldest = hub.oldest_seq().unwrap_or(idr_seq);
+    let use_preroll = !selected.is_keyframe
+        && selected.codec == CodecType::H264
+        && is_snapshot_h264_intra_candidate(selected);
+    let start_seq = if use_preroll {
+        idr_seq
+            .saturating_sub(SNAPSHOT_H264_INTRA_PREROLL_FRAMES)
+            .max(oldest)
+    } else {
+        idr_seq
+    };
+    let mut out = Vec::new();
+    let mut frames = 0usize;
+    let mut bytes = 0usize;
+    let mut stopped_at_next_gop = false;
+
+    for seq in start_seq..=latest {
+        let Some(frame) = hub.get(seq) else {
+            continue;
+        };
+        if frame.track_id != selected.track_id || frame.codec != selected.codec {
+            continue;
+        }
+        if !use_preroll && frames > 0 && frame.is_keyframe {
+            stopped_at_next_gop = true;
+            break;
+        }
+        let annex = ensure_annex_b(&frame.data);
+        if annex.is_empty() {
+            continue;
+        }
+        if frames > 0 && bytes.saturating_add(annex.len()) > SNAPSHOT_MAX_RAW_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(annex.len());
+        out.extend_from_slice(&annex);
+        frames += 1;
+        if frames >= SNAPSHOT_MAX_VIDEO_FRAMES {
+            break;
+        }
+    }
+
+    if out.is_empty() {
+        out = ensure_annex_b(&selected.data);
+        frames = usize::from(!out.is_empty());
+        bytes = out.len();
+    }
+
+    debug!(
+        "[Snapshot] collected raw video stream='{}' idr_seq={} start_seq={} latest_seq={} frames={} bytes={} codec={:?} preroll={} stopped_at_next_gop={}",
+        stream_id,
+        idr_seq,
+        start_seq,
+        latest,
+        frames,
+        bytes,
+        selected.codec,
+        use_preroll,
+        stopped_at_next_gop
+    );
+    out
+}
+
+fn is_snapshot_h264_intra_candidate(frame: &MediaFrame) -> bool {
+    if frame.codec != CodecType::H264 {
+        return false;
+    }
+    let annex_b = ensure_annex_b(&frame.data);
+    iter_annex_b_nal_ranges(&annex_b)
+        .into_iter()
+        .any(|(start, end)| h264_slice_type(&annex_b[start..end]).is_some_and(is_h264_intra_slice))
+}
+
+fn is_h264_intra_slice(slice_type: u32) -> bool {
+    matches!(slice_type % 5, 2 | 4)
+}
+
+fn h264_slice_type(nal: &[u8]) -> Option<u32> {
+    if nal.len() < 2 || (nal[0] & 0x1F) != 1 {
+        return None;
+    }
+    let rbsp = h264_rbsp_from_ebsp(&nal[1..]);
+    let mut reader = BitReader::new(&rbsp);
+    let _first_mb_in_slice = reader.read_ue()?;
+    reader.read_ue()
+}
+
+fn h264_rbsp_from_ebsp(ebsp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ebsp.len());
+    let mut zeros = 0usize;
+    for &byte in ebsp {
+        if zeros >= 2 && byte == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        out.push(byte);
+        if byte == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+    }
+    out
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    fn read_bit(&mut self) -> Option<u8> {
+        if self.bit_pos >= self.data.len() * 8 {
+            return None;
+        }
+        let byte = self.data[self.bit_pos / 8];
+        let shift = 7 - (self.bit_pos % 8);
+        self.bit_pos += 1;
+        Some((byte >> shift) & 1)
+    }
+
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zero_bits = 0u32;
+        while self.read_bit()? == 0 {
+            leading_zero_bits += 1;
+            if leading_zero_bits > 31 {
+                return None;
+            }
+        }
+        let mut value = 1u32 << leading_zero_bits;
+        for shift in (0..leading_zero_bits).rev() {
+            value |= (self.read_bit()? as u32) << shift;
+        }
+        Some(value - 1)
+    }
+}
+
 fn sanitize_path_component(input: &str) -> String {
-    input
+    let sanitized: String = input
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else if c.is_control() || matches!(c, '/' | '\\' | ':' | '\0') {
+                '_'
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "_".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn snapshot_id_component(input: &str) -> String {
+    let sanitized: String = input
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
@@ -428,7 +988,13 @@ fn sanitize_path_component(input: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "stream".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn now_ms() -> u64 {
@@ -456,6 +1022,15 @@ mod tests {
     #[test]
     fn sanitizes_stream_id_for_path() {
         assert_eq!(sanitize_path_component("cam/a:b"), "cam_a_b");
+        assert_eq!(sanitize_path_component("重庆卫视"), "重庆卫视");
+        assert_eq!(sanitize_path_component("大湾区/卫视"), "大湾区_卫视");
+    }
+
+    #[test]
+    fn snapshot_id_component_is_url_and_file_safe() {
+        assert_eq!(snapshot_id_component("cam/a:b"), "cam_a_b");
+        assert_eq!(snapshot_id_component("大湾区/卫视"), "stream");
+        assert_eq!(snapshot_id_component("cam-01_main"), "cam-01_main");
     }
 
     #[test]
@@ -479,7 +1054,7 @@ mod tests {
         )
         .with_clock_rate(VIDEO_RTP_CLOCK_RATE);
 
-        let prepared = prepare_video_snapshot_frame(&manager, "s", frame);
+        let prepared = prepare_video_snapshot_frame(&manager, "s", frame, 0);
 
         assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x67]));
         assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x68]));
@@ -507,7 +1082,7 @@ mod tests {
         )
         .with_clock_rate(VIDEO_RTP_CLOCK_RATE);
 
-        let prepared = prepare_video_snapshot_frame(&manager, "s", frame);
+        let prepared = prepare_video_snapshot_frame(&manager, "s", frame, 0);
 
         assert!(prepared
             .data
@@ -537,6 +1112,102 @@ mod tests {
         assert_eq!(raw_video_extension(CodecType::H265).unwrap(), "h265");
     }
 
+    #[test]
+    fn snapshot_frame_includes_following_video_frames_from_idr() {
+        let manager = StreamManager::new();
+        manager.create_stream("s", StreamSourceMode::Pull, StreamProtocol::HLS, None);
+        manager.set_stream_sps_pps("s", vec![0x67, 0x42], vec![0x68, 0xce]);
+
+        let idr = MediaFrame::new(
+            "s".to_string(),
+            0,
+            1_000,
+            Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x88]),
+            true,
+            CodecType::H264,
+        );
+        let p_frame = MediaFrame::new(
+            "s".to_string(),
+            0,
+            1_033,
+            Bytes::from_static(&[0, 0, 0, 1, 0x41, 0x9a]),
+            false,
+            CodecType::H264,
+        );
+
+        manager.publish_frame(idr.clone());
+        manager.publish_frame(p_frame);
+
+        let prepared = prepare_video_snapshot_frame(&manager, "s", idr, 0);
+
+        assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x65]));
+        assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x41]));
+    }
+
+    #[test]
+    fn hls_snapshot_can_fallback_to_h264_intra_slice_without_idr() {
+        let stream_manager = Arc::new(StreamManager::new());
+        stream_manager.create_stream("s", StreamSourceMode::Pull, StreamProtocol::HLS, None);
+        stream_manager.set_stream_sps_pps("s", vec![0x67, 0x42], vec![0x68, 0xce]);
+        let p_frame = MediaFrame::new(
+            "s".to_string(),
+            0,
+            1_000,
+            Bytes::from_static(&[0, 0, 0, 1, 0x41, 0x9a]),
+            false,
+            CodecType::H264,
+        );
+        let i_slice = MediaFrame::new(
+            "s".to_string(),
+            0,
+            1_033,
+            Bytes::from_static(&[0, 0, 0, 1, 0x41, 0xb0]),
+            false,
+            CodecType::H264,
+        );
+        stream_manager.publish_frame(p_frame);
+        stream_manager.publish_frame(i_slice);
+
+        let snapshot = SnapshotManager::new(stream_manager, SnapshotConfig::default());
+        let selection = snapshot
+            .find_snapshot_frame("s")
+            .expect("H264 I-slice should be usable as snapshot fallback");
+
+        assert_eq!(selection.seq, 1);
+        assert!(!selection.frame.is_keyframe);
+        assert!(is_snapshot_h264_intra_candidate(&selection.frame));
+    }
+
+    #[test]
+    fn h264_intra_fallback_collects_preroll_frames() {
+        let manager = StreamManager::new();
+        manager.create_stream("s", StreamSourceMode::Pull, StreamProtocol::HLS, None);
+        manager.set_stream_sps_pps("s", vec![0x67, 0x42], vec![0x68, 0xce]);
+        let preroll = MediaFrame::new(
+            "s".to_string(),
+            0,
+            1_000,
+            Bytes::from_static(&[0, 0, 0, 1, 0x41, 0x9a]),
+            false,
+            CodecType::H264,
+        );
+        let i_slice = MediaFrame::new(
+            "s".to_string(),
+            0,
+            1_033,
+            Bytes::from_static(&[0, 0, 0, 1, 0x41, 0xb0]),
+            false,
+            CodecType::H264,
+        );
+        manager.publish_frame(preroll);
+        manager.publish_frame(i_slice.clone());
+
+        let collected = collect_snapshot_video_annex_b(&manager, "s", &i_slice, 1);
+
+        assert!(collected.windows(6).any(|w| w == [0, 0, 0, 1, 0x41, 0x9a]));
+        assert!(collected.windows(6).any(|w| w == [0, 0, 0, 1, 0x41, 0xb0]));
+    }
+
     #[tokio::test]
     async fn submit_snapshot_returns_pending_entry() {
         let stream_manager = Arc::new(StreamManager::new());
@@ -558,6 +1229,35 @@ mod tests {
 
         assert_eq!(entry.status, "pending");
         assert!(entry.path.is_none());
+        assert!(manager.get(&entry.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_snapshot_uses_safe_id_for_stream_name_with_slash() {
+        let stream_manager = Arc::new(StreamManager::new());
+        stream_manager.create_stream(
+            "大湾区/卫视",
+            StreamSourceMode::Pull,
+            StreamProtocol::HLS,
+            None,
+        );
+        let manager = SnapshotManager::new(
+            stream_manager,
+            SnapshotConfig {
+                enabled: true,
+                wait_keyframe: Duration::from_millis(1),
+                ..SnapshotConfig::default()
+            },
+        );
+
+        let entry = manager
+            .submit(CaptureSnapshotRequest {
+                stream_id: "大湾区/卫视".to_string(),
+            })
+            .expect("submit snapshot");
+
+        assert!(entry.id.starts_with("snap_stream_"));
+        assert!(!entry.id.contains('/'));
         assert!(manager.get(&entry.id).is_some());
     }
 }

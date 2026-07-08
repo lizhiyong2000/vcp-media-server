@@ -123,6 +123,10 @@ impl FrameRing {
         self.idr_seqs.back().copied()
     }
 
+    pub fn iter_idr_seqs_rev(&self) -> impl Iterator<Item = u64> + '_ {
+        self.idr_seqs.iter().rev().copied()
+    }
+
     pub fn latest_idr_frame(&self) -> Option<MediaFrame> {
         let seq = self.latest_idr_seq()?;
         self.get(seq).map(|f| f.to_media_frame())
@@ -145,6 +149,26 @@ impl FrameRing {
         out
     }
 
+    pub fn find_frame_rev(
+        &self,
+        from_seq: u64,
+        to_seq: u64,
+        mut predicate: impl FnMut(&StoredFrame) -> bool,
+    ) -> Option<MediaFrame> {
+        for f in self.slots.iter().rev() {
+            if f.seq < from_seq {
+                break;
+            }
+            if f.seq > to_seq {
+                continue;
+            }
+            if predicate(f) {
+                return Some(f.to_media_frame());
+            }
+        }
+        None
+    }
+
     fn needs_evict(&self) -> bool {
         self.slots.len() > self.capacity_frames || self.bytes_used > self.capacity_bytes
     }
@@ -154,7 +178,12 @@ impl FrameRing {
             if self.gop_starts.len() > MIN_GOPS_RETAINED {
                 self.evict_oldest_gop();
             } else if self.slots.len() > 1 {
+                let before_len = self.slots.len();
+                let before_bytes = self.bytes_used;
                 self.evict_front_until_keyframe_or_empty();
+                if self.slots.len() == before_len && self.bytes_used == before_bytes {
+                    self.evict_oldest_non_key_after_front();
+                }
             } else {
                 break;
             }
@@ -178,6 +207,15 @@ impl FrameRing {
             if let Some(f) = self.slots.pop_front() {
                 self.bytes_used = self.bytes_used.saturating_sub(f.data.len());
             }
+        }
+    }
+
+    fn evict_oldest_non_key_after_front(&mut self) {
+        if self.slots.len() <= 1 {
+            return;
+        }
+        if let Some(f) = self.slots.remove(1) {
+            self.bytes_used = self.bytes_used.saturating_sub(f.data.len());
         }
     }
 
@@ -254,6 +292,17 @@ mod tests {
         )
     }
 
+    fn audio_frame(seq_ts: u64) -> MediaFrame {
+        MediaFrame::new(
+            "s1".into(),
+            1,
+            seq_ts,
+            Bytes::from(vec![0x12, 0x10, 0x56]),
+            false,
+            CodecType::AAC,
+        )
+    }
+
     #[test]
     fn push_assigns_monotonic_seq() {
         let mut ring = FrameRing::new();
@@ -303,5 +352,19 @@ mod tests {
         assert!(ring.get(2).is_none());
         assert!(ring.get(3).is_some());
         assert!(ring.get(4).is_some());
+    }
+
+    #[test]
+    fn evict_makes_progress_when_single_gop_exceeds_capacity_with_audio() {
+        let mut ring = FrameRing::with_capacity(4, 1024);
+        let idr_seq = ring.push(video_frame(1, true));
+
+        for i in 0..20 {
+            ring.push(audio_frame(2 + i));
+        }
+
+        assert!(ring.len() <= 4);
+        assert!(ring.get(idr_seq).is_some());
+        assert_eq!(ring.latest_idr_seq(), Some(idr_seq));
     }
 }

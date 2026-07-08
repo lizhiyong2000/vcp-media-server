@@ -162,6 +162,23 @@ impl StreamHub {
         self.ring.read().latest_idr_frame()
     }
 
+    pub fn latest_playable_idr_frame<F>(&self, mut is_match: F) -> Option<MediaFrame>
+    where
+        F: FnMut(&MediaFrame) -> bool,
+    {
+        let ring = self.ring.read();
+        for seq in ring.iter_idr_seqs_rev() {
+            let Some(stored) = ring.get(seq) else {
+                continue;
+            };
+            let frame = stored.to_media_frame();
+            if is_match(&frame) {
+                return Some(frame);
+            }
+        }
+        None
+    }
+
     pub fn latest_idr_seq(&self) -> Option<u64> {
         self.ring.read().latest_idr_seq()
     }
@@ -175,6 +192,17 @@ impl StreamHub {
 
     pub fn frames_from(&self, from_seq: u64, to_seq: u64) -> Vec<MediaFrame> {
         self.ring.read().frames_from(from_seq, to_seq)
+    }
+
+    pub fn find_frame_rev(
+        &self,
+        from_seq: u64,
+        to_seq: u64,
+        predicate: impl FnMut(&StoredFrame) -> bool,
+    ) -> Option<MediaFrame> {
+        self.ring
+            .read()
+            .find_frame_rev(from_seq, to_seq, predicate)
     }
 
     pub fn oldest_seq(&self) -> Option<u64> {

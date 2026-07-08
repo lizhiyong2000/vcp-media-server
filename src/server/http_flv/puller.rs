@@ -75,11 +75,17 @@ pub(crate) fn resolve_relative_url(base_url: &str, path: &str) -> String {
     if path.starts_with("http") || path.starts_with("https") {
         return path.to_string();
     }
-    let base = base_url.rsplit_once('/').map(|(b, _)| b.to_string()).unwrap_or_else(|| base_url.to_string());
+    let base = base_url
+        .rsplit_once('/')
+        .map(|(b, _)| b.to_string())
+        .unwrap_or_else(|| base_url.to_string());
     if path.starts_with('/') {
         if let Some(host_end) = base_url.find("://") {
             let host_start = host_end + 3;
-            let host_end2 = base_url[host_start..].find('/').map(|p| host_start + p).unwrap_or(base_url.len());
+            let host_end2 = base_url[host_start..]
+                .find('/')
+                .map(|p| host_start + p)
+                .unwrap_or(base_url.len());
             format!("{}{}", &base_url[..host_end2], path)
         } else {
             format!("{}{}", base, path)
@@ -184,10 +190,7 @@ impl FlvPuller {
         if content_type.contains("video/mp2t") || actual_url.ends_with(".ts") {
             // Download entire response and parse as TS
             let bytes = response.bytes().await?;
-            info!(
-                "[FLV Puller] Downloaded {} bytes of TS data",
-                bytes.len()
-            );
+            info!("[FLV Puller] Downloaded {} bytes of TS data", bytes.len());
             tokio::spawn(async move {
                 if let Err(e) = process_ts_segment(&bytes, &manager, &local_id).await {
                     error!("[FLV Puller] TS processing error: {}", e);
@@ -197,9 +200,7 @@ impl FlvPuller {
         } else {
             // FLV streaming - read as byte stream
             tokio::spawn(async move {
-                if let Err(e) =
-                    process_flv_stream(response, &manager, &local_id).await
-                {
+                if let Err(e) = process_flv_stream(response, &manager, &local_id).await {
                     error!("[FLV Puller] Stream processing error: {}", e);
                 }
                 let _ = manager.set_stopped(&local_id);
@@ -232,11 +233,7 @@ async fn resolve_hls_to_first_segment(url: &str) -> Result<Option<String>> {
     }
 }
 
-async fn process_ts_segment(
-    data: &[u8],
-    manager: &StreamManager,
-    stream_id: &str,
-) -> Result<()> {
+async fn process_ts_segment(data: &[u8], manager: &StreamManager, stream_id: &str) -> Result<()> {
     use crate::server::hls::ts_parser;
 
     let packets = ts_parser::find_ts_packets(data);
@@ -256,8 +253,13 @@ async fn process_ts_segment(
     }
 
     info!("[TS Puller] PMT PIDs: {:?}", pmt_pids);
-    let (video_pid, audio_pid) = ts_parser::parse_pmt(&packets, pmt_pids[0]);
-    info!("[TS Puller] Video PID={:?} Audio PID={:?}", video_pid, audio_pid);
+    let pmt_info = ts_parser::parse_pmt_info(&packets, pmt_pids[0]);
+    let (video_pid, audio_pid) = (pmt_info.video_pid, pmt_info.audio_pid);
+    let mut video_ts_codec = pmt_info.video_codec;
+    info!(
+        "[TS Puller] Video PID={:?} Audio PID={:?} codec={:?}",
+        video_pid, audio_pid, video_ts_codec
+    );
 
     let mut all_video_pid = video_pid;
     let mut all_audio_pid = audio_pid;
@@ -265,30 +267,39 @@ async fn process_ts_segment(
     // Try all PMT PIDs
     if all_video_pid.is_none() {
         for &pid in &pmt_pids[1..] {
-            let (v, a) = ts_parser::parse_pmt(&packets, pid);
+            let info = ts_parser::parse_pmt_info(&packets, pid);
             if all_video_pid.is_none() {
-                all_video_pid = v;
+                all_video_pid = info.video_pid;
+                video_ts_codec = info.video_codec;
             }
             if all_audio_pid.is_none() {
-                all_audio_pid = a;
+                all_audio_pid = info.audio_pid;
             }
         }
     }
 
     let video_pid = all_video_pid.ok_or_else(|| anyhow!("No video PID found"))?;
-    info!("[TS Puller] Using Video PID={} Audio PID={:?}", video_pid, all_audio_pid);
+    info!(
+        "[TS Puller] Using Video PID={} Audio PID={:?}",
+        video_pid, all_audio_pid
+    );
 
-    let es_map = ts_parser::extract_es_data(&packets, video_pid, all_audio_pid.unwrap_or(0xFFFF));
+    let es_map = ts_parser::extract_es_data_with_codec(
+        &packets,
+        video_pid,
+        all_audio_pid.unwrap_or(0xFFFF),
+        video_ts_codec,
+    );
 
     let mut total_frames = 0u64;
     let mut ts_counter = 0u64;
     let has_audio = es_map.contains_key(&all_audio_pid.unwrap_or(0xFFFF));
 
     // Detect H264 vs H265 from the actual data
-    let (video_codec, actual_video_pid) = detect_video_codec(&es_map, video_pid);
+    let (video_codec, actual_video_pid) = detect_video_codec(&es_map, video_pid, video_ts_codec);
 
     // Process video
-    if let Some(es) = es_map.get(&actual_video_pid) {
+    if let (Some(video_codec), Some(es)) = (video_codec, es_map.get(&actual_video_pid)) {
         info!(
             "[TS Puller] Video ES data: {} bytes codec={:?}",
             es.data.len(),
@@ -304,7 +315,7 @@ async fn process_ts_segment(
         let mut pps_found = false;
         let mut vps_found = false;
 
-        let frames = ts_parser::extract_video_frames(&es.data);
+        let frames = ts_parser::extract_video_frames_with_codec(&es.data, es.codec);
         for (ts_codec, is_key, nal_unit) in &frames {
             // Detect codec from actual NAL
             let actual_codec = if *ts_codec == ts_parser::TsCodec::H265 {
@@ -332,7 +343,7 @@ async fn process_ts_segment(
                         // Update with SPS
                         manager.set_stream_hevc_config(
                             stream_id,
-                            Vec::new(),  // VPS already set
+                            Vec::new(), // VPS already set
                             sps_bytes,
                             Vec::new(),
                             None,
@@ -355,20 +366,28 @@ async fn process_ts_segment(
                 }
             }
 
-            manager.publish_frame(MediaFrame::new(
-                stream_id.to_string(),
-                0,
-                ts_counter,
-                Bytes::from(nal_unit.clone()),
-                *is_key,
-                actual_codec,
-            ).with_clock_rate(MILLISECOND_CLOCK_RATE));
+            manager.publish_frame(
+                MediaFrame::new(
+                    stream_id.to_string(),
+                    0,
+                    ts_counter,
+                    Bytes::from(nal_unit.clone()),
+                    *is_key,
+                    actual_codec,
+                )
+                .with_clock_rate(MILLISECOND_CLOCK_RATE),
+            );
             ts_counter += 33; // approx 33ms per frame at 30fps in ms clock
             total_frames += 1;
         }
         info!(
             "[TS Puller] Published {} video frames for stream {}",
             total_frames, stream_id
+        );
+    } else {
+        info!(
+            "[TS Puller] Skip unsupported or unknown TS video stream {} pid={} ts_codec={:?}",
+            stream_id, video_pid, video_ts_codec
         );
     }
 
@@ -381,20 +400,24 @@ async fn process_ts_segment(
                 let mut audio_ts = 0u64;
                 for aac in &aac_frames {
                     if aac.len() > 1 {
-                        manager.publish_frame(MediaFrame::new(
-                            stream_id.to_string(),
-                            1,
-                            audio_ts,
-                            Bytes::from(aac.clone()),
-                            false,
-                            CodecType::AAC,
-                        ).with_clock_rate(MILLISECOND_CLOCK_RATE));
+                        manager.publish_frame(
+                            MediaFrame::new(
+                                stream_id.to_string(),
+                                1,
+                                audio_ts,
+                                Bytes::from(aac.clone()),
+                                false,
+                                CodecType::AAC,
+                            )
+                            .with_clock_rate(MILLISECOND_CLOCK_RATE),
+                        );
                         audio_ts += 23; // approx 23ms per AAC frame
                     }
                 }
                 info!(
                     "[TS Puller] Published {} AAC frames for stream {}",
-                    aac_frames.len(), stream_id
+                    aac_frames.len(),
+                    stream_id
                 );
             }
         }
@@ -403,8 +426,32 @@ async fn process_ts_segment(
     Ok(())
 }
 
-fn detect_video_codec(es_map: &std::collections::HashMap<u16, crate::server::hls::ts_parser::TsElementaryData>, video_pid: u16) -> (CodecType, u16) {
+fn detect_video_codec(
+    es_map: &std::collections::HashMap<u16, crate::server::hls::ts_parser::TsElementaryData>,
+    video_pid: u16,
+    hinted_codec: crate::server::hls::ts_parser::TsCodec,
+) -> (Option<CodecType>, u16) {
+    match hinted_codec {
+        crate::server::hls::ts_parser::TsCodec::H264 => return (Some(CodecType::H264), video_pid),
+        crate::server::hls::ts_parser::TsCodec::H265 => return (Some(CodecType::H265), video_pid),
+        crate::server::hls::ts_parser::TsCodec::Mpeg2Video
+        | crate::server::hls::ts_parser::TsCodec::AAC => return (None, video_pid),
+        crate::server::hls::ts_parser::TsCodec::Unknown => {}
+    }
+
     if let Some(es) = es_map.get(&video_pid) {
+        match es.codec {
+            crate::server::hls::ts_parser::TsCodec::H264 => {
+                return (Some(CodecType::H264), video_pid)
+            }
+            crate::server::hls::ts_parser::TsCodec::H265 => {
+                return (Some(CodecType::H265), video_pid)
+            }
+            crate::server::hls::ts_parser::TsCodec::Mpeg2Video
+            | crate::server::hls::ts_parser::TsCodec::AAC => return (None, video_pid),
+            crate::server::hls::ts_parser::TsCodec::Unknown => {}
+        }
+
         if !es.data.is_empty() {
             // Check first few bytes for H265 NAL type pattern
             if es.data.len() > 5 {
@@ -415,25 +462,31 @@ fn detect_video_codec(es_map: &std::collections::HashMap<u16, crate::server::hls
                     }
                 }
                 // Check NAL header
-                if let Some(pos) = es.data.windows(5).position(|w| w[0..4] == [0x00, 0x00, 0x00, 0x01] || w[0..3] == [0x00, 0x00, 0x01]) {
-                    let start_pos = if es.data[pos..pos+4] == [0x00, 0x00, 0x00, 0x01] { pos + 4 } else { pos + 3 };
+                if let Some(pos) = es.data.windows(5).position(|w| {
+                    w[0..4] == [0x00, 0x00, 0x00, 0x01] || w[0..3] == [0x00, 0x00, 0x01]
+                }) {
+                    let start_pos = if es.data[pos..pos + 4] == [0x00, 0x00, 0x00, 0x01] {
+                        pos + 4
+                    } else {
+                        pos + 3
+                    };
                     if start_pos < es.data.len() {
                         let nal_header = es.data[start_pos];
                         let h264_nal_type = nal_header & 0x1F;
                         let h265_nal_type = (nal_header & 0x7E) >> 1;
                         // H265 SPS is type 33, H264 SPS is type 7
                         if h264_nal_type == 7 || h264_nal_type == 8 {
-                            return (CodecType::H264, video_pid);
+                            return (Some(CodecType::H264), video_pid);
                         }
                         if h265_nal_type == 32 || h265_nal_type == 33 || h265_nal_type == 34 {
-                            return (CodecType::H265, video_pid);
+                            return (Some(CodecType::H265), video_pid);
                         }
                     }
                 }
             }
         }
     }
-    (CodecType::H264, video_pid) // default
+    (None, video_pid)
 }
 
 async fn process_flv_stream(
@@ -493,16 +546,12 @@ async fn process_flv_stream(
         // Parse FLV tags
         while buf.len() >= 11 {
             let tag_type = buf[0];
-            let data_size = ((buf[1] as u32) << 16)
-                | ((buf[2] as u32) << 8)
-                | buf[3] as u32;
+            let data_size = ((buf[1] as u32) << 16) | ((buf[2] as u32) << 8) | buf[3] as u32;
             let timestamp = ((buf[4] as u32) << 16)
                 | ((buf[5] as u32) << 8)
                 | buf[6] as u32
                 | ((buf[7] as u32) << 24);
-            let _stream_id = ((buf[8] as u32) << 16)
-                | ((buf[9] as u32) << 8)
-                | buf[10] as u32;
+            let _stream_id = ((buf[8] as u32) << 16) | ((buf[9] as u32) << 8) | buf[10] as u32;
 
             let total_tag_size = 11 + data_size as usize + 4; // header + data + prev_tag_size
 
@@ -522,8 +571,7 @@ async fn process_flv_stream(
                                 if let Some(enhanced) =
                                     crate::core::parse_enhanced_hevc_video_message(tag_data)
                                 {
-                                    if enhanced.packet_type
-                                        == crate::core::RTMP_PKT_SEQUENCE_START
+                                    if enhanced.packet_type == crate::core::RTMP_PKT_SEQUENCE_START
                                     {
                                         let (vps, sps, pps) =
                                             crate::core::parse_hevc_decoder_config_record(
@@ -542,9 +590,7 @@ async fn process_flv_stream(
                                                 Some(enhanced.payload.to_vec()),
                                             );
                                             sps_sent = true;
-                                            debug!(
-                                                "[FLV Puller] HEVC sequence header stored"
-                                            );
+                                            debug!("[FLV Puller] HEVC sequence header stored");
                                         }
                                         let _ = buf.split_to(total_tag_size);
                                         continue;
@@ -555,44 +601,36 @@ async fn process_flv_stream(
                                         // AVC sequence header
                                         let config_data = &tag_data[5..];
                                         if config_data.len() > 7 {
-                                            let num_sps =
-                                                (config_data[5] & 0x1F) as usize;
+                                            let num_sps = (config_data[5] & 0x1F) as usize;
                                             let mut offset = 6;
                                             let mut sps_data = Vec::new();
                                             for _ in 0..num_sps {
                                                 if offset + 2 > config_data.len() {
                                                     break;
                                                 }
-                                                let sps_len =
-                                                    ((config_data[offset] as usize) << 8)
-                                                        | config_data[offset + 1] as usize;
+                                                let sps_len = ((config_data[offset] as usize) << 8)
+                                                    | config_data[offset + 1] as usize;
                                                 offset += 2;
                                                 if offset + sps_len > config_data.len() {
                                                     break;
                                                 }
-                                                sps_data = config_data
-                                                    [offset..offset + sps_len]
-                                                    .to_vec();
+                                                sps_data =
+                                                    config_data[offset..offset + sps_len].to_vec();
                                                 offset += sps_len;
                                             }
                                             let mut pps_data = Vec::new();
                                             if offset < config_data.len() {
-                                                let num_pps =
-                                                    config_data[offset] & 0x1F;
+                                                let num_pps = config_data[offset] & 0x1F;
                                                 offset += 1;
                                                 for _ in 0..num_pps as usize {
                                                     if offset + 2 > config_data.len() {
                                                         break;
                                                     }
-                                                    let pps_len =
-                                                        ((config_data[offset] as usize)
-                                                            << 8)
-                                                            | config_data[offset + 1]
-                                                                as usize;
+                                                    let pps_len = ((config_data[offset] as usize)
+                                                        << 8)
+                                                        | config_data[offset + 1] as usize;
                                                     offset += 2;
-                                                    if offset + pps_len
-                                                        > config_data.len()
-                                                    {
+                                                    if offset + pps_len > config_data.len() {
                                                         break;
                                                     }
                                                     pps_data = config_data
@@ -604,9 +642,7 @@ async fn process_flv_stream(
                                             if !sps_data.is_empty() {
                                                 let sps_len = sps_data.len();
                                                 manager.set_stream_sps_pps(
-                                                    stream_id,
-                                                    sps_data,
-                                                    pps_data,
+                                                    stream_id, sps_data, pps_data,
                                                 );
                                                 sps_sent = true;
                                                 debug!("[FLV Puller] AVC sequence header stored: SPS={} PPS={}", sps_len, offset);
@@ -632,7 +668,9 @@ async fn process_flv_stream(
                             let mut frame_to_publish = frame;
                             // Override keyframe flag for HEVC
                             if frame_to_publish.codec == CodecType::H265 {
-                                if let Some(enhanced) = crate::core::parse_enhanced_hevc_video_message(tag_data) {
+                                if let Some(enhanced) =
+                                    crate::core::parse_enhanced_hevc_video_message(tag_data)
+                                {
                                     frame_to_publish.is_keyframe = enhanced.is_keyframe;
                                 }
                             } else {
@@ -647,26 +685,24 @@ async fn process_flv_stream(
                 0x08 => {
                     // Audio tag
                     if !tag_data.is_empty() {
-                        let audio_data = if tag_data.len() > 1
-                            && tag_data[0] == 0xAF
-                            && tag_data[1] == 0x01
-                        {
-                            // AAC raw, skip header
-                            &tag_data[2..]
-                        } else if tag_data.len() > 1 && tag_data[1] == 0x00 {
-                            // AAC sequence header
-                            if !aac_seq_sent {
-                                manager.ensure_aac_track(stream_id);
-                                aac_seq_sent = true;
-                                debug!("[FLV Puller] AAC sequence header processed");
-                            }
-                            let _ = buf.split_to(total_tag_size);
-                            continue;
-                        } else if tag_data.len() > 1 {
-                            &tag_data[1..]
-                        } else {
-                            tag_data
-                        };
+                        let audio_data =
+                            if tag_data.len() > 1 && tag_data[0] == 0xAF && tag_data[1] == 0x01 {
+                                // AAC raw, skip header
+                                &tag_data[2..]
+                            } else if tag_data.len() > 1 && tag_data[1] == 0x00 {
+                                // AAC sequence header
+                                if !aac_seq_sent {
+                                    manager.ensure_aac_track(stream_id);
+                                    aac_seq_sent = true;
+                                    debug!("[FLV Puller] AAC sequence header processed");
+                                }
+                                let _ = buf.split_to(total_tag_size);
+                                continue;
+                            } else if tag_data.len() > 1 {
+                                &tag_data[1..]
+                            } else {
+                                tag_data
+                            };
 
                         if !audio_data.is_empty() && aac_seq_sent {
                             manager.publish_frame(
@@ -702,11 +738,7 @@ async fn process_flv_stream(
     Ok(())
 }
 
-fn flv_video_to_frame(
-    data: &[u8],
-    stream_id: &str,
-    timestamp: u32,
-) -> Option<MediaFrame> {
+fn flv_video_to_frame(data: &[u8], stream_id: &str, timestamp: u32) -> Option<MediaFrame> {
     if data.is_empty() {
         return None;
     }
@@ -770,8 +802,7 @@ fn flv_video_to_frame(
         return None;
     }
 
-    let is_keyframe =
-        is_keyframe || is_keyframe_annex_b(video_codec, &annex_b);
+    let is_keyframe = is_keyframe || is_keyframe_annex_b(video_codec, &annex_b);
 
     Some(
         MediaFrame::new(

@@ -1,20 +1,87 @@
 /// HLS Puller - Pure Rust implementation (no ffmpeg)
 /// Downloads m3u8 playlist, fetches TS segments, parses MPEG-TS to extract
 /// H264/H265 video and AAC audio, publishes via StreamManager.
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tokio::sync::Semaphore;
+use tracing::{debug, error, info, trace, warn};
 
 use crate::core::{
-    default_live_tracks, ensure_annex_b, is_keyframe_annex_b, CodecType, MediaFrame,
-    MediaTransport, StreamManager, StreamProtocol, StreamPuller, StreamSourceMode,
-    TransportStatus, MILLISECOND_CLOCK_RATE,
+    default_live_tracks, is_keyframe_annex_b, CodecType, MediaFrame, MediaTransport, StreamManager,
+    StreamProtocol, StreamPuller, StreamSourceMode, TransportStatus, MILLISECOND_CLOCK_RATE,
 };
 
 use crate::server::http_flv::puller::{parse_m3u8_for_segment, resolve_relative_url};
+
+const HLS_CONCURRENT_SEGMENTS: usize = 3;
+const DECODE_BATCH_PACKETS: usize = 128;
+/// ~5MB TS @ 188 bytes/packet needs ~27k packets → ~210 batches of 128.
+const MAX_DECODE_BATCHES_PER_SEGMENT: usize = 512;
+
+fn hls_segment_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| Semaphore::new(HLS_CONCURRENT_SEGMENTS))
+}
+
+async fn decode_ts_batch(
+    decoder: Arc<Mutex<super::ts_parser::TsStreamDecoder>>,
+    max_packets: usize,
+) -> Result<(Vec<(super::ts_parser::TsCodec, bool, Vec<u8>)>, bool)> {
+    tokio::task::spawn_blocking(move || {
+        let mut guard = decoder
+            .lock()
+            .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
+        if !guard.has_pending_packets() {
+            return Ok((Vec::new(), false));
+        }
+        let before = guard.consumed_packets();
+        let nals = guard.process_packets(max_packets);
+        let more =
+            guard.has_pending_packets() && (guard.consumed_packets() > before || !nals.is_empty());
+        Ok((nals, more))
+    })
+    .await
+    .context("TS decode worker join failed")?
+}
+
+async fn drain_decoder_until_idle(
+    decoder: Arc<Mutex<super::ts_parser::TsStreamDecoder>>,
+    publisher: &mut HlsSegmentPublisher<'_>,
+) -> Result<usize> {
+    let mut published_frames = 0usize;
+    let mut idle_batches = 0u32;
+    for _ in 0..MAX_DECODE_BATCHES_PER_SEGMENT {
+        let has_pending = {
+            let guard = decoder
+                .lock()
+                .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
+            guard.has_pending_packets()
+        };
+        if !has_pending {
+            break;
+        }
+        let (nals, more) = decode_ts_batch(decoder.clone(), DECODE_BATCH_PACKETS).await?;
+        for (ts_codec, is_key, nal_unit) in nals {
+            publisher.publish_nal(ts_codec, is_key, &nal_unit);
+            published_frames += 1;
+            idle_batches = 0;
+        }
+        if !more {
+            break;
+        }
+        if published_frames == 0 {
+            idle_batches += 1;
+            if idle_batches >= 8 {
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(published_frames)
+}
 
 pub struct HlsPuller {
     stream_manager: Arc<StreamManager>,
@@ -60,6 +127,10 @@ impl HlsPuller {
             .set_stream_tracks(local_stream_id, default_live_tracks());
         let _ = self.stream_manager.set_unpublished(local_stream_id);
         self.stream_manager.set_stream_broadcast(local_stream_id);
+        debug!(
+            "[HLS Puller] stream registered stream='{}' remote='{}'",
+            local_stream_id, remote_url
+        );
 
         let manager = self.stream_manager.clone();
         let local_id = local_stream_id.to_string();
@@ -82,20 +153,58 @@ async fn run_hls_pull_loop(
     stream_id: String,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent("vcp-media-server/0.1")
         .build()?;
 
     // Download initial playlist
+    debug!(
+        "[HLS Puller] fetching initial playlist stream='{}' url='{}'",
+        stream_id, playlist_url
+    );
     let resp = client.get(&playlist_url).send().await?;
+    debug!(
+        "[HLS Puller] initial playlist response stream='{}' url='{}' status={} content_length={:?}",
+        stream_id,
+        playlist_url,
+        resp.status(),
+        resp.content_length()
+    );
     let body = resp.text().await?;
+    debug!(
+        "[HLS Puller] initial playlist body stream='{}' url='{}' bytes={} lines={}",
+        stream_id,
+        playlist_url,
+        body.len(),
+        body.lines().count()
+    );
 
     let target = parse_m3u8_for_segment(&body, &playlist_url);
+    debug!(
+        "[HLS Puller] initial playlist target stream='{}' target={:?}",
+        stream_id, target
+    );
 
     let (media_url, mut playlist_body) = match target {
         Some(url) if url.ends_with(".m3u8") && url != playlist_url => {
             info!("[HLS Puller] Fetching variant playlist: {}", url);
             let resp2 = client.get(&url).send().await?;
+            debug!(
+                "[HLS Puller] variant playlist response stream='{}' url='{}' status={} content_length={:?}",
+                stream_id,
+                url,
+                resp2.status(),
+                resp2.content_length()
+            );
             let body2 = resp2.text().await?;
+            debug!(
+                "[HLS Puller] variant playlist body stream='{}' url='{}' bytes={} lines={}",
+                stream_id,
+                url,
+                body2.len(),
+                body2.lines().count()
+            );
             (url, body2)
         }
         Some(_) | None => (playlist_url.clone(), body),
@@ -138,9 +247,20 @@ async fn run_hls_pull_loop(
             break;
         }
     }
+    debug!(
+        "[HLS Puller] playlist codec hints stream='{}' media_url='{}' is_h265={} audio_codec_known={}",
+        stream_id, media_url, is_h265, audio_codec_known
+    );
 
     loop {
         loop_count += 1;
+        debug!(
+            "[HLS Puller] playlist loop start stream='{}' loop={} media_url='{}' downloaded_segments={}",
+            stream_id,
+            loop_count,
+            media_url,
+            downloaded_segments.len()
+        );
 
         if loop_count > 600 {
             info!("[HLS Puller] Reached max loop count (10 min), stopping");
@@ -151,51 +271,110 @@ async fn run_hls_pull_loop(
         let resp = match client.get(&media_url).send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!("[HLS Puller] Failed to fetch playlist: {}", e);
+                warn!(
+                    "[HLS Puller] Failed to fetch playlist stream='{}' url='{}': {}",
+                    stream_id, media_url, e
+                );
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
         };
+        debug!(
+            "[HLS Puller] playlist response stream='{}' loop={} status={} content_length={:?}",
+            stream_id,
+            loop_count,
+            resp.status(),
+            resp.content_length()
+        );
 
         let body = match resp.text().await {
             Ok(b) => b,
             Err(e) => {
-                warn!("[HLS Puller] Failed to read playlist body: {}", e);
+                warn!(
+                    "[HLS Puller] Failed to read playlist body stream='{}' url='{}': {}",
+                    stream_id, media_url, e
+                );
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
         };
         playlist_body = body.clone();
 
-        // Parse segments
-        let segments = parse_media_segments(&body, &media_url);
+        // Parse segments — for live playlists only fetch the newest unseen segments.
+        let parsed_segments = parse_media_segments(&body, &media_url);
+        let segments = select_live_segments(&parsed_segments, &downloaded_segments);
+        debug!(
+            "[HLS Puller] playlist parsed stream='{}' loop={} body_bytes={} parsed_segments={} selected_segments={} downloaded_segments={}",
+            stream_id,
+            loop_count,
+            body.len(),
+            parsed_segments.len(),
+            segments.len(),
+            downloaded_segments.len()
+        );
 
         if segments.is_empty() {
+            debug!(
+                "[HLS Puller] no new segments stream='{}' loop={} parsed_segments={} sleeping_ms=2000",
+                stream_id,
+                loop_count,
+                parsed_segments.len()
+            );
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
 
-        // Download new segments
+        // Download new segments (newest first)
         let mut _new_frames = 0;
         let mut playlist_expired = false;
 
         for seg in &segments {
-            if downloaded_segments.contains(&seg.url) {
-                continue;
-            }
-
             info!(
                 "[HLS Puller] Downloading segment (duration={}s): {}",
+                seg.duration, &seg.url
+            );
+            debug!(
+                "[HLS Puller] segment selected stream='{}' loop={} duration={}s url='{}' timeout_ms={}",
+                stream_id,
+                loop_count,
                 seg.duration,
-                &seg.url
+                seg.url,
+                segment_download_timeout(seg.duration).as_millis()
             );
 
             // Retry segment download up to 2 times
-            let mut seg_data = None;
+            let mut download_ok = false;
+            let seg_timeout = segment_download_timeout(seg.duration);
             for attempt in 0..2 {
-                match download_segment(&client, &seg.url).await {
-                    Ok(d) => {
-                        seg_data = Some(d);
+                debug!(
+                    "[HLS Puller] segment attempt start stream='{}' loop={} attempt={}/2 url='{}'",
+                    stream_id,
+                    loop_count,
+                    attempt + 1,
+                    seg.url
+                );
+                match download_and_process_segment_streaming(
+                    &client,
+                    &seg.url,
+                    seg_timeout,
+                    &manager,
+                    &stream_id,
+                    &mut ts_counter_ms,
+                    &mut sps_pps_stored,
+                    is_h265,
+                    audio_codec_known,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        debug!(
+                            "[HLS Puller] segment attempt success stream='{}' loop={} attempt={}/2 url='{}'",
+                            stream_id,
+                            loop_count,
+                            attempt + 1,
+                            seg.url
+                        );
+                        download_ok = true;
                         break;
                     }
                     Err(e) => {
@@ -204,22 +383,22 @@ async fn run_hls_pull_loop(
                         // this batch and re-fetch the playlist
                         if err_msg.contains("404") {
                             warn!(
-                                "[HLS Puller] Segment 404 (playlist expired), re-fetching: {}",
-                                &seg.url
+                                  "[HLS Puller] Segment 404 (playlist expired), re-fetching stream='{}' url='{}'",
+                                  stream_id, &seg.url
                             );
                             playlist_expired = true;
                             break;
                         }
                         if attempt == 0 {
                             warn!(
-                                "[HLS Puller] Segment download failed (attempt 1/2): {} — {}",
-                                e, &seg.url
+                                  "[HLS Puller] Segment download failed stream='{}' attempt=1/2 error='{}' url='{}'",
+                                  stream_id, e, &seg.url
                             );
                             tokio::time::sleep(Duration::from_millis(500)).await;
                         } else {
                             warn!(
-                                "[HLS Puller] Segment download failed (attempt 2/2): {} — {}",
-                                e, &seg.url
+                                  "[HLS Puller] Segment download failed stream='{}' attempt=2/2 error='{}' url='{}'",
+                                  stream_id, e, &seg.url
                             );
                         }
                     }
@@ -230,25 +409,29 @@ async fn run_hls_pull_loop(
                 break; // Stop processing stale segments, go re-fetch playlist
             }
 
-            let seg_data = match seg_data {
-                Some(d) => d,
-                None => {
-                    // Download failed after retries, mark URL to avoid infinite retry
-                    downloaded_segments.insert(seg.url.clone());
-                    continue;
-                }
-            };
+            if !download_ok {
+                // Download failed after retries, mark URL to avoid infinite retry
+                downloaded_segments.insert(seg.url.clone());
+                debug!(
+                    "[HLS Puller] segment marked failed stream='{}' loop={} url='{}' downloaded_segments={}",
+                    stream_id,
+                    loop_count,
+                    seg.url,
+                    downloaded_segments.len()
+                );
+                continue;
+            }
 
             // Only mark as downloaded after successful download + processing
             downloaded_segments.insert(seg.url.clone());
-
-            if let Err(e) =
-                process_ts_segment_hls(&seg_data, &manager, &stream_id, &mut ts_counter_ms, &mut sps_pps_stored, is_h265, audio_codec_known).await
-            {
-                warn!("[HLS Puller] Failed to process segment: {}", e);
-            } else {
-                _new_frames += 1;
-            }
+            debug!(
+                "[HLS Puller] segment marked downloaded stream='{}' loop={} url='{}' downloaded_segments={}",
+                stream_id,
+                loop_count,
+                seg.url,
+                downloaded_segments.len()
+            );
+            _new_frames += 1;
         }
 
         // If playlist was expired, don't sleep full duration — re-fetch immediately
@@ -257,7 +440,7 @@ async fn run_hls_pull_loop(
             continue;
         }
 
-        // Calculate sleep time based on segment durations
+        // Calculate sleep time based on newest segment duration
         let total_duration: f64 = segments.iter().map(|s| s.duration).sum();
         let sleep_duration = if total_duration > 1.0 {
             Duration::from_secs_f64((total_duration * 0.8).max(1.0))
@@ -266,8 +449,12 @@ async fn run_hls_pull_loop(
         };
 
         debug!(
-            "[HLS Puller] Sleeping {}s before next playlist fetch",
-            sleep_duration.as_secs_f64()
+            "[HLS Puller] sleeping before next playlist fetch stream='{}' loop={} sleep_secs={} processed_segments={} playlist_expired={}",
+            stream_id,
+            loop_count,
+            sleep_duration.as_secs_f64(),
+            _new_frames,
+            playlist_expired
         );
         tokio::time::sleep(sleep_duration).await;
     }
@@ -276,6 +463,7 @@ async fn run_hls_pull_loop(
     Ok(())
 }
 
+#[derive(Clone)]
 struct Segment {
     url: String,
     duration: f64,
@@ -313,12 +501,251 @@ fn parse_media_segments(body: &str, base_url: &str) -> Vec<Segment> {
     segments
 }
 
-async fn download_segment(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
-    let response = client
-        .get(url)
-        .timeout(Duration::from_secs(8))
-        .send()
-        .await?;
+/// Pick up to two newest segments that have not been downloaded yet.
+fn select_live_segments(
+    segments: &[Segment],
+    downloaded: &std::collections::HashSet<String>,
+) -> Vec<Segment> {
+    segments
+        .iter()
+        .rev()
+        .filter(|seg| !downloaded.contains(&seg.url))
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn segment_download_timeout(duration_secs: f64) -> Duration {
+    // Large TS segments over slow links can take 30s+; scale with declared duration.
+    let secs = (duration_secs * 12.0).ceil().max(45.0).min(120.0);
+    Duration::from_secs_f64(secs)
+}
+
+async fn download_and_process_segment_streaming(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    manager: &StreamManager,
+    stream_id: &str,
+    ts_counter_ms: &mut u64,
+    sps_pps_stored: &mut bool,
+    is_h265: bool,
+    has_audio: bool,
+) -> Result<()> {
+    use super::ts_parser::TsStreamDecoder;
+
+    debug!(
+        "[HLS Puller] waiting segment semaphore stream='{}' url='{}' available_permits={} timeout_ms={}",
+        stream_id,
+        url,
+        hls_segment_semaphore().available_permits(),
+        timeout.as_millis()
+    );
+    let _segment_permit = hls_segment_semaphore()
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("HLS segment semaphore closed"))?;
+    debug!(
+        "[HLS Puller] acquired segment semaphore stream='{}' url='{}' available_permits={}",
+        stream_id,
+        url,
+        hls_segment_semaphore().available_permits()
+    );
+
+    let response = client.get(url).timeout(timeout).send().await?;
+    let status = response.status();
+    let content_length = response.content_length();
+    debug!(
+        "[HLS Puller] segment response stream='{}' url='{}' status={} content_length={:?}",
+        stream_id, url, status, content_length
+    );
+
+    if !status.is_success() {
+        return Err(anyhow!("HTTP {} downloading segment: {}", status, url));
+    }
+
+    let decoder = Arc::new(Mutex::new(TsStreamDecoder::new(is_h265)));
+    let mut publisher = HlsSegmentPublisher::new(
+        manager,
+        stream_id,
+        ts_counter_ms,
+        sps_pps_stored,
+        is_h265,
+        has_audio,
+    );
+
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut total = 0usize;
+    let mut published_frames = 0usize;
+    let mut chunks = 0usize;
+    let mut next_progress_log = 512 * 1024usize;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            anyhow!(
+                "error reading segment body (timeout={}s): {} — {}",
+                timeout.as_secs(),
+                e,
+                url
+            )
+        })?;
+        chunks += 1;
+        total += chunk.len();
+        {
+            let mut guard = decoder
+                .lock()
+                .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
+            guard.append(&chunk);
+        }
+        let before = published_frames;
+        published_frames += drain_decoder_until_idle(decoder.clone(), &mut publisher).await?;
+        if chunks == 1 || total >= next_progress_log || published_frames > before {
+            let (raw_len, consumed, has_sync, video_pid, audio_pid, codec) = {
+                let guard = decoder
+                    .lock()
+                    .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
+                (
+                    guard.raw_len(),
+                    guard.consumed_packets(),
+                    guard.has_sync(),
+                    guard.video_pid(),
+                    guard.audio_pid(),
+                    guard.video_codec(),
+                )
+            };
+            debug!(
+                "[HLS Puller] segment streaming progress stream='{}' url='{}' chunks={} bytes={} raw={} consumed_packets={} sync={} video_pid={:?} audio_pid={:?} ts_codec={:?} extracted_nals={} published_video={} published_audio={}",
+                stream_id,
+                url,
+                chunks,
+                total,
+                raw_len,
+                consumed,
+                has_sync,
+                video_pid,
+                audio_pid,
+                codec,
+                published_frames,
+                publisher.published_video_frames,
+                publisher.published_audio_frames
+            );
+            while total >= next_progress_log {
+                next_progress_log += 512 * 1024;
+            }
+        }
+        publisher.ensure_tracks({
+            let guard = decoder
+                .lock()
+                .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
+            guard.video_codec()
+        });
+        tokio::task::yield_now().await;
+    }
+
+    published_frames += drain_decoder_until_idle(decoder.clone(), &mut publisher).await?;
+    debug!(
+        "[HLS Puller] segment stream ended stream='{}' url='{}' chunks={} bytes={} extracted_nals={} published_video={} published_audio={}",
+        stream_id,
+        url,
+        chunks,
+        total,
+        published_frames,
+        publisher.published_video_frames,
+        publisher.published_audio_frames
+    );
+
+    let finish_nals = {
+        let mut guard = decoder
+            .lock()
+            .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
+        guard.finish()
+    };
+    debug!(
+        "[HLS Puller] decoder finish stream='{}' url='{}' pending_nals={}",
+        stream_id,
+        url,
+        finish_nals.len()
+    );
+    for (ts_codec, is_key, nal_unit) in finish_nals {
+        publisher.publish_nal(ts_codec, is_key, &nal_unit);
+        published_frames += 1;
+    }
+    publisher.ensure_tracks({
+        let guard = decoder
+            .lock()
+            .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
+        guard.video_codec()
+    });
+    let audio_es = {
+        let guard = decoder
+            .lock()
+            .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
+        guard.audio_es().to_vec()
+    };
+    debug!(
+        "[HLS Puller] audio ES extracted stream='{}' url='{}' bytes={}",
+        stream_id,
+        url,
+        audio_es.len()
+    );
+    publisher.publish_audio_es(&audio_es);
+
+    if total < 1024 {
+        debug!(
+            "[HLS Puller] segment rejected too small stream='{}' url='{}' bytes={}",
+            stream_id, url, total
+        );
+        return Err(anyhow!(
+            "segment too small ({} bytes), likely truncated: {}",
+            total,
+            url
+        ));
+    }
+    if published_frames == 0 {
+        let (raw_len, consumed, has_sync, video_pid) = {
+            let guard = decoder
+                .lock()
+                .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
+            (
+                guard.raw_len(),
+                guard.consumed_packets(),
+                guard.has_sync(),
+                guard.video_pid(),
+            )
+        };
+        warn!(
+              "[HLS Puller] No frames from segment stream='{}' raw={} consumed_packets={} sync={} video_pid={:?} url='{}'",
+              stream_id, raw_len, consumed, has_sync, video_pid, url
+        );
+        return Err(anyhow!("no video frames extracted from segment: {}", url));
+    }
+    debug!(
+        "[HLS Puller] segment processed stream='{}' url='{}' bytes={} chunks={} extracted_nals={} published_video={} published_audio={} final_ts_ms={} actual_codec={:?} tracks_ready={} has_keyframe={}",
+        stream_id,
+        url,
+        total,
+        chunks,
+        published_frames,
+        publisher.published_video_frames,
+        publisher.published_audio_frames,
+        *publisher.ts_counter_ms,
+        publisher.actual_codec,
+        publisher.tracks_ready,
+        publisher.published_keyframe
+    );
+    Ok(())
+}
+
+async fn download_segment(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let response = client.get(url).timeout(timeout).send().await?;
 
     if !response.status().is_success() {
         return Err(anyhow!(
@@ -328,8 +755,366 @@ async fn download_segment(client: &reqwest::Client, url: &str) -> Result<Vec<u8>
         ));
     }
 
-    let bytes = response.bytes().await?;
+    let bytes = response.bytes().await.map_err(|e| {
+        anyhow!(
+            "error reading segment body (timeout={}s): {} — {}",
+            timeout.as_secs(),
+            e,
+            url
+        )
+    })?;
+    if bytes.len() < 1024 {
+        return Err(anyhow!(
+            "segment too small ({} bytes), likely truncated: {}",
+            bytes.len(),
+            url
+        ));
+    }
     Ok(bytes.to_vec())
+}
+
+struct HlsSegmentPublisher<'a> {
+    manager: &'a StreamManager,
+    stream_id: &'a str,
+    ts_counter_ms: &'a mut u64,
+    sps_pps_stored: &'a mut bool,
+    is_h265_hint: bool,
+    has_audio: bool,
+    actual_codec: CodecType,
+    h265_vps: Option<Vec<u8>>,
+    h265_sps: Option<Vec<u8>>,
+    h265_pps: Option<Vec<u8>>,
+    h264_sps: Option<Vec<u8>>,
+    h264_pps: Option<Vec<u8>>,
+    tracks_ready: bool,
+    published_keyframe: bool,
+    published_video_frames: usize,
+    published_audio_frames: usize,
+    skipped_parameter_nals: usize,
+}
+
+impl<'a> HlsSegmentPublisher<'a> {
+    fn new(
+        manager: &'a StreamManager,
+        stream_id: &'a str,
+        ts_counter_ms: &'a mut u64,
+        sps_pps_stored: &'a mut bool,
+        is_h265_hint: bool,
+        has_audio: bool,
+    ) -> Self {
+        Self {
+            manager,
+            stream_id,
+            ts_counter_ms,
+            sps_pps_stored,
+            is_h265_hint,
+            has_audio,
+            actual_codec: if is_h265_hint {
+                CodecType::H265
+            } else {
+                CodecType::H264
+            },
+            h265_vps: None,
+            h265_sps: None,
+            h265_pps: None,
+            h264_sps: None,
+            h264_pps: None,
+            tracks_ready: false,
+            published_keyframe: false,
+            published_video_frames: 0,
+            published_audio_frames: 0,
+            skipped_parameter_nals: 0,
+        }
+    }
+
+    fn ensure_tracks(&mut self, ts_codec: super::ts_parser::TsCodec) {
+        if self.tracks_ready {
+            return;
+        }
+        self.actual_codec = match ts_codec {
+            super::ts_parser::TsCodec::H265 => CodecType::H265,
+            super::ts_parser::TsCodec::H264 => CodecType::H264,
+            _ if self.is_h265_hint => CodecType::H265,
+            _ => CodecType::H264,
+        };
+        debug!(
+            "[HLS Puller] ensure tracks stream='{}' ts_codec={:?} actual_codec={:?} has_audio={} h265_hint={}",
+            self.stream_id,
+            ts_codec,
+            self.actual_codec,
+            self.has_audio,
+            self.is_h265_hint
+        );
+        self.manager
+            .ensure_video_track_codec(self.stream_id, self.actual_codec);
+        if self.has_audio {
+            self.manager.ensure_aac_track(self.stream_id);
+        }
+        self.tracks_ready = true;
+    }
+
+    fn publish_nal(
+        &mut self,
+        ts_codec: super::ts_parser::TsCodec,
+        _is_key_hint: bool,
+        data: &[u8],
+    ) {
+        if matches!(ts_codec, super::ts_parser::TsCodec::Mpeg2Video) {
+            debug!(
+                "[HLS Puller] skip unsupported MPEG2 video frame stream='{}' bytes={}",
+                self.stream_id,
+                data.len()
+            );
+            return;
+        }
+        if data.len() < 5 {
+            debug!(
+                "[HLS Puller] skip short NAL stream='{}' ts_codec={:?} bytes={}",
+                self.stream_id,
+                ts_codec,
+                data.len()
+            );
+            return;
+        }
+        self.ensure_tracks(ts_codec);
+
+        let nal_header = data[4];
+        let h264_type = nal_header & 0x1F;
+        let h265_type = (nal_header & 0x7E) >> 1;
+        let detected_codec = match ts_codec {
+            super::ts_parser::TsCodec::H265 => CodecType::H265,
+            super::ts_parser::TsCodec::H264 => CodecType::H264,
+            super::ts_parser::TsCodec::Unknown => {
+                if matches!(h265_type, 32..=34 | 19 | 20) {
+                    CodecType::H265
+                } else if matches!(h264_type, 7 | 8 | 5) {
+                    CodecType::H264
+                } else {
+                    self.actual_codec
+                }
+            }
+            super::ts_parser::TsCodec::AAC => self.actual_codec,
+            super::ts_parser::TsCodec::Mpeg2Video => {
+                debug!(
+                    "[HLS Puller] skip unsupported MPEG2 video stream='{}' bytes={}",
+                    self.stream_id,
+                    data.len()
+                );
+                return;
+            }
+        };
+        let previous_codec = self.actual_codec;
+        self.actual_codec = detected_codec;
+        let codec = detected_codec;
+        if previous_codec != detected_codec {
+            debug!(
+                "[HLS Puller] detected codec switch stream='{}' ts_codec={:?} previous={:?} detected={:?} h264_type={} h265_type={}",
+                self.stream_id,
+                ts_codec,
+                previous_codec,
+                detected_codec,
+                h264_type,
+                h265_type
+            );
+        }
+
+        let is_keyframe = is_keyframe_annex_b(codec, data);
+
+        if !*self.sps_pps_stored {
+            match codec {
+                CodecType::H265 if h265_type == 32 => {
+                    self.h265_vps = Some(data[4..].to_vec());
+                    debug!(
+                        "[HLS Puller] cached H265 VPS stream='{}' bytes={}",
+                        self.stream_id,
+                        data.len().saturating_sub(4)
+                    );
+                }
+                CodecType::H265 if h265_type == 33 => {
+                    self.h265_sps = Some(data[4..].to_vec());
+                    debug!(
+                        "[HLS Puller] cached H265 SPS stream='{}' bytes={}",
+                        self.stream_id,
+                        data.len().saturating_sub(4)
+                    );
+                }
+                CodecType::H265 if h265_type == 34 => {
+                    self.h265_pps = Some(data[4..].to_vec());
+                    debug!(
+                        "[HLS Puller] cached H265 PPS stream='{}' bytes={}",
+                        self.stream_id,
+                        data.len().saturating_sub(4)
+                    );
+                }
+                CodecType::H264 if h264_type == 7 => {
+                    self.h264_sps = Some(data[4..].to_vec());
+                    debug!(
+                        "[HLS Puller] cached H264 SPS stream='{}' bytes={}",
+                        self.stream_id,
+                        data.len().saturating_sub(4)
+                    );
+                }
+                CodecType::H264 if h264_type == 8 => {
+                    self.h264_pps = Some(data[4..].to_vec());
+                    debug!(
+                        "[HLS Puller] cached H264 PPS stream='{}' bytes={}",
+                        self.stream_id,
+                        data.len().saturating_sub(4)
+                    );
+                }
+                _ => {}
+            }
+
+            if codec == CodecType::H265 {
+                if let (Some(vps), Some(sps), Some(pps)) =
+                    (&self.h265_vps, &self.h265_sps, &self.h265_pps)
+                {
+                    if !vps.is_empty() && !sps.is_empty() && !pps.is_empty() {
+                        self.manager.set_stream_hevc_config(
+                            self.stream_id,
+                            vps.clone(),
+                            sps.clone(),
+                            pps.clone(),
+                            None,
+                        );
+                        *self.sps_pps_stored = true;
+                        debug!(
+                            "[HLS Puller] stored H265 config stream='{}' vps={} sps={} pps={}",
+                            self.stream_id,
+                            vps.len(),
+                            sps.len(),
+                            pps.len()
+                        );
+                    }
+                }
+            } else if let (Some(sps), Some(pps)) = (&self.h264_sps, &self.h264_pps) {
+                if !sps.is_empty() && !pps.is_empty() {
+                    self.manager
+                        .set_stream_sps_pps(self.stream_id, sps.clone(), pps.clone());
+                    *self.sps_pps_stored = true;
+                    debug!(
+                        "[HLS Puller] stored H264 config stream='{}' sps={} pps={}",
+                        self.stream_id,
+                        sps.len(),
+                        pps.len()
+                    );
+                }
+            }
+        }
+
+        if matches!(codec, CodecType::H265 if matches!(h265_type, 32 | 33 | 34))
+            || matches!(codec, CodecType::H264 if matches!(h264_type, 7 | 8))
+            || h264_type == 9
+            || h265_type == 35
+        {
+            self.skipped_parameter_nals += 1;
+            trace!(
+                "[HLS Puller] skip parameter/AUD NAL stream='{}' codec={:?} h264_type={} h265_type={} bytes={}",
+                self.stream_id,
+                codec,
+                h264_type,
+                h265_type,
+                data.len()
+            );
+            if self.skipped_parameter_nals <= 3 || self.skipped_parameter_nals % 300 == 0 {
+                debug!(
+                    "[HLS Puller] skipped parameter/AUD NALs stream='{}' count={} last_codec={:?} last_h264_type={} last_h265_type={} last_bytes={}",
+                    self.stream_id,
+                    self.skipped_parameter_nals,
+                    codec,
+                    h264_type,
+                    h265_type,
+                    data.len()
+                );
+            }
+            return;
+        }
+
+        if is_keyframe && !self.published_keyframe {
+            info!(
+                "[HLS Puller] Published first keyframe for stream '{}'",
+                self.stream_id
+            );
+            self.published_keyframe = true;
+        }
+        if is_keyframe {
+            debug!(
+                "[HLS Puller] publishing keyframe stream='{}' codec={:?} ts_ms={} bytes={} h264_type={} h265_type={}",
+                self.stream_id,
+                codec,
+                *self.ts_counter_ms,
+                data.len(),
+                h264_type,
+                h265_type
+            );
+        }
+
+        let frame = MediaFrame::new(
+            self.stream_id.to_string(),
+            0,
+            *self.ts_counter_ms,
+            Bytes::from(data.to_vec()),
+            is_keyframe,
+            codec,
+        )
+        .with_clock_rate(MILLISECOND_CLOCK_RATE);
+        self.manager.publish_frame(frame);
+        self.published_video_frames += 1;
+        if self.published_video_frames <= 3 || self.published_video_frames % 30 == 0 {
+            debug!(
+                "[HLS Puller] published video frame stream='{}' codec={:?} ts_ms={} keyframe={} bytes={} count={}",
+                self.stream_id,
+                codec,
+                *self.ts_counter_ms,
+                is_keyframe,
+                data.len(),
+                self.published_video_frames
+            );
+        }
+        *self.ts_counter_ms += 33;
+    }
+
+    fn publish_audio_es(&mut self, audio_es: &[u8]) {
+        if audio_es.is_empty() {
+            return;
+        }
+        use super::ts_parser;
+        let mut frames = 0usize;
+        for aac in ts_parser::extract_aac_frames(audio_es) {
+            if aac.len() > 1 {
+                let len = aac.len();
+                self.manager.publish_frame(
+                    MediaFrame::new(
+                        self.stream_id.to_string(),
+                        1,
+                        *self.ts_counter_ms,
+                        Bytes::from(aac),
+                        false,
+                        CodecType::AAC,
+                    )
+                    .with_clock_rate(MILLISECOND_CLOCK_RATE),
+                );
+                self.published_audio_frames += 1;
+                frames += 1;
+                if self.published_audio_frames <= 3 || self.published_audio_frames % 100 == 0 {
+                    debug!(
+                        "[HLS Puller] published audio frame stream='{}' ts_ms={} bytes={} total_audio={}",
+                        self.stream_id,
+                        *self.ts_counter_ms,
+                        len,
+                        self.published_audio_frames
+                    );
+                }
+            }
+        }
+        debug!(
+            "[HLS Puller] audio publish complete stream='{}' input_bytes={} frames={} total_audio={}",
+            self.stream_id,
+            audio_es.len(),
+            frames,
+            self.published_audio_frames
+        );
+    }
 }
 
 async fn process_ts_segment_hls(
@@ -339,202 +1124,43 @@ async fn process_ts_segment_hls(
     ts_counter_ms: &mut u64,
     sps_pps_stored: &mut bool,
     is_h265: bool,
-    _has_audio: bool,
+    has_audio: bool,
 ) -> Result<()> {
-    use super::ts_parser;
+    use super::ts_parser::TsStreamDecoder;
 
-    let mut h265_vps: Option<Vec<u8>> = None;
-    let mut h265_sps: Option<Vec<u8>> = None;
-    let mut h265_pps: Option<Vec<u8>> = None;
-    let mut h264_sps: Option<Vec<u8>> = None;
-    let mut h264_pps: Option<Vec<u8>> = None;
-
-    let packets = ts_parser::find_ts_packets(data);
-
-    if packets.len() < 5 {
-        return Err(anyhow!("Too few TS packets: {}", packets.len()));
+    if data.len() < TS_PACKET_SIZE * 5 {
+        return Err(anyhow!("segment too small: {} bytes", data.len()));
     }
 
-    // Find PIDs and codec from PMT
-    let pmt_pids = ts_parser::parse_pat(&packets);
-    if pmt_pids.is_empty() {
-        return Err(anyhow!("No PAT found"));
+    let mut decoder = TsStreamDecoder::new(is_h265);
+    let mut publisher = HlsSegmentPublisher::new(
+        manager,
+        stream_id,
+        ts_counter_ms,
+        sps_pps_stored,
+        is_h265,
+        has_audio,
+    );
+
+    let mut published_frames = 0usize;
+    for (ts_codec, is_key, nal_unit) in decoder.feed(data) {
+        publisher.publish_nal(ts_codec, is_key, &nal_unit);
+        published_frames += 1;
     }
-
-    let mut video_pid = None;
-    let mut audio_pid = None;
-    let mut pmt_video_codec = ts_parser::TsCodec::Unknown;
-    for &pid in &pmt_pids {
-        let info = ts_parser::parse_pmt_info(&packets, pid);
-        if video_pid.is_none() {
-            video_pid = info.video_pid;
-            if info.video_codec != ts_parser::TsCodec::Unknown {
-                pmt_video_codec = info.video_codec;
-            }
-        }
-        if audio_pid.is_none() {
-            audio_pid = info.audio_pid;
-        }
+    for (ts_codec, is_key, nal_unit) in decoder.finish() {
+        publisher.publish_nal(ts_codec, is_key, &nal_unit);
+        published_frames += 1;
     }
+    publisher.ensure_tracks(decoder.video_codec());
+    publisher.publish_audio_es(decoder.audio_es());
 
-    let video_pid = video_pid.ok_or_else(|| anyhow!("No video PID found"))?;
-
-    let es_map = ts_parser::extract_es_data(&packets, video_pid, audio_pid.unwrap_or(0xFFFF));
-
-    let ts_video_codec = match pmt_video_codec {
-        ts_parser::TsCodec::H265 => ts_parser::TsCodec::H265,
-        ts_parser::TsCodec::H264 => ts_parser::TsCodec::H264,
-        _ if is_h265 => ts_parser::TsCodec::H265,
-        _ => ts_parser::TsCodec::H264,
-    };
-
-    let mut actual_codec = match ts_video_codec {
-        ts_parser::TsCodec::H265 => CodecType::H265,
-        _ => CodecType::H264,
-    };
-
-    // Detect actual codec from NAL headers when PMT is ambiguous
-    if pmt_video_codec == ts_parser::TsCodec::Unknown {
-        if let Some(es) = es_map.get(&video_pid) {
-            let frames =
-                ts_parser::extract_video_frames_with_codec(&es.data, ts_video_codec);
-            for (ts_codec, _, nal_unit) in &frames {
-                if nal_unit.len() < 5 {
-                    continue;
-                }
-                let nal_header = nal_unit[4];
-                let h264_type = nal_header & 0x1F;
-                let h265_type = (nal_header & 0x7E) >> 1;
-                if *ts_codec == ts_parser::TsCodec::H265 || (h265_type >= 32 && h265_type <= 34) {
-                    actual_codec = CodecType::H265;
-                    break;
-                }
-                if h264_type == 7 || h264_type == 8 {
-                    actual_codec = CodecType::H264;
-                    break;
-                }
-            }
-        }
+    if published_frames == 0 {
+        return Err(anyhow!("no video frames extracted from segment"));
     }
-
-    manager.ensure_video_track_codec(stream_id, actual_codec);
-    if audio_pid.is_some() {
-        manager.ensure_aac_track(stream_id);
-    }
-
-    // Process video frames
-    if let Some(es) = es_map.get(&video_pid) {
-        let frames =
-            ts_parser::extract_video_frames_with_codec(&es.data, ts_video_codec);
-
-        for (_ts_codec, _is_key, nal_unit) in &frames {
-            let data: &[u8] = nal_unit;
-            if data.len() < 5 {
-                continue;
-            }
-
-            let nal_header = data[4];
-            let h264_type = nal_header & 0x1F;
-            let h265_type = (nal_header & 0x7E) >> 1;
-            let codec = actual_codec;
-
-            let is_keyframe = is_keyframe_annex_b(codec, data);
-
-            // Store SPS/PPS/VPS (order-independent pairing)
-            if !*sps_pps_stored {
-                match codec {
-                    CodecType::H265 if h265_type == 32 => {
-                        h265_vps = Some(data[4..].to_vec());
-                    }
-                    CodecType::H265 if h265_type == 33 => {
-                        h265_sps = Some(data[4..].to_vec());
-                    }
-                    CodecType::H265 if h265_type == 34 => {
-                        h265_pps = Some(data[4..].to_vec());
-                    }
-                    CodecType::H264 if h264_type == 7 => {
-                        h264_sps = Some(data[4..].to_vec());
-                    }
-                    CodecType::H264 if h264_type == 8 => {
-                        h264_pps = Some(data[4..].to_vec());
-                    }
-                    _ => {}
-                }
-
-                if codec == CodecType::H265 {
-                    if let (Some(vps), Some(sps), Some(pps)) =
-                        (&h265_vps, &h265_sps, &h265_pps)
-                    {
-                        if !vps.is_empty() && !sps.is_empty() && !pps.is_empty() {
-                            manager.set_stream_hevc_config(
-                                stream_id,
-                                vps.clone(),
-                                sps.clone(),
-                                pps.clone(),
-                                None,
-                            );
-                            *sps_pps_stored = true;
-                        }
-                    }
-                } else if let (Some(sps), Some(pps)) = (&h264_sps, &h264_pps) {
-                    if !sps.is_empty() && !pps.is_empty() {
-                        manager.set_stream_sps_pps(stream_id, sps.clone(), pps.clone());
-                        *sps_pps_stored = true;
-                    }
-                }
-            }
-
-            // Skip parameter-set-only NALUs from the media timeline
-            if matches!(codec, CodecType::H265 if matches!(h265_type, 32 | 33 | 34))
-                || matches!(codec, CodecType::H264 if matches!(h264_type, 7 | 8))
-                || h264_type == 9
-                || h265_type == 35
-            {
-                continue;
-            }
-
-            let frame = MediaFrame::new(
-                stream_id.to_string(),
-                0,
-                *ts_counter_ms,
-                Bytes::from(data.to_vec()),
-                is_keyframe,
-                codec,
-            )
-            .with_clock_rate(MILLISECOND_CLOCK_RATE);
-
-            manager.publish_frame(frame);
-            *ts_counter_ms += 33;
-        }
-    }
-
-    // Process audio
-    if let Some(audio_pid_val) = audio_pid {
-        if let Some(es) = es_map.get(&audio_pid_val) {
-            if !es.data.is_empty() {
-                let audio_frames = ts_parser::extract_aac_frames(&es.data);
-
-                for aac in &audio_frames {
-                    if aac.len() > 1 {
-                        manager.publish_frame(
-                            MediaFrame::new(
-                                stream_id.to_string(),
-                                1,
-                                *ts_counter_ms,
-                                Bytes::from(aac.clone()),
-                                false,
-                                CodecType::AAC,
-                            )
-                            .with_clock_rate(MILLISECOND_CLOCK_RATE),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     Ok(())
 }
+
+const TS_PACKET_SIZE: usize = 188;
 
 #[async_trait]
 impl MediaTransport for HlsPuller {
@@ -581,6 +1207,103 @@ impl StreamPuller for HlsPuller {
 mod tests {
     use super::*;
     use crate::server::hls::ts_parser;
+
+    #[test]
+    fn select_live_segments_prefers_newest_unseen() {
+        let segments = vec![
+            Segment {
+                url: "a.ts".into(),
+                duration: 4.0,
+            },
+            Segment {
+                url: "b.ts".into(),
+                duration: 4.0,
+            },
+            Segment {
+                url: "c.ts".into(),
+                duration: 4.0,
+            },
+        ];
+        let mut downloaded = std::collections::HashSet::new();
+        downloaded.insert("a.ts".to_string());
+
+        let picked = select_live_segments(&segments, &downloaded);
+        assert_eq!(picked.len(), 2);
+        assert_eq!(picked[0].url, "b.ts");
+        assert_eq!(picked[1].url, "c.ts");
+    }
+
+    #[test]
+    fn segment_download_timeout_scales_with_duration() {
+        assert_eq!(segment_download_timeout(4.2).as_secs(), 51);
+        assert_eq!(segment_download_timeout(10.0).as_secs(), 120);
+    }
+
+    #[test]
+    fn h265_parameter_sets_are_stored_when_playlist_lacks_codec_hint() {
+        let manager = StreamManager::new();
+        manager.create_stream("s", StreamSourceMode::Pull, StreamProtocol::HLS, None);
+        let mut ts_counter_ms = 0;
+        let mut sps_pps_stored = false;
+        let mut publisher = HlsSegmentPublisher::new(
+            &manager,
+            "s",
+            &mut ts_counter_ms,
+            &mut sps_pps_stored,
+            false,
+            false,
+        );
+
+        publisher.publish_nal(
+            ts_parser::TsCodec::Unknown,
+            true,
+            &[0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01],
+        );
+        publisher.publish_nal(
+            ts_parser::TsCodec::Unknown,
+            true,
+            &[0, 0, 0, 1, 0x42, 0x01, 0x01, 0x60],
+        );
+        publisher.publish_nal(
+            ts_parser::TsCodec::Unknown,
+            true,
+            &[0, 0, 0, 1, 0x44, 0x01, 0xc0, 0xf1],
+        );
+
+        let stream = manager.get_stream(&"s".to_string()).expect("stream");
+        assert_eq!(stream.vps.as_deref(), Some(&[0x40, 0x01, 0x0c, 0x01][..]));
+        assert_eq!(stream.sps.as_deref(), Some(&[0x42, 0x01, 0x01, 0x60][..]));
+        assert_eq!(stream.pps.as_deref(), Some(&[0x44, 0x01, 0xc0, 0xf1][..]));
+        assert!(sps_pps_stored);
+    }
+
+    #[test]
+    fn h264_ts_codec_hint_prevents_false_h265_detection() {
+        let manager = StreamManager::new();
+        manager.create_stream("s", StreamSourceMode::Pull, StreamProtocol::HLS, None);
+        let mut ts_counter_ms = 0;
+        let mut sps_pps_stored = false;
+        let mut publisher = HlsSegmentPublisher::new(
+            &manager,
+            "s",
+            &mut ts_counter_ms,
+            &mut sps_pps_stored,
+            false,
+            false,
+        );
+
+        publisher.publish_nal(
+            ts_parser::TsCodec::H264,
+            false,
+            &[0, 0, 0, 1, 0x41, 0x9a, 0x22],
+        );
+
+        assert_eq!(publisher.actual_codec, CodecType::H264);
+        let hub = manager.get_hub("s").expect("hub");
+        let frame = hub.get(0).expect("published frame");
+        assert_eq!(frame.codec, CodecType::H264);
+        assert_eq!(frame.data.as_ref(), &[0, 0, 0, 1, 0x41, 0x9a, 0x22]);
+    }
 
     const TEST_M3U8_URL: &str = "https://bp-resource-dfl.bestv.cn/148/3/video.m3u8";
     const MAX_SEGMENTS_TO_DOWNLOAD: usize = 3;
@@ -742,8 +1465,7 @@ mod tests {
                                 let section_len =
                                     ((pkt[off + 1] as usize & 0x0F) << 8) | pkt[off + 2] as usize;
                                 let data_start = off + 3;
-                                let data_end =
-                                    std::cmp::min(data_start + section_len, 188);
+                                let data_end = std::cmp::min(data_start + section_len, 188);
                                 println!(
                                     "[TEST] PAT raw: table_id=0x{:02X} section_len={} payload_off={} pusi={} has_adapt={}",
                                     table_id, section_len, off, pusi, has_adapt
@@ -767,7 +1489,10 @@ mod tests {
                             let (mut video_pid, mut audio_pid) = (None, None);
                             for &pid in &pmt_pids {
                                 let (v, a) = ts_parser::parse_pmt(&packets, pid);
-                                println!("[TEST] PMT parse pid={}: video={:?} audio={:?}", pid, v, a);
+                                println!(
+                                    "[TEST] PMT parse pid={}: video={:?} audio={:?}",
+                                    pid, v, a
+                                );
                                 if video_pid.is_none() {
                                     video_pid = v;
                                 }
@@ -810,28 +1535,28 @@ mod tests {
 
                                 // Detect codec from NAL header
                                 if let Some(pos) = es.data.windows(4).position(|w| {
-                                    w == [0x00, 0x00, 0x00, 0x01]
-                                        || w[..3] == [0x00, 0x00, 0x01]
+                                    w == [0x00, 0x00, 0x00, 0x01] || w[..3] == [0x00, 0x00, 0x01]
                                 }) {
-                                    let off = if es.data[pos..].starts_with(&[0x00, 0x00, 0x00, 0x01])
-                                    {
-                                        pos + 4
-                                    } else {
-                                        pos + 3
-                                    };
+                                    let off =
+                                        if es.data[pos..].starts_with(&[0x00, 0x00, 0x00, 0x01]) {
+                                            pos + 4
+                                        } else {
+                                            pos + 3
+                                        };
                                     if off < es.data.len() {
                                         let nal_header = es.data[off];
                                         let h264_type = nal_header & 0x1F;
                                         let h265_type = (nal_header & 0x7E) >> 1;
-                                        video_codec =
-                                            if h265_type == 32 || h265_type == 33 || h265_type == 34
-                                            {
-                                                "H265".to_string()
-                                            } else if h264_type == 7 || h264_type == 8 {
-                                                "H264".to_string()
-                                            } else {
-                                                format!("Unknown(0x{:02X})", nal_header)
-                                            };
+                                        video_codec = if h265_type == 32
+                                            || h265_type == 33
+                                            || h265_type == 34
+                                        {
+                                            "H265".to_string()
+                                        } else if h264_type == 7 || h264_type == 8 {
+                                            "H264".to_string()
+                                        } else {
+                                            format!("Unknown(0x{:02X})", nal_header)
+                                        };
                                         println!("[TEST] Detected video codec: {}", video_codec);
                                     }
                                 } else {
@@ -860,7 +1585,11 @@ mod tests {
                                     };
                                     println!(
                                         "[TEST]   Frame {}: {:?} key={} size={} {}",
-                                        j, codec, is_key, nal.len(), tag
+                                        j,
+                                        codec,
+                                        is_key,
+                                        nal.len(),
+                                        tag
                                     );
                                 }
 
@@ -932,10 +1661,7 @@ mod tests {
 
         assert!(!segments.is_empty(), "Should have found segments");
         assert!(total_ts_packets > 0, "Should have parsed TS packets");
-        assert!(
-            total_video_frames > 0,
-            "Should have extracted video frames"
-        );
+        assert!(total_video_frames > 0, "Should have extracted video frames");
         println!("\n[TEST] HLS pull verification PASSED!");
     }
 }
