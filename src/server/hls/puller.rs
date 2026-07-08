@@ -177,26 +177,70 @@ async fn run_hls_pull_loop(
 
         // Download new segments
         let mut _new_frames = 0;
+        let mut playlist_expired = false;
+
         for seg in &segments {
             if downloaded_segments.contains(&seg.url) {
                 continue;
             }
-            downloaded_segments.insert(seg.url.clone());
 
             info!(
-                "[HLS Puller] Downloading segment {} (duration={}s): {}",
-                downloaded_segments.len(),
+                "[HLS Puller] Downloading segment (duration={}s): {}",
                 seg.duration,
                 &seg.url
             );
 
-            let seg_data = match download_segment(&client, &seg.url).await {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!("[HLS Puller] Failed to download segment: {}", e);
+            // Retry segment download up to 2 times
+            let mut seg_data = None;
+            for attempt in 0..2 {
+                match download_segment(&client, &seg.url).await {
+                    Ok(d) => {
+                        seg_data = Some(d);
+                        break;
+                    }
+                    Err(e) => {
+                        let err_msg = format!("{}", e);
+                        // If 404, the playlist segment has expired — stop processing
+                        // this batch and re-fetch the playlist
+                        if err_msg.contains("404") {
+                            warn!(
+                                "[HLS Puller] Segment 404 (playlist expired), re-fetching: {}",
+                                &seg.url
+                            );
+                            playlist_expired = true;
+                            break;
+                        }
+                        if attempt == 0 {
+                            warn!(
+                                "[HLS Puller] Segment download failed (attempt 1/2): {} — {}",
+                                e, &seg.url
+                            );
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        } else {
+                            warn!(
+                                "[HLS Puller] Segment download failed (attempt 2/2): {} — {}",
+                                e, &seg.url
+                            );
+                        }
+                    }
+                }
+            }
+
+            if playlist_expired {
+                break; // Stop processing stale segments, go re-fetch playlist
+            }
+
+            let seg_data = match seg_data {
+                Some(d) => d,
+                None => {
+                    // Download failed after retries, mark URL to avoid infinite retry
+                    downloaded_segments.insert(seg.url.clone());
                     continue;
                 }
             };
+
+            // Only mark as downloaded after successful download + processing
+            downloaded_segments.insert(seg.url.clone());
 
             if let Err(e) =
                 process_ts_segment_hls(&seg_data, &manager, &stream_id, &mut ts_counter_ms, &mut sps_pps_stored, is_h265, audio_codec_known).await
@@ -205,6 +249,12 @@ async fn run_hls_pull_loop(
             } else {
                 _new_frames += 1;
             }
+        }
+
+        // If playlist was expired, don't sleep full duration — re-fetch immediately
+        if playlist_expired {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
         }
 
         // Calculate sleep time based on segment durations
@@ -266,7 +316,7 @@ fn parse_media_segments(body: &str, base_url: &str) -> Vec<Segment> {
 async fn download_segment(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     let response = client
         .get(url)
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(8))
         .send()
         .await?;
 
