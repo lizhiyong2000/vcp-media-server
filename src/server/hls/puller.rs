@@ -1,7 +1,7 @@
 /// HLS Puller - Pure Rust implementation (no ffmpeg)
 /// Downloads m3u8 playlist, fetches TS segments, parses MPEG-TS to extract
 /// H264/H265 video and AAC audio, publishes via StreamManager.
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -10,11 +10,11 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::core::{
-    default_live_tracks, is_keyframe_annex_b, CodecType, MediaFrame, MediaTransport, StreamManager,
-    StreamProtocol, StreamPuller, StreamSourceMode, TransportStatus, MILLISECOND_CLOCK_RATE,
+    CodecType, MILLISECOND_CLOCK_RATE, MediaFrame, MediaTransport, StreamManager, StreamProtocol,
+    StreamPuller, StreamSourceMode, TransportStatus, default_live_tracks, is_keyframe_annex_b,
 };
 
-use crate::server::http_flv::puller::{parse_m3u8_for_segment, resolve_relative_url};
+use crate::server::http_flv::puller::{is_m3u8_url, parse_m3u8_for_segment, resolve_relative_url};
 
 const HLS_CONCURRENT_SEGMENTS: usize = 3;
 const DECODE_BATCH_PACKETS: usize = 128;
@@ -187,7 +187,7 @@ async fn run_hls_pull_loop(
     );
 
     let (media_url, mut playlist_body) = match target {
-        Some(url) if url.ends_with(".m3u8") && url != playlist_url => {
+        Some(url) if is_m3u8_url(&url) && url != playlist_url => {
             info!("[HLS Puller] Fetching variant playlist: {}", url);
             let resp2 = client.get(&url).send().await?;
             debug!(
@@ -379,26 +379,34 @@ async fn run_hls_pull_loop(
                     }
                     Err(e) => {
                         let err_msg = format!("{}", e);
-                        // If 404, the playlist segment has expired — stop processing
-                        // this batch and re-fetch the playlist
-                        if err_msg.contains("404") {
+                        // If the HTTP status is exactly 404, the live playlist segment
+                        // has expired. Do not match against the full URL; signed HLS
+                        // query strings can contain "404" as ordinary digits.
+                        if is_playlist_expired_error(&err_msg) {
                             warn!(
-                                  "[HLS Puller] Segment 404 (playlist expired), re-fetching stream='{}' url='{}'",
-                                  stream_id, &seg.url
+                                "[HLS Puller] Segment 404 (playlist expired), re-fetching stream='{}' url='{}'",
+                                stream_id, &seg.url
                             );
                             playlist_expired = true;
                             break;
                         }
+                        if is_non_retryable_segment_error(&err_msg) {
+                            warn!(
+                                "[HLS Puller] Segment has no usable video, skipping retry stream='{}' error='{}' url='{}'",
+                                stream_id, e, &seg.url
+                            );
+                            break;
+                        }
                         if attempt == 0 {
                             warn!(
-                                  "[HLS Puller] Segment download failed stream='{}' attempt=1/2 error='{}' url='{}'",
-                                  stream_id, e, &seg.url
+                                "[HLS Puller] Segment download failed stream='{}' attempt=1/2 error='{}' url='{}'",
+                                stream_id, e, &seg.url
                             );
                             tokio::time::sleep(Duration::from_millis(500)).await;
                         } else {
                             warn!(
-                                  "[HLS Puller] Segment download failed stream='{}' attempt=2/2 error='{}' url='{}'",
-                                  stream_id, e, &seg.url
+                                "[HLS Puller] Segment download failed stream='{}' attempt=2/2 error='{}' url='{}'",
+                                stream_id, e, &seg.url
                             );
                         }
                     }
@@ -524,6 +532,15 @@ fn segment_download_timeout(duration_secs: f64) -> Duration {
     Duration::from_secs_f64(secs)
 }
 
+fn is_playlist_expired_error(err_msg: &str) -> bool {
+    err_msg.starts_with("HTTP 404 ") || err_msg.contains("HTTP 404 ")
+}
+
+fn is_non_retryable_segment_error(err_msg: &str) -> bool {
+    err_msg.starts_with("segment has no video PID")
+        || err_msg.starts_with("no video frames extracted")
+}
+
 async fn download_and_process_segment_streaming(
     client: &reqwest::Client,
     url: &str,
@@ -637,12 +654,17 @@ async fn download_and_process_segment_streaming(
                 next_progress_log += 512 * 1024;
             }
         }
-        publisher.ensure_tracks({
+        let video_codec = {
             let guard = decoder
                 .lock()
                 .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
-            guard.video_codec()
-        });
+            guard.video_pid().map(|_| guard.video_codec())
+        };
+        let Some(video_codec) = video_codec else {
+            tokio::task::yield_now().await;
+            continue;
+        };
+        publisher.ensure_tracks(video_codec);
         tokio::task::yield_now().await;
     }
 
@@ -674,12 +696,14 @@ async fn download_and_process_segment_streaming(
         publisher.publish_nal(ts_codec, is_key, &nal_unit);
         published_frames += 1;
     }
-    publisher.ensure_tracks({
+    if let Some(video_codec) = {
         let guard = decoder
             .lock()
             .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
-        guard.video_codec()
-    });
+        guard.video_pid().map(|_| guard.video_codec())
+    } {
+        publisher.ensure_tracks(video_codec);
+    }
     let audio_es = {
         let guard = decoder
             .lock()
@@ -706,7 +730,7 @@ async fn download_and_process_segment_streaming(
         ));
     }
     if published_frames == 0 {
-        let (raw_len, consumed, has_sync, video_pid) = {
+        let (raw_len, consumed, has_sync, video_pid, audio_pid, codec) = {
             let guard = decoder
                 .lock()
                 .map_err(|e| anyhow!("TS decoder lock poisoned: {e}"))?;
@@ -715,12 +739,23 @@ async fn download_and_process_segment_streaming(
                 guard.consumed_packets(),
                 guard.has_sync(),
                 guard.video_pid(),
+                guard.audio_pid(),
+                guard.video_codec(),
             )
         };
         warn!(
-              "[HLS Puller] No frames from segment stream='{}' raw={} consumed_packets={} sync={} video_pid={:?} url='{}'",
-              stream_id, raw_len, consumed, has_sync, video_pid, url
+            "[HLS Puller] No frames from segment stream='{}' raw={} consumed_packets={} sync={} video_pid={:?} audio_pid={:?} ts_codec={:?} url='{}'",
+            stream_id, raw_len, consumed, has_sync, video_pid, audio_pid, codec, url
         );
+        if video_pid.is_none() {
+            return Err(anyhow!(
+                "segment has no video PID (audio_pid={:?}, sync={}, packets={}): {}",
+                audio_pid,
+                has_sync,
+                consumed,
+                url
+            ));
+        }
         return Err(anyhow!("no video frames extracted from segment: {}", url));
     }
     debug!(
@@ -839,11 +874,7 @@ impl<'a> HlsSegmentPublisher<'a> {
         };
         debug!(
             "[HLS Puller] ensure tracks stream='{}' ts_codec={:?} actual_codec={:?} has_audio={} h265_hint={}",
-            self.stream_id,
-            ts_codec,
-            self.actual_codec,
-            self.has_audio,
-            self.is_h265_hint
+            self.stream_id, ts_codec, self.actual_codec, self.has_audio, self.is_h265_hint
         );
         self.manager
             .ensure_video_track_codec(self.stream_id, self.actual_codec);
@@ -909,12 +940,7 @@ impl<'a> HlsSegmentPublisher<'a> {
         if previous_codec != detected_codec {
             debug!(
                 "[HLS Puller] detected codec switch stream='{}' ts_codec={:?} previous={:?} detected={:?} h264_type={} h265_type={}",
-                self.stream_id,
-                ts_codec,
-                previous_codec,
-                detected_codec,
-                h264_type,
-                h265_type
+                self.stream_id, ts_codec, previous_codec, detected_codec, h264_type, h265_type
             );
         }
 
@@ -1099,10 +1125,7 @@ impl<'a> HlsSegmentPublisher<'a> {
                 if self.published_audio_frames <= 3 || self.published_audio_frames % 100 == 0 {
                     debug!(
                         "[HLS Puller] published audio frame stream='{}' ts_ms={} bytes={} total_audio={}",
-                        self.stream_id,
-                        *self.ts_counter_ms,
-                        len,
-                        self.published_audio_frames
+                        self.stream_id, *self.ts_counter_ms, len, self.published_audio_frames
                     );
                 }
             }
@@ -1237,6 +1260,34 @@ mod tests {
     fn segment_download_timeout_scales_with_duration() {
         assert_eq!(segment_download_timeout(4.2).as_secs(), 51);
         assert_eq!(segment_download_timeout(10.0).as_secs(), 120);
+    }
+
+    #[test]
+    fn master_playlist_variant_with_query_is_detected_as_m3u8() {
+        let playlist = "#EXTM3U\n#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=229000\nhttp://180.163.117.65/satellitepull.cnr.cn/live/wxbtv/playlist.m3u8?wsSession=abc&wsBindIP=2\n";
+
+        let target = parse_m3u8_for_segment(
+            playlist,
+            "http://satellitepull.cnr.cn/live/wxbtv/playlist.m3u8",
+        )
+        .expect("variant target");
+
+        assert!(is_m3u8_url(&target));
+    }
+
+    #[test]
+    fn segment_404_detection_ignores_signed_url_digits() {
+        let err = "no video frames extracted from segment: http://example/live/1.ts?wsserid=1168208404049835318";
+
+        assert!(!is_playlist_expired_error(err));
+        assert!(is_non_retryable_segment_error(err));
+    }
+
+    #[test]
+    fn segment_404_detection_matches_http_status_only() {
+        let err = "HTTP 404 Not Found downloading segment: http://example/live/1.ts?wsserid=1";
+
+        assert!(is_playlist_expired_error(err));
     }
 
     #[test]

@@ -3,25 +3,26 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{Duration, Instant, sleep};
 use tracing::{error, info, warn};
 
+use crate::core::TransportConfig;
 use crate::core::{
-    is_idr_frame, prime_live_play, CodecType, Config, DispatchError, DispatchPolicy, MetricsRegistry,
-    MetricsSnapshot, PlaybackProtocol, StreamManager, StreamProtocol, StreamSourceMode, Track,
-    WallclockMsTimeline,
+    CodecType, Config, DispatchError, DispatchPolicy, MetricsRegistry, MetricsSnapshot,
+    PlaybackProtocol, StreamManager, StreamProtocol, StreamSourceMode, Track, WallclockMsTimeline,
+    is_idr_frame, prime_live_play,
 };
 use crate::process::analysis::{AnalysisManager, StartAnalysisRequest, StopAnalysisRequest};
 use crate::process::record::{RecorderManager, StartRecordRequest, StopRecordRequest};
 use crate::process::snapshot::{CaptureSnapshotRequest, SnapshotManager};
 use crate::process::transcode::{StartTranscodeRequest, StopTranscodeRequest, TranscodeManager};
 use crate::server::hls::HlsServer;
+use crate::server::http_flv::puller::is_m3u8_url;
 use crate::server::http_flv::{
-    format_chunk, stream_has_video_sequence_header, HttpFlvServer, HttpFlvSession,
+    HttpFlvServer, HttpFlvSession, format_chunk, stream_has_video_sequence_header,
 };
-use crate::server::transport::TransportAdapterFactory;
-use crate::core::TransportConfig;
 use crate::server::rtsp::RtspPusher;
+use crate::server::transport::TransportAdapterFactory;
 
 /// Percent-decode a URL path segment.
 /// Handles percent-encoded UTF-8 sequences (e.g. %E4%B8%9C → 东).
@@ -157,7 +158,8 @@ impl HttpServer {
                     let transcode = self.transcode.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection(
-                            socket, manager, metrics, config, hls, flv, recorder, analysis, snapshot, transcode,
+                            socket, manager, metrics, config, hls, flv, recorder, analysis,
+                            snapshot, transcode,
                         )
                         .await
                         {
@@ -226,7 +228,8 @@ impl HttpServer {
                     let playlist = playlist.unwrap_or_else(|| hls.empty_playlist());
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: close\r\n\r\n{}",
-                        playlist.len(), playlist
+                        playlist.len(),
+                        playlist
                     );
                     socket.write_all(response.as_bytes()).await?;
                     socket.shutdown().await?;
@@ -283,13 +286,13 @@ impl HttpServer {
             if path.starts_with("/flv/") {
                 if let Some(ref flv) = flv_server {
                     let flv_path = path.trim_start_matches("/flv/").trim_end_matches('/');
-                    let (stream_id, join_from_idr) = if let Some((id, query)) = flv_path.split_once('?')
-                    {
-                        let join = query.split('&').any(|p| p == "join=idr");
-                        (id.trim_end_matches('/'), join)
-                    } else {
-                        (flv_path, false)
-                    };
+                    let (stream_id, join_from_idr) =
+                        if let Some((id, query)) = flv_path.split_once('?') {
+                            let join = query.split('&').any(|p| p == "join=idr");
+                            (id.trim_end_matches('/'), join)
+                        } else {
+                            (flv_path, false)
+                        };
                     if let Some((mut session, mut stream)) = flv.create_session(stream_id) {
                         let play_started_at = Instant::now();
                         let stream_id_owned = stream_id.to_string();
@@ -309,23 +312,26 @@ impl HttpServer {
                                 .get_hub(stream_id)
                                 .map(|hub| hub.latest_seq())
                                 .unwrap_or_default(),
-                            manager.get_hub(stream_id).and_then(|hub| hub.latest_idr_seq())
+                            manager
+                                .get_hub(stream_id)
+                                .and_then(|hub| hub.latest_idr_seq())
                         );
                         let dispatch_policy = if join_from_idr {
                             DispatchPolicy::SequentialFromIdr
                         } else {
                             DispatchPolicy::LiveSequential
                         };
-                        let mut reader = match manager.dispatch_subscribe(stream_id, dispatch_policy) {
-                            Some(r) => r,
-                            None => {
-                                let response =
-                                    Self::http_response(404, "Not Found", "Stream not found");
-                                socket.write_all(response.as_bytes()).await?;
-                                socket.flush().await?;
-                                return Ok(());
-                            }
-                        };
+                        let mut reader =
+                            match manager.dispatch_subscribe(stream_id, dispatch_policy) {
+                                Some(r) => r,
+                                None => {
+                                    let response =
+                                        Self::http_response(404, "Not Found", "Stream not found");
+                                    socket.write_all(response.as_bytes()).await?;
+                                    socket.flush().await?;
+                                    return Ok(());
+                                }
+                            };
                         MetricsRegistry::inc_player(&stream_id_owned, PlaybackProtocol::HttpFlv);
                         struct FlvPlayerGuard(String);
                         impl Drop for FlvPlayerGuard {
@@ -449,20 +455,20 @@ impl HttpServer {
                                         let requested =
                                             request_publisher_keyframe(&stream_id_owned);
                                         info!(
-                                        "[HTTP-FLV] [{}] waiting for first IDR; dropped non-IDR ts={} requested_keyframe={}",
-                                        stream_id, frame.timestamp, requested
-                                    );
+                                            "[HTTP-FLV] [{}] waiting for first IDR; dropped non-IDR ts={} requested_keyframe={}",
+                                            stream_id, frame.timestamp, requested
+                                        );
                                         continue;
                                     }
                                     info!(
-                                    "[HTTP-FLV] [{}] accepted first video IDR after={}ms raw_ts={} size={} cursor={} latest_seq={}",
-                                    stream_id,
-                                    play_started_at.elapsed().as_millis(),
-                                    frame.timestamp,
-                                    frame.data.len(),
-                                    reader.cursor(),
-                                    reader.hub().latest_seq()
-                                );
+                                        "[HTTP-FLV] [{}] accepted first video IDR after={}ms raw_ts={} size={} cursor={} latest_seq={}",
+                                        stream_id,
+                                        play_started_at.elapsed().as_millis(),
+                                        frame.timestamp,
+                                        frame.data.len(),
+                                        reader.cursor(),
+                                        reader.hub().latest_seq()
+                                    );
                                     video_streaming = true;
                                 }
                                 if frame.codec == CodecType::AAC && frame.data.len() < 8 {
@@ -501,19 +507,19 @@ impl HttpServer {
                                             first_ms,
                                         );
                                         info!(
-                                        "[HTTP-FLV] [{}] >>> SENT first frame after={}ms codec={:?} keyframe={} raw_ts={} tag_ts={} send_elapsed_ms={} tag_bytes={} chunk_bytes={} cursor={} latest_seq={}",
-                                        stream_id,
-                                        play_started_at.elapsed().as_millis(),
-                                        frame.codec,
-                                        frame.is_keyframe,
-                                        frame.timestamp,
-                                        tag_ts,
-                                        send_started_at.elapsed().as_millis(),
-                                        flv_data.len(),
-                                        chunk.len(),
-                                        reader.cursor(),
-                                        reader.hub().latest_seq()
-                                    );
+                                            "[HTTP-FLV] [{}] >>> SENT first frame after={}ms codec={:?} keyframe={} raw_ts={} tag_ts={} send_elapsed_ms={} tag_bytes={} chunk_bytes={} cursor={} latest_seq={}",
+                                            stream_id,
+                                            play_started_at.elapsed().as_millis(),
+                                            frame.codec,
+                                            frame.is_keyframe,
+                                            frame.timestamp,
+                                            tag_ts,
+                                            send_started_at.elapsed().as_millis(),
+                                            flv_data.len(),
+                                            chunk.len(),
+                                            reader.cursor(),
+                                            reader.hub().latest_seq()
+                                        );
                                     }
                                     frames_sent += 1;
                                     if frames_sent % 100 == 0 {
@@ -522,15 +528,15 @@ impl HttpServer {
                                         let send_lead_ms =
                                             (tag_ts as u64).saturating_sub(elapsed_ms);
                                         info!(
-                                        "[HTTP-FLV] [{}] >>> SEND {} frames tag_ts={} elapsed_ms={} send_lead_ms={} cursor={} latest_seq={}",
-                                        stream_id,
-                                        frames_sent,
-                                        tag_ts,
-                                        elapsed_ms,
-                                        send_lead_ms,
-                                        reader.cursor(),
-                                        reader.hub().latest_seq()
-                                    );
+                                            "[HTTP-FLV] [{}] >>> SEND {} frames tag_ts={} elapsed_ms={} send_lead_ms={} cursor={} latest_seq={}",
+                                            stream_id,
+                                            frames_sent,
+                                            tag_ts,
+                                            elapsed_ms,
+                                            send_lead_ms,
+                                            reader.cursor(),
+                                            reader.hub().latest_seq()
+                                        );
                                     }
                                 }
                             }
@@ -828,8 +834,12 @@ impl HttpServer {
                 let local_stream_id_clone = local_stream_id.clone();
 
                 tokio::spawn(async move {
-                    let config = TransportConfig::new(manager_clone, StreamProtocol::RTSP, &local_stream_id_clone)
-                        .with_remote_url(&remote_url_clone);
+                    let config = TransportConfig::new(
+                        manager_clone,
+                        StreamProtocol::RTSP,
+                        &local_stream_id_clone,
+                    )
+                    .with_remote_url(&remote_url_clone);
                     let mut puller = TransportAdapterFactory::create_puller(config);
                     if let Err(e) = puller.start().await {
                         error!("[RTSP Puller] Failed to start: {}", e);
@@ -888,8 +898,12 @@ impl HttpServer {
                 let local_stream_id_clone = local_stream_id.clone();
 
                 tokio::spawn(async move {
-                    let config = TransportConfig::new(manager_clone, StreamProtocol::RTMP, &local_stream_id_clone)
-                        .with_remote_url(&remote_url_clone);
+                    let config = TransportConfig::new(
+                        manager_clone,
+                        StreamProtocol::RTMP,
+                        &local_stream_id_clone,
+                    )
+                    .with_remote_url(&remote_url_clone);
                     let mut puller = TransportAdapterFactory::create_puller(config);
                     if let Err(e) = puller.start().await {
                         error!("[RTMP Puller] Failed to start: {}", e);
@@ -1400,7 +1414,10 @@ impl HttpServer {
                 Ok(Self::http_response(200, "OK", &body))
             }
             ("GET", path) if path.starts_with("/api/play-urls/") => {
-                let stream_id = url_decode_path(path.trim_start_matches("/api/play-urls/").trim_end_matches('/'));
+                let stream_id = url_decode_path(
+                    path.trim_start_matches("/api/play-urls/")
+                        .trim_end_matches('/'),
+                );
                 if stream_id.is_empty() {
                     return Ok(Self::http_response(
                         400,
@@ -1411,23 +1428,54 @@ impl HttpServer {
                 let http_port = config.server.http.port;
                 let rtmp_port = config.server.rtmp.port;
                 let rtsp_port = config.server.rtsp.port;
-                let hls_enabled = config.server.hls.as_ref().map(|h| h.enabled).unwrap_or(false);
-                let http_flv_enabled = config.server.http_flv.as_ref().map(|h| h.enabled).unwrap_or(true);
+                let hls_enabled = config
+                    .server
+                    .hls
+                    .as_ref()
+                    .map(|h| h.enabled)
+                    .unwrap_or(false);
+                let http_flv_enabled = config
+                    .server
+                    .http_flv
+                    .as_ref()
+                    .map(|h| h.enabled)
+                    .unwrap_or(true);
 
                 let mut play_urls = serde_json::Map::new();
-                play_urls.insert("rtmp".to_string(), json!(format!("rtmp://localhost:{}/live/{}", rtmp_port, stream_id)));
-                play_urls.insert("rtsp".to_string(), json!(format!("rtsp://localhost:{}/{}", rtsp_port, stream_id)));
+                play_urls.insert(
+                    "rtmp".to_string(),
+                    json!(format!("rtmp://localhost:{}/live/{}", rtmp_port, stream_id)),
+                );
+                play_urls.insert(
+                    "rtsp".to_string(),
+                    json!(format!("rtsp://localhost:{}/{}", rtsp_port, stream_id)),
+                );
                 if http_flv_enabled {
-                    play_urls.insert("http_flv".to_string(), json!(format!("http://localhost:{}/flv/{}", http_port, stream_id)));
+                    play_urls.insert(
+                        "http_flv".to_string(),
+                        json!(format!("http://localhost:{}/flv/{}", http_port, stream_id)),
+                    );
                 } else {
                     play_urls.insert("http_flv".to_string(), serde_json::Value::Null);
                 }
                 if hls_enabled {
-                    play_urls.insert("hls".to_string(), json!(format!("http://localhost:{}/hls/{}/live.m3u8", http_port, stream_id)));
+                    play_urls.insert(
+                        "hls".to_string(),
+                        json!(format!(
+                            "http://localhost:{}/hls/{}/live.m3u8",
+                            http_port, stream_id
+                        )),
+                    );
                 } else {
                     play_urls.insert("hls".to_string(), serde_json::Value::Null);
                 }
-                play_urls.insert("webrtc_test_page".to_string(), json!(format!("http://localhost:{}/webrtc/webrtc-test.html", http_port)));
+                play_urls.insert(
+                    "webrtc_test_page".to_string(),
+                    json!(format!(
+                        "http://localhost:{}/webrtc/webrtc-test.html",
+                        http_port
+                    )),
+                );
 
                 let body = json!({
                     "stream_id": stream_id,
@@ -1552,7 +1600,6 @@ impl HttpServer {
         label: &str,
     ) -> Result<String> {
         let body_start = Self::json_body(request);
-        let label_str = label.to_string();
         let parse_result = serde_json::from_str::<serde_json::Value>(body_start);
 
         let (remote_url, local_stream_id) = if let Ok(json) = &parse_result {
@@ -1578,6 +1625,9 @@ impl HttpServer {
             ));
         }
 
+        let (effective_protocol, label_str) =
+            Self::effective_pull_protocol(protocol, label, &remote_url);
+
         info!(
             "[HTTP] Starting {} pull from {} to stream {}",
             label_str, remote_url, local_stream_id
@@ -1586,16 +1636,12 @@ impl HttpServer {
         let manager_clone = manager.clone();
         let remote_url_clone = remote_url.clone();
         let local_stream_id_clone = local_stream_id.clone();
-        let proto = protocol.clone();
+        let proto = effective_protocol.clone();
         let lbl = label_str.clone();
 
         tokio::spawn(async move {
-            let config = TransportConfig::new(
-                manager_clone,
-                proto,
-                &local_stream_id_clone,
-            )
-            .with_remote_url(&remote_url_clone);
+            let config = TransportConfig::new(manager_clone, proto, &local_stream_id_clone)
+                .with_remote_url(&remote_url_clone);
             let mut puller = TransportAdapterFactory::create_puller(config);
             if let Err(e) = puller.start().await {
                 error!("[{} Puller] Failed to start: {}", lbl, e);
@@ -1609,10 +1655,21 @@ impl HttpServer {
         let body = json!({
             "stream_id": local_stream_id,
             "remote_url": remote_url,
-            "message": format!("{} pull started", label)
+            "message": format!("{} pull started", label_str)
         })
         .to_string();
         Ok(Self::http_response(200, "OK", &body))
+    }
+
+    fn effective_pull_protocol(
+        protocol: StreamProtocol,
+        label: &str,
+        remote_url: &str,
+    ) -> (StreamProtocol, String) {
+        if protocol == StreamProtocol::HTTP_FLV && is_m3u8_url(remote_url) {
+            return (StreamProtocol::HLS, "HLS".to_string());
+        }
+        (protocol, label.to_string())
     }
 
     fn http_response(code: u32, reason: &str, body: &str) -> String {
@@ -1637,5 +1694,34 @@ impl HttpServer {
             .map(|i| &request[i + 4..])
             .unwrap_or("")
             .trim()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flv_pull_endpoint_routes_m3u8_fragment_to_hls() {
+        let (protocol, label) = HttpServer::effective_pull_protocol(
+            StreamProtocol::HTTP_FLV,
+            "HTTP-FLV",
+            "http://l.cztvcloud.com/channels/lantian/SXxinchang2/720p.m3u8#",
+        );
+
+        assert_eq!(protocol, StreamProtocol::HLS);
+        assert_eq!(label, "HLS");
+    }
+
+    #[test]
+    fn flv_pull_endpoint_keeps_real_flv_as_http_flv() {
+        let (protocol, label) = HttpServer::effective_pull_protocol(
+            StreamProtocol::HTTP_FLV,
+            "HTTP-FLV",
+            "http://example/live.flv",
+        );
+
+        assert_eq!(protocol, StreamProtocol::HTTP_FLV);
+        assert_eq!(label, "HTTP-FLV");
     }
 }

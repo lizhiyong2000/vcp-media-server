@@ -1,6 +1,6 @@
 /// HTTP-FLV Puller
 /// Connects to an HTTP FLV source, parses FLV tags, and publishes frames via StreamManager.
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
@@ -8,8 +8,8 @@ use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info, warn};
 
 use crate::core::{
-    is_keyframe_annex_b, CodecType, MediaFrame, MediaTransport, StreamManager, StreamProtocol,
-    StreamPuller, StreamSourceMode, TransportStatus, MILLISECOND_CLOCK_RATE,
+    CodecType, MILLISECOND_CLOCK_RATE, MediaFrame, MediaTransport, StreamManager, StreamProtocol,
+    StreamPuller, StreamSourceMode, TransportStatus, is_keyframe_annex_b,
 };
 
 /// Simple m3u8 parser for HLS to FLV puller redirect resolution.
@@ -56,7 +56,7 @@ pub fn parse_m3u8_for_segment(content: &str, base_url: &str) -> Option<String> {
     } else {
         // Media playlist - find first TS segment
         for line in &lines {
-            if !line.starts_with("#") && !line.is_empty() && line.ends_with(".ts") {
+            if !line.starts_with("#") && !line.is_empty() && is_ts_url(line) {
                 let uri = if line.starts_with("http") {
                     line.to_string()
                 } else {
@@ -95,6 +95,16 @@ pub(crate) fn resolve_relative_url(base_url: &str, path: &str) -> String {
     }
 }
 
+pub(crate) fn is_m3u8_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.ends_with(".m3u8")
+}
+
+fn is_ts_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.ends_with(".ts")
+}
+
 pub struct FlvPuller {
     stream_manager: Arc<StreamManager>,
     remote_url: Option<String>,
@@ -129,7 +139,7 @@ impl FlvPuller {
         info!("[FLV Puller] =========================================");
 
         // Check if URL is actually HLS (m3u8)
-        let actual_url = if remote_url.ends_with(".m3u8") || remote_url.contains(".m3u8?") {
+        let actual_url = if is_m3u8_url(remote_url) {
             info!("[FLV Puller] Detected HLS URL, resolving to first TS segment...");
             match resolve_hls_to_first_segment(remote_url).await {
                 Ok(Some(seg_url)) => {
@@ -220,7 +230,7 @@ async fn resolve_hls_to_first_segment(url: &str) -> Result<Option<String>> {
     let body = response.text().await?;
     let target = parse_m3u8_for_segment(&body, url);
     if let Some(ref uri) = target {
-        if uri.ends_with(".m3u8") {
+        if is_m3u8_url(uri) {
             // It's a variant playlist, fetch it
             let response2 = client.get(uri).send().await?;
             let body2 = response2.text().await?;
@@ -442,10 +452,10 @@ fn detect_video_codec(
     if let Some(es) = es_map.get(&video_pid) {
         match es.codec {
             crate::server::hls::ts_parser::TsCodec::H264 => {
-                return (Some(CodecType::H264), video_pid)
+                return (Some(CodecType::H264), video_pid);
             }
             crate::server::hls::ts_parser::TsCodec::H265 => {
-                return (Some(CodecType::H265), video_pid)
+                return (Some(CodecType::H265), video_pid);
             }
             crate::server::hls::ts_parser::TsCodec::Mpeg2Video
             | crate::server::hls::ts_parser::TsCodec::AAC => return (None, video_pid),
@@ -645,7 +655,10 @@ async fn process_flv_stream(
                                                     stream_id, sps_data, pps_data,
                                                 );
                                                 sps_sent = true;
-                                                debug!("[FLV Puller] AVC sequence header stored: SPS={} PPS={}", sps_len, offset);
+                                                debug!(
+                                                    "[FLV Puller] AVC sequence header stored: SPS={} PPS={}",
+                                                    sps_len, offset
+                                                );
                                             }
                                         }
                                         let _ = buf.split_to(total_tag_size);
@@ -855,5 +868,33 @@ impl StreamPuller for FlvPuller {
             self.do_pull(&url, &self.stream_id).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hls_url_detection_accepts_query_and_fragment() {
+        assert!(is_m3u8_url("http://example/live/playlist.m3u8"));
+        assert!(is_m3u8_url("http://example/live/playlist.m3u8?token=1"));
+        assert!(is_m3u8_url("http://example/live/playlist.m3u8#"));
+    }
+
+    #[test]
+    fn media_playlist_segment_detection_accepts_query_and_fragment() {
+        let playlist = "#EXTM3U\n#EXTINF:8.00\n720p/0/seg.ts#\n";
+
+        let target = parse_m3u8_for_segment(
+            playlist,
+            "http://example/channels/lantian/SXxinchang2/720p.m3u8#",
+        )
+        .expect("segment target");
+
+        assert_eq!(
+            target,
+            "http://example/channels/lantian/SXxinchang2/720p/0/seg.ts#"
+        );
     }
 }

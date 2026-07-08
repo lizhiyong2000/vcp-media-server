@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use tokio::sync::Semaphore;
-use tokio::time::{timeout, Instant};
+use tokio::time::{Instant, timeout};
 use tracing::{debug, error, info};
 
 use crate::core::live_play::{is_idr_frame, is_playable_video_frame};
 use crate::core::{
-    ensure_annex_b, iter_annex_b_nal_ranges, prepend_annex_b_config_if_needed, CodecType,
-    MediaFrame, StreamManager, StreamSourceMode, DEFAULT_SNAPSHOT_DIR,
+    CodecType, DEFAULT_SNAPSHOT_DIR, MediaFrame, StreamHub, StreamManager, StreamSourceMode,
+    ensure_annex_b, iter_annex_b_nal_ranges, prepend_annex_b_config_if_needed,
 };
 use crate::server::webrtc::request_publisher_keyframe;
 
@@ -28,6 +28,8 @@ const SNAPSHOT_MAX_RAW_BYTES: usize = 4 * 1024 * 1024;
 const SNAPSHOT_RING_LOOKBACK: u64 = 600;
 const SNAPSHOT_H264_INTRA_PREROLL_FRAMES: u64 = 120;
 const SNAPSHOT_H264_INTRA_SKIP_DECODED_FRAMES: usize = 30;
+const SNAPSHOT_PULL_IDR_MIN_VIDEO_FRAMES: usize = 8;
+const SNAPSHOT_PULL_IDR_COLLECT_WAIT_MS: u64 = 1_500;
 
 #[derive(Debug, Clone)]
 struct SnapshotSelection {
@@ -210,6 +212,8 @@ impl SnapshotManager {
         let image_path = dir.join(format!("{id}.jpg"));
 
         let selection = self.wait_latest_idr(&req.stream_id).await?;
+        self.wait_for_pull_idr_video_window(&req.stream_id, &selection)
+            .await;
         let frame = selection.frame;
         debug!(
             "[Snapshot] selected frame stream='{}' id='{}' seq={} codec={:?} ts={} keyframe={} bytes={} clock_rate={:?} wait_elapsed_ms={}",
@@ -435,6 +439,82 @@ impl SnapshotManager {
             polls
         );
         Err(anyhow!("no playable H264/H265 keyframe available"))
+    }
+
+    async fn wait_for_pull_idr_video_window(&self, stream_id: &str, selection: &SnapshotSelection) {
+        if selection.h264_intra_fallback || !selection.frame.is_keyframe {
+            return;
+        }
+        let Some(hub) = self.stream_manager.get_hub(stream_id) else {
+            return;
+        };
+        if hub.stream().source != StreamSourceMode::Pull {
+            return;
+        }
+
+        let initial = count_snapshot_video_frames(&hub, selection.seq, &selection.frame);
+        if initial >= SNAPSHOT_PULL_IDR_MIN_VIDEO_FRAMES {
+            debug!(
+                "[Snapshot] pull IDR video window already ready stream='{}' seq={} frames={} min_frames={} latest_seq={}",
+                stream_id,
+                selection.seq,
+                initial,
+                SNAPSHOT_PULL_IDR_MIN_VIDEO_FRAMES,
+                hub.latest_seq()
+            );
+            return;
+        }
+
+        let mut notify = hub.subscribe_notify();
+        let _baseline = *notify.borrow();
+        let wait_budget = Duration::from_millis(SNAPSHOT_PULL_IDR_COLLECT_WAIT_MS);
+        let started = Instant::now();
+        let deadline = started + wait_budget;
+        let mut frames = initial;
+        let mut polls = 0u64;
+        debug!(
+            "[Snapshot] waiting pull IDR video window stream='{}' seq={} initial_frames={} min_frames={} wait_ms={} latest_seq={}",
+            stream_id,
+            selection.seq,
+            initial,
+            SNAPSHOT_PULL_IDR_MIN_VIDEO_FRAMES,
+            wait_budget.as_millis(),
+            hub.latest_seq()
+        );
+
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let wait_for = remaining.min(Duration::from_millis(100));
+            let _ = timeout(wait_for, notify.changed()).await;
+            polls = polls.saturating_add(1);
+            frames = count_snapshot_video_frames(&hub, selection.seq, &selection.frame);
+            if frames >= SNAPSHOT_PULL_IDR_MIN_VIDEO_FRAMES {
+                debug!(
+                    "[Snapshot] pull IDR video window ready stream='{}' seq={} frames={} waited_ms={} polls={} latest_seq={}",
+                    stream_id,
+                    selection.seq,
+                    frames,
+                    started.elapsed().as_millis(),
+                    polls,
+                    hub.latest_seq()
+                );
+                return;
+            }
+        }
+
+        debug!(
+            "[Snapshot] pull IDR video window wait ended stream='{}' seq={} frames={} min_frames={} waited_ms={} polls={} latest_seq={}",
+            stream_id,
+            selection.seq,
+            frames,
+            SNAPSHOT_PULL_IDR_MIN_VIDEO_FRAMES,
+            started.elapsed().as_millis(),
+            polls,
+            hub.latest_seq()
+        );
     }
 
     fn find_snapshot_frame(&self, stream_id: &str) -> Option<SnapshotSelection> {
@@ -879,6 +959,30 @@ fn collect_snapshot_video_annex_b(
     out
 }
 
+fn count_snapshot_video_frames(hub: &Arc<StreamHub>, idr_seq: u64, selected: &MediaFrame) -> usize {
+    let latest = hub.latest_seq();
+    let mut frames = 0usize;
+    for seq in idr_seq..=latest {
+        let Some(frame) = hub.get(seq) else {
+            continue;
+        };
+        if frame.track_id != selected.track_id || frame.codec != selected.codec {
+            continue;
+        }
+        if frames > 0 && frame.is_keyframe {
+            break;
+        }
+        if ensure_annex_b(&frame.data).is_empty() {
+            continue;
+        }
+        frames += 1;
+        if frames >= SNAPSHOT_PULL_IDR_MIN_VIDEO_FRAMES {
+            break;
+        }
+    }
+    frames
+}
+
 fn is_snapshot_h264_intra_candidate(frame: &MediaFrame) -> bool {
     if frame.codec != CodecType::H264 {
         return false;
@@ -1084,22 +1188,30 @@ mod tests {
 
         let prepared = prepare_video_snapshot_frame(&manager, "s", frame, 0);
 
-        assert!(prepared
-            .data
-            .windows(8)
-            .any(|w| w == [0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01]));
-        assert!(prepared
-            .data
-            .windows(8)
-            .any(|w| w == [0, 0, 0, 1, 0x42, 0x01, 0x01, 0x60]));
-        assert!(prepared
-            .data
-            .windows(8)
-            .any(|w| w == [0, 0, 0, 1, 0x44, 0x01, 0xc0, 0xf1]));
-        assert!(prepared
-            .data
-            .windows(7)
-            .any(|w| w == [0, 0, 0, 1, 0x26, 0x01, 0xaa]));
+        assert!(
+            prepared
+                .data
+                .windows(8)
+                .any(|w| w == [0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01])
+        );
+        assert!(
+            prepared
+                .data
+                .windows(8)
+                .any(|w| w == [0, 0, 0, 1, 0x42, 0x01, 0x01, 0x60])
+        );
+        assert!(
+            prepared
+                .data
+                .windows(8)
+                .any(|w| w == [0, 0, 0, 1, 0x44, 0x01, 0xc0, 0xf1])
+        );
+        assert!(
+            prepared
+                .data
+                .windows(7)
+                .any(|w| w == [0, 0, 0, 1, 0x26, 0x01, 0xaa])
+        );
         assert_eq!(prepared.codec, CodecType::H265);
         assert_eq!(prepared.clock_rate, Some(VIDEO_RTP_CLOCK_RATE));
     }
@@ -1142,6 +1254,56 @@ mod tests {
 
         assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x65]));
         assert!(prepared.data.windows(5).any(|w| w == [0, 0, 0, 1, 0x41]));
+    }
+
+    #[tokio::test]
+    async fn pull_idr_snapshot_waits_for_following_video_window() {
+        let stream_manager = Arc::new(StreamManager::new());
+        stream_manager.create_stream("s", StreamSourceMode::Pull, StreamProtocol::HLS, None);
+        stream_manager.set_stream_sps_pps("s", vec![0x67, 0x42], vec![0x68, 0xce]);
+
+        let idr = MediaFrame::new(
+            "s".to_string(),
+            0,
+            1_000,
+            Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x88]),
+            true,
+            CodecType::H264,
+        );
+        stream_manager.publish_frame(idr.clone());
+
+        let publisher = stream_manager.clone();
+        tokio::spawn(async move {
+            for i in 1..SNAPSHOT_PULL_IDR_MIN_VIDEO_FRAMES {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                publisher.publish_frame(MediaFrame::new(
+                    "s".to_string(),
+                    0,
+                    1_000 + i as u64 * 33,
+                    Bytes::from_static(&[0, 0, 0, 1, 0x41, 0x9a]),
+                    false,
+                    CodecType::H264,
+                ));
+            }
+        });
+
+        let snapshot_manager =
+            SnapshotManager::new(stream_manager.clone(), SnapshotConfig::default());
+        let selection = SnapshotSelection {
+            frame: idr,
+            seq: 0,
+            h264_intra_fallback: false,
+        };
+
+        snapshot_manager
+            .wait_for_pull_idr_video_window("s", &selection)
+            .await;
+
+        let hub = stream_manager.get_hub("s").expect("hub");
+        assert_eq!(
+            count_snapshot_video_frames(&hub, 0, &selection.frame),
+            SNAPSHOT_PULL_IDR_MIN_VIDEO_FRAMES
+        );
     }
 
     #[test]
