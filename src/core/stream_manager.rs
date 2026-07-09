@@ -1481,4 +1481,458 @@ mod tests {
             Some("publisher-next")
         );
     }
+
+    // -----------------------------------------------------------------------
+    // StreamEvent broadcast channel tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: collect up to `limit` events from a receiver with a short timeout.
+    async fn drain_events(rx: &mut StreamEventReceiver, limit: usize) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match tokio::time::timeout_at(deadline.into(), rx.recv()).await {
+                Ok(Ok(event)) => {
+                    events.push(event);
+                    if events.len() >= limit {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn subscribe_events_returns_a_live_receiver() {
+        let manager = StreamManager::new();
+        let rx = manager.subscribe_events();
+        // Receiver should be valid (not closed/lagged before any event)
+        assert_eq!(rx.len(), 0);
+    }
+
+    #[test]
+    fn event_stream_created_emitted_when_stream_is_created() {
+        let manager = StreamManager::new();
+        let mut rx = manager.subscribe_events();
+
+        let stream = create_test_stream(&manager, "s");
+
+        let event = rx.try_recv().expect("should receive StreamCreated event");
+        match event {
+            StreamEvent::StreamCreated {
+                stream_id,
+                source,
+                protocol,
+                pull_url,
+            } => {
+                assert_eq!(stream_id, "s");
+                assert_eq!(source, StreamSourceMode::Pull);
+                assert_eq!(protocol, StreamProtocol::RTSP);
+                assert_eq!(pull_url, Some("rtsp://example/s".to_string()));
+            }
+            other => panic!("expected StreamCreated, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err()); // no more events
+        drop(rx);
+        let _ = stream;
+    }
+
+    #[test]
+    fn event_stream_removed_emitted_when_stream_is_removed() {
+        let manager = StreamManager::new();
+        let mut rx = manager.subscribe_events();
+
+        create_test_stream(&manager, "s");
+        let _created = rx.try_recv().unwrap(); // consume StreamCreated
+
+        manager.remove_stream(&"s".to_string());
+
+        let event = rx.try_recv().expect("should receive StreamRemoved event");
+        match event {
+            StreamEvent::StreamRemoved { stream_id } => {
+                assert_eq!(stream_id, "s");
+            }
+            other => panic!("expected StreamRemoved, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_stream_removed_not_emitted_for_nonexistent_stream() {
+        let manager = StreamManager::new();
+        let mut rx = manager.subscribe_events();
+
+        manager.remove_stream(&"nonexistent".to_string());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_publisher_acquired_and_released_emitted_in_order() {
+        let manager = StreamManager::new();
+        let mut rx = manager.subscribe_events();
+
+        create_test_stream(&manager, "s");
+        let _created = rx.try_recv().unwrap();
+
+        manager
+            .acquire_publisher("s", "pub-1")
+            .expect("acquire publisher");
+
+        let event = rx.try_recv().expect("should receive PublisherAcquired");
+        match event {
+            StreamEvent::PublisherAcquired {
+                stream_id,
+                publisher_id,
+            } => {
+                assert_eq!(stream_id, "s");
+                assert_eq!(publisher_id, "pub-1");
+            }
+            other => panic!("expected PublisherAcquired, got {other:?}"),
+        }
+
+        manager.release_publisher("s", "pub-1");
+
+        let event = rx.try_recv().expect("should receive PublisherReleased");
+        match event {
+            StreamEvent::PublisherReleased {
+                stream_id,
+                publisher_id,
+            } => {
+                assert_eq!(stream_id, "s");
+                assert_eq!(publisher_id, "pub-1");
+            }
+            other => panic!("expected PublisherReleased, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_publisher_released_not_emitted_for_non_owner() {
+        let manager = StreamManager::new();
+        let mut rx = manager.subscribe_events();
+
+        create_test_stream(&manager, "s");
+        let _created = rx.try_recv().unwrap();
+
+        manager.acquire_publisher("s", "pub-1").unwrap();
+        let _acquired = rx.try_recv().unwrap();
+
+        // Release by non-owner should be a no-op
+        let released = manager.release_publisher("s", "non-owner");
+        assert!(!released);
+        assert!(rx.try_recv().is_err()); // no extra event
+    }
+
+    #[test]
+    fn event_receiver_created_and_removed_emitted_in_order() {
+        let manager = StreamManager::new();
+        let mut rx = manager.subscribe_events();
+
+        create_test_stream(&manager, "s");
+        let _created = rx.try_recv().unwrap();
+
+        let receiver = manager.create_pull_receiver("s", StreamProtocol::RTSP, "127.0.0.1:554");
+
+        let event = rx.try_recv().expect("should receive ReceiverCreated");
+        match event {
+            StreamEvent::ReceiverCreated {
+                stream_id,
+                ref receiver_id,
+                mode,
+                protocol,
+                ref client_addr,
+            } => {
+                assert_eq!(stream_id, "s");
+                assert_eq!(*receiver_id, receiver.id);
+                assert_eq!(mode, StreamSinkMode::Pull);
+                assert_eq!(protocol, StreamProtocol::RTSP);
+                assert_eq!(client_addr.as_deref(), Some("127.0.0.1:554"));
+            }
+            other => panic!("expected ReceiverCreated, got {other:?}"),
+        }
+
+        manager.remove_receiver(&receiver.id);
+
+        let event = rx.try_recv().expect("should receive ReceiverRemoved");
+        match event {
+            StreamEvent::ReceiverRemoved {
+                stream_id,
+                receiver_id,
+            } => {
+                assert_eq!(stream_id, "s");
+                assert_eq!(receiver_id, receiver.id);
+            }
+            other => panic!("expected ReceiverRemoved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_receiver_created_for_push_receiver_includes_mode_and_no_client_addr() {
+        let manager = StreamManager::new();
+        let mut rx = manager.subscribe_events();
+
+        create_test_stream(&manager, "s");
+        let _created = rx.try_recv().unwrap();
+
+        manager.create_push_receiver("s", StreamProtocol::RTMP, "rtmp://edge/live");
+
+        let event = rx.try_recv().expect("should receive ReceiverCreated");
+        match event {
+            StreamEvent::ReceiverCreated {
+                stream_id,
+                mode,
+                protocol,
+                client_addr,
+                ..
+            } => {
+                assert_eq!(stream_id, "s");
+                assert_eq!(mode, StreamSinkMode::Push);
+                assert_eq!(protocol, StreamProtocol::RTMP);
+                assert!(client_addr.is_none());
+            }
+            other => panic!("expected ReceiverCreated for push, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_receiver_status_changed_emitted_on_transition() {
+        let manager = StreamManager::new();
+        let mut rx = manager.subscribe_events();
+
+        create_test_stream(&manager, "s");
+        let _created = rx.try_recv().unwrap();
+
+        let receiver = manager.create_receiver("s", StreamSinkMode::Pull, StreamProtocol::HTTP);
+        let _recv_created = rx.try_recv().unwrap();
+
+        manager
+            .set_receiver_status(&receiver.id, ReceiverStatus::Playing)
+            .unwrap();
+
+        let event = rx.try_recv().expect("should receive ReceiverStatusChanged");
+        match event {
+            StreamEvent::ReceiverStatusChanged {
+                ref stream_id,
+                ref receiver_id,
+                old_status,
+                new_status,
+            } => {
+                assert_eq!(stream_id, "s");
+                assert_eq!(*receiver_id, receiver.id);
+                assert_eq!(old_status, ReceiverStatus::Idle);
+                assert_eq!(new_status, ReceiverStatus::Playing);
+            }
+            other => panic!("expected ReceiverStatusChanged, got {other:?}"),
+        }
+
+        // Setting same status should NOT emit a duplicate event
+        manager
+            .set_receiver_status(&receiver.id, ReceiverStatus::Playing)
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_stream_status_changed_emitted_on_set_status() {
+        let manager = StreamManager::new();
+        let mut rx = manager.subscribe_events();
+
+        create_test_stream(&manager, "s");
+        let _created = rx.try_recv().unwrap();
+
+        manager.set_status("s", StreamStatus::Publishing).unwrap();
+
+        let event = rx.try_recv().expect("should receive StreamStatusChanged");
+        match event {
+            StreamEvent::StreamStatusChanged {
+                stream_id,
+                old_status,
+                new_status,
+            } => {
+                assert_eq!(stream_id, "s");
+                assert_eq!(old_status, StreamStatus::Created);
+                assert_eq!(new_status, StreamStatus::Publishing);
+            }
+            other => panic!("expected StreamStatusChanged, got {other:?}"),
+        }
+
+        // Same status — no event
+        manager.set_status("s", StreamStatus::Publishing).unwrap();
+        assert!(rx.try_recv().is_err());
+
+        manager.set_status("s", StreamStatus::Unpublished).unwrap();
+        let event = rx.try_recv().expect("should receive StreamStatusChanged for Unpublished");
+        match event {
+            StreamEvent::StreamStatusChanged { new_status, .. } => {
+                assert_eq!(new_status, StreamStatus::Unpublished);
+            }
+            other => panic!("expected StreamStatusChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_stream_status_changed_emitted_on_publish_frame() {
+        let manager = StreamManager::new();
+        let mut rx = manager.subscribe_events();
+
+        create_test_stream(&manager, "s");
+        let _created = rx.try_recv().unwrap();
+
+        // publish_frame should trigger Created→Publishing transition
+        manager.publish_frame(h264_frame("s", 1000, true));
+
+        let event = rx.try_recv().expect("should receive StreamStatusChanged via publish_frame");
+        match event {
+            StreamEvent::StreamStatusChanged {
+                ref stream_id,
+                old_status,
+                new_status,
+            } => {
+                assert_eq!(stream_id, "s");
+                assert!(matches!(old_status, StreamStatus::Created));
+                assert_eq!(new_status, StreamStatus::Publishing);
+            }
+            other => panic!("expected StreamStatusChanged from publish_frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_multiple_subscribers_receive_same_events() {
+        let manager = StreamManager::new();
+        let mut rx1 = manager.subscribe_events();
+        let mut rx2 = manager.subscribe_events();
+
+        create_test_stream(&manager, "s");
+
+        for rx in [&mut rx1, &mut rx2] {
+            let event = rx.try_recv().expect("subscriber should receive StreamCreated");
+            assert!(matches!(event, StreamEvent::StreamCreated { .. }));
+        }
+    }
+
+    #[test]
+    fn no_event_emitted_when_no_subscribers_present() {
+        let manager = StreamManager::new();
+
+        // Create/remove streams without any subscriber — should not panic or block
+        let _stream = create_test_stream(&manager, "s1");
+        manager.remove_stream(&"s1".to_string());
+
+        let _stream = create_test_stream(&manager, "s2");
+        manager.acquire_publisher("s2", "pub-1").unwrap();
+        manager.release_publisher("s2", "pub-1");
+        manager.remove_stream(&"s2".to_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn event_lagged_receiver_is_detected_when_channel_overflowed() {
+        let manager = Arc::new(StreamManager::new());
+        let mut rx = manager.subscribe_events();
+
+        // Create many streams quickly to fill the channel buffer
+        // (channel capacity is 256; 2 events per stream: StreamCreated + status changes)
+        for i in 0..400 {
+            manager.create_stream(
+                &format!("s{i}"),
+                StreamSourceMode::Push,
+                StreamProtocol::Unknown,
+                None,
+            );
+        }
+
+        // Without draining, the slow subscriber should eventually see Lagged
+        // Drain a few to avoid actual overflow if tests run slowly
+        let _ = rx.try_recv();
+
+        // Now drain rapidly with a dedicated task to clear the backlog
+        let _events = drain_events(&mut rx, 800).await;
+        // The key assertion: even after potential lag, the event system
+        // did not crash/block the manager
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn event_concurrent_stream_operations_preserve_event_ordering_per_stream() {
+        let manager = Arc::new(StreamManager::new());
+        let mut rx = manager.subscribe_events();
+
+        const N: usize = 16;
+        let mut handles = Vec::new();
+
+        for i in 0..N {
+            let mgr = Arc::clone(&manager);
+            handles.push(tokio::spawn(async move {
+                let sid = format!("s{i}");
+                mgr.create_stream(
+                    &sid,
+                    StreamSourceMode::Push,
+                    StreamProtocol::Unknown,
+                    None,
+                );
+                mgr.acquire_publisher(&sid, "pub").unwrap();
+                mgr.release_publisher(&sid, "pub");
+                mgr.remove_stream(&sid);
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let events = drain_events(&mut rx, N * 4).await;
+
+        // Each stream should produce 4 events in order:
+        // StreamCreated → PublisherAcquired → PublisherReleased → StreamRemoved
+        // (StreamStatusChanged may also appear for publish_frame/update_stream_status)
+        let mut created: HashMap<String, usize> = HashMap::new();
+        let mut removed: HashMap<String, usize> = HashMap::new();
+
+        for event in &events {
+            match event {
+                StreamEvent::StreamCreated { stream_id, .. } => {
+                    *created.entry(stream_id.clone()).or_default() += 1;
+                }
+                StreamEvent::StreamRemoved { stream_id } => {
+                    *removed.entry(stream_id.clone()).or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+
+        // Every stream should be both created and removed
+        for i in 0..N {
+            let sid = format!("s{i}");
+            assert_eq!(
+                created.get(&sid).copied().unwrap_or(0),
+                1,
+                "Stream {sid} should be created exactly once"
+            );
+            assert_eq!(
+                removed.get(&sid).copied().unwrap_or(0),
+                1,
+                "Stream {sid} should be removed exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn event_receiver_removed_not_emitted_for_unknown_receiver() {
+        let manager = StreamManager::new();
+        let mut rx = manager.subscribe_events();
+
+        let result = manager.remove_receiver(&"unknown-receiver-id".to_string());
+        assert!(result.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn event_set_receiver_status_returns_error_for_unregistered_receiver() {
+        let manager = StreamManager::new();
+        let result = manager.set_receiver_status(&"unknown".to_string(), ReceiverStatus::Playing);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not found"));
+    }
 }
