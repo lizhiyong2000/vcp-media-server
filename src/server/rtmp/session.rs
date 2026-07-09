@@ -207,7 +207,10 @@ impl RtmpSession {
 pub fn stream_name_from_tc_url(tc_url: &str) -> Option<String> {
     let rest = tc_url.strip_prefix("rtmp://")?;
     let path = rest.split_once('/')?.1;
-    let parts: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     match parts.as_slice() {
         ["live", name] => Some((*name).to_string()),
         [name] => Some((*name).to_string()),

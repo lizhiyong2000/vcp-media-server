@@ -31,9 +31,10 @@ use super::sdp_h265::{build_h265_sdp_fmtp, patch_answer_sdp_h265};
 use super::signaling::ServerSignal;
 use crate::core::dispatch::DispatchError;
 use crate::core::{
-    extract_hevc_param_sets, is_keyframe_annex_b, is_parameter_set_only as is_parameter_set_only_for_codec,
-    packetize_hevc_access_unit_for_rtp, prepend_annex_b_config, video_media_timestamp_to_rtp_ticks,
-    CodecType, DispatchPolicy, MediaFrame, MetricsRegistry, PlaybackProtocol, StreamManager,
+    extract_hevc_param_sets, is_keyframe_annex_b,
+    is_parameter_set_only as is_parameter_set_only_for_codec, packetize_hevc_access_unit_for_rtp,
+    prepend_annex_b_config, video_media_timestamp_to_rtp_ticks, CodecType, DispatchPolicy,
+    MediaFrame, MetricsRegistry, PlaybackProtocol, StreamManager,
 };
 use webrtc::api::API;
 
@@ -106,7 +107,11 @@ pub async fn start_play(
         info!(
             "[WebRTC] Codec negotiation: created H265 track with MIME type '{}', fmtp='{}'",
             codec_capability.mime_type,
-            if codec_capability.sdp_fmtp_line.is_empty() { "none" } else { &codec_capability.sdp_fmtp_line }
+            if codec_capability.sdp_fmtp_line.is_empty() {
+                "none"
+            } else {
+                &codec_capability.sdp_fmtp_line
+            }
         );
         OutboundVideoTrack::H265 {
             track,
@@ -126,7 +131,11 @@ pub async fn start_play(
         info!(
             "[WebRTC] Codec negotiation: created H264 track with MIME type '{}', fmtp='{}'",
             codec_capability.mime_type,
-            if codec_capability.sdp_fmtp_line.is_empty() { "none" } else { &codec_capability.sdp_fmtp_line }
+            if codec_capability.sdp_fmtp_line.is_empty() {
+                "none"
+            } else {
+                &codec_capability.sdp_fmtp_line
+            }
         );
         OutboundVideoTrack::H264(OutboundH264Track::new(video_track))
     };
@@ -153,9 +162,7 @@ pub async fn start_play(
                 }
             }
             CodecType::H265 => {
-                if let (Some(vps), Some(sps), Some(pps)) =
-                    (&stream.vps, &stream.sps, &stream.pps)
-                {
+                if let (Some(vps), Some(sps), Some(pps)) = (&stream.vps, &stream.sps, &stream.pps) {
                     answer_sdp = patch_answer_sdp_h265(&answer_sdp, vps, sps, pps);
                 }
             }
@@ -274,12 +281,12 @@ fn ensure_offer_supports_video_codec(offer_sdp: &str, codec: CodecType) -> Resul
         }
         _ => return Err(anyhow!("Unsupported WebRTC video codec {:?}", codec)),
     };
-    
+
     info!(
         "[WebRTC] Codec negotiation: checking if offer supports {:?} - {}",
         codec, details
     );
-    
+
     if supported {
         Ok(())
     } else {
@@ -696,11 +703,7 @@ async fn relay_stream_to_track(
         if rtp_sent <= 8 || is_idr {
             info!(
                 "[WebRTC] Play sent stream='{}' #{} rtp_ts={} [{}] kf={}",
-                stream_id,
-                rtp_sent,
-                rtp_ts,
-                nalu_desc,
-                is_idr
+                stream_id, rtp_sent, rtp_ts, nalu_desc, is_idr
             );
         } else if rtp_sent % 100 == 0 {
             info!(
@@ -946,7 +949,8 @@ mod tests {
 
     #[test]
     fn webrtc_mime_type_falls_back_to_hevc_when_no_h265() {
-        let hevc_only_offer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 126\r\na=rtpmap:126 HEVC/90000\r\n";
+        let hevc_only_offer =
+            "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 126\r\na=rtpmap:126 HEVC/90000\r\n";
         assert_eq!(
             webrtc_mime_type(CodecType::H265, hevc_only_offer),
             MIME_TYPE_HEVC

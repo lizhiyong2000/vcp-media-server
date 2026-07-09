@@ -125,10 +125,7 @@ impl RtmpPusher {
                 Ok(_) => continue,
                 Err(crate::core::dispatch::DispatchError::Closed) => break,
                 Err(e) => {
-                    error!(
-                        "[RTMP Pusher] [Send Loop] Receive error: {:?}",
-                        e
-                    );
+                    error!("[RTMP Pusher] [Send Loop] Receive error: {:?}", e);
                     break;
                 }
             };
@@ -156,13 +153,8 @@ impl RtmpPusher {
                 let track = track.unwrap();
 
                 if !sent_sequence_headers && frame_count == 1 {
-                    Self::send_sequence_headers(
-                        &mut writer,
-                        &tracks,
-                        msg_stream_id,
-                        chunk_size,
-                    )
-                    .await;
+                    Self::send_sequence_headers(&mut writer, &tracks, msg_stream_id, chunk_size)
+                        .await;
                     sent_sequence_headers = true;
                 }
 
@@ -254,7 +246,9 @@ impl RtmpPusher {
         if let Some(video_track) = video_track {
             match video_track.codec {
                 CodecType::H264 => {
-                    let sps_data = vec![0x67, 0x42, 0x00, 0x1F, 0xD9, 0x01, 0x40, 0x1E, 0x16, 0xDD, 0x00];
+                    let sps_data = vec![
+                        0x67, 0x42, 0x00, 0x1F, 0xD9, 0x01, 0x40, 0x1E, 0x16, 0xDD, 0x00,
+                    ];
                     let pps_data = vec![0x68, 0xCE, 0x38, 0x80];
                     let seq_header = build_avc_sequence_header(&sps_data, &pps_data);
                     let _ = Self::send_rtmp_message(
@@ -290,29 +284,14 @@ impl RtmpPusher {
 
         if audio_track.is_some() {
             let seq_header = build_aac_sequence_header();
-            let _ = Self::send_rtmp_message(
-                writer,
-                0x08,
-                msg_stream_id,
-                0,
-                &seq_header,
-                chunk_size,
-                0,
-            )
-            .await;
+            let _ =
+                Self::send_rtmp_message(writer, 0x08, msg_stream_id, 0, &seq_header, chunk_size, 0)
+                    .await;
         }
 
         let metadata = build_metadata(1920, 1080, "");
-        let _ = Self::send_rtmp_message(
-            writer,
-            0x12,
-            msg_stream_id,
-            0,
-            &metadata,
-            chunk_size,
-            0,
-        )
-        .await;
+        let _ =
+            Self::send_rtmp_message(writer, 0x12, msg_stream_id, 0, &metadata, chunk_size, 0).await;
     }
 
     async fn cache_and_send_h264_frame(
@@ -417,7 +396,8 @@ impl RtmpPusher {
         chunk_size: usize,
         frame_count: u64,
     ) -> Result<()> {
-        let message = chunk::encode_message(msg_type, timestamp, msg_stream_id, payload, chunk_size, 3);
+        let message =
+            chunk::encode_message(msg_type, timestamp, msg_stream_id, payload, chunk_size, 3);
         if let Err(e) = writer.write_all(&message).await {
             error!(
                 "[RTMP Pusher] [Send Loop] Frame #{:>6} - Write error: {}",
@@ -471,9 +451,7 @@ impl MediaTransport for RtmpPusher {
 
         if self.tracks.is_none() {
             self.set_status(TransportStatus::Error("Tracks not set".to_string()));
-            return Err(anyhow!(
-                "Tracks not set. Call set_tracks() before start()"
-            ));
+            return Err(anyhow!("Tracks not set. Call set_tracks() before start()"));
         }
 
         let tracks = self.tracks.as_ref().unwrap();
@@ -500,7 +478,8 @@ impl MediaTransport for RtmpPusher {
         let mut server_stream_id: u32 = 1;
 
         info!("[RTMP Pusher] [Step 3/5] Sending connect...");
-        let connect_msg = super::puller::build_connect_command(tx_id, &rtmp_url.app, &rtmp_url.tc_url);
+        let connect_msg =
+            super::puller::build_connect_command(tx_id, &rtmp_url.app, &rtmp_url.tc_url);
         conn.send_message(0x14, 0, &connect_msg).await?;
 
         let _ = wait_for_result(&mut conn, tx_id, "connect").await?;
@@ -515,7 +494,8 @@ impl MediaTransport for RtmpPusher {
 
         info!("[RTMP Pusher] [Step 5/5] Sending publish...");
         let publish_msg = build_publish_command(tx_id, &rtmp_url.stream_name, server_stream_id);
-        conn.send_message(0x14, server_stream_id, &publish_msg).await?;
+        conn.send_message(0x14, server_stream_id, &publish_msg)
+            .await?;
 
         let _ = wait_for_publish_start(&mut conn).await?;
 
@@ -552,7 +532,10 @@ impl MediaTransport for RtmpPusher {
     }
 
     async fn stop(&mut self) -> Result<()> {
-        if matches!(self.status(), TransportStatus::Closed | TransportStatus::Error(_)) {
+        if matches!(
+            self.status(),
+            TransportStatus::Closed | TransportStatus::Error(_)
+        ) {
             return Ok(());
         }
         self.set_status(TransportStatus::Closed);
@@ -572,7 +555,10 @@ impl StreamPusher for RtmpPusher {
     }
 
     async fn pause(&mut self) -> Result<()> {
-        if matches!(self.status(), TransportStatus::Closed | TransportStatus::Error(_)) {
+        if matches!(
+            self.status(),
+            TransportStatus::Closed | TransportStatus::Error(_)
+        ) {
             return Err(anyhow!("Pusher is not running"));
         }
         self.set_paused(true);
@@ -616,7 +602,10 @@ async fn wait_for_result(conn: &mut RtmpConnection, tx_id: f64, command: &str) -
                         if cmd == "_result" || cmd == "_error" {
                             if let Some(Amf0Value::Number(id)) = values.get(1) {
                                 if (id - tx_id).abs() < 0.001 {
-                                    info!("[RTMP Pusher] Received {} response for {}", cmd, command);
+                                    info!(
+                                        "[RTMP Pusher] Received {} response for {}",
+                                        cmd, command
+                                    );
                                     return Ok(());
                                 }
                             }

@@ -1,9 +1,9 @@
 use base64::Engine;
 use std::result::Result as StdResult;
+use tracing::info;
 use webrtc::sdp::description::common::Attribute;
 use webrtc::sdp::description::media::MediaDescription;
 use webrtc::sdp::description::session::SessionDescription;
-use tracing::info;
 
 pub fn build_h264_sdp_fmtp(sps: &[u8], pps: &[u8]) -> String {
     let profile = profile_level_id_from_sps(sps).unwrap_or_else(|| "42e01f".to_string());
@@ -52,42 +52,58 @@ pub fn h264_payload_type_from_sdp(sdp: &str) -> Option<u8> {
 }
 
 fn find_video_media_description(sdp: &SessionDescription) -> Option<&MediaDescription> {
-    sdp.media_descriptions.iter().find(|md| md.media_name.media == "video")
+    sdp.media_descriptions
+        .iter()
+        .find(|md| md.media_name.media == "video")
 }
 
 fn find_video_media_description_mut(sdp: &mut SessionDescription) -> Option<&mut MediaDescription> {
-    sdp.media_descriptions.iter_mut().find(|md| md.media_name.media == "video")
+    sdp.media_descriptions
+        .iter_mut()
+        .find(|md| md.media_name.media == "video")
 }
 
 fn find_fmtp_attr_index(md: &MediaDescription, payload_type: u8) -> Option<usize> {
     md.attributes.iter().position(|attr| {
-        attr.key == "fmtp" && attr.value.as_ref().map_or(false, |v| v.starts_with(&format!("{payload_type} ")))
+        attr.key == "fmtp"
+            && attr
+                .value
+                .as_ref()
+                .map_or(false, |v| v.starts_with(&format!("{payload_type} ")))
     })
 }
 
 fn find_rtpmap_attr_index(md: &MediaDescription, payload_type: u8) -> Option<usize> {
     md.attributes.iter().position(|attr| {
-        attr.key == "rtpmap" && attr.value.as_ref().map_or(false, |v| v.starts_with(&format!("{payload_type} ")))
+        attr.key == "rtpmap"
+            && attr
+                .value
+                .as_ref()
+                .map_or(false, |v| v.starts_with(&format!("{payload_type} ")))
     })
 }
 
 pub fn patch_answer_sdp_h264(sdp: &str, sps: &[u8], pps: &[u8]) -> String {
-    let mut sdp_result: StdResult<SessionDescription, _> = SessionDescription::try_from(sdp.to_string());
+    let mut sdp_result: StdResult<SessionDescription, _> =
+        SessionDescription::try_from(sdp.to_string());
     if let Ok(ref mut sdp) = sdp_result {
         if let Some(md) = find_video_media_description_mut(sdp) {
             if let Some(pt) = h264_payload_type_from_sdp_internal(md) {
                 let fmtp = build_h264_sdp_fmtp(sps, pps);
                 let fmtp_value = format!("{pt} {fmtp}");
-                
+
                 if let Some(idx) = find_fmtp_attr_index(md, pt) {
                     md.attributes[idx].value = Some(fmtp_value);
                 } else if let Some(rtpmap_idx) = find_rtpmap_attr_index(md, pt) {
-                    md.attributes.insert(rtpmap_idx + 1, Attribute {
-                        key: "fmtp".to_string(),
-                        value: Some(fmtp_value),
-                    });
+                    md.attributes.insert(
+                        rtpmap_idx + 1,
+                        Attribute {
+                            key: "fmtp".to_string(),
+                            value: Some(fmtp_value),
+                        },
+                    );
                 }
-                
+
                 info!(
                     "[WebRTC] Patched play answer SDP fmtp pt={} profile={}",
                     pt,
@@ -96,7 +112,7 @@ pub fn patch_answer_sdp_h264(sdp: &str, sps: &[u8], pps: &[u8]) -> String {
             }
         }
     }
-    
+
     match sdp_result {
         Ok(s) => s.marshal(),
         Err(_) => sdp.to_string(),
@@ -138,9 +154,9 @@ pub fn parse_sprop_parameter_sets(sdp: &str) -> (Option<Vec<u8>>, Option<Vec<u8>
 fn parse_sprop_from_fmtp(fmtp: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     let mut sps = None;
     let mut pps = None;
-    
+
     let fmtp = fmtp.split_whitespace().last().unwrap_or(fmtp);
-    
+
     for param in fmtp.split(';') {
         if let Some(params) = param.strip_prefix("sprop-parameter-sets=") {
             for (idx, b64) in params.split(',').enumerate() {
@@ -168,7 +184,7 @@ fn parse_sprop_from_fmtp(fmtp: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
             }
         }
     }
-    
+
     if sps.is_some() || pps.is_some() {
         info!(
             "[WebRTC] SDP sprop-parameter-sets: sps={} pps={}",
@@ -176,7 +192,7 @@ fn parse_sprop_from_fmtp(fmtp: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
             pps.as_ref().map(|p| p.len()).unwrap_or(0)
         );
     }
-    
+
     (sps, pps)
 }
 
@@ -194,7 +210,8 @@ m=video 9 UDP/TLS/RTP/SAVPF 96
 a=rtpmap:96 H264/90000
 a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f;sprop-parameter-sets=Z0LAHukBQBbsAAADAAQAAAMABAAAAwHNgYI=,aM4xsg==
 ";
-        let sdp: StdResult<SessionDescription, _> = SessionDescription::try_from(sdp_str.to_string());
+        let sdp: StdResult<SessionDescription, _> =
+            SessionDescription::try_from(sdp_str.to_string());
         println!("SDP parse result: {:?}", sdp);
         if let Ok(sdp) = &sdp {
             println!("Media descriptions: {}", sdp.media_descriptions.len());

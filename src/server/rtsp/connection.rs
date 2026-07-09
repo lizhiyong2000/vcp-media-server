@@ -7,7 +7,7 @@ use tracing::{debug, info};
 
 use super::common::{format_rtsp_message, RtspCommon};
 use super::messages::{RtspRequest, RtspResponse};
-use crate::server::socket_transport::{ChannelSocketWriter, SocketReader, spawn_write_loop};
+use crate::server::socket_transport::{spawn_write_loop, ChannelSocketWriter, SocketReader};
 
 pub struct RtspConnection {
     reader: SocketReader<tokio::net::tcp::OwnedReadHalf>,
@@ -41,7 +41,7 @@ impl RtspConnection {
     pub async fn read_request(&mut self) -> Result<Option<RtspRequest>> {
         let mut buffer = BytesMut::with_capacity(8192);
         let request_data = self.read_rtsp_message(&mut buffer).await?;
-        
+
         if request_data.is_empty() {
             return Ok(None);
         }

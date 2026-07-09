@@ -20,8 +20,10 @@ use super::rtp_h264::{
 };
 use super::sdp_h264::parse_sprop_parameter_sets;
 use super::signaling::ServerSignal;
-use crate::core::{parse_hevc_sprop_fmtp, CodecType, MediaFrame, MetricsRegistry, StreamManager, StreamProtocol, StreamSourceMode,
-    Track, VIDEO_RTP_CLOCK_RATE};
+use crate::core::{
+    parse_hevc_sprop_fmtp, CodecType, MediaFrame, MetricsRegistry, StreamManager, StreamProtocol,
+    StreamSourceMode, Track, VIDEO_RTP_CLOCK_RATE,
+};
 use webrtc::api::API;
 
 pub struct PublishSession {

@@ -213,7 +213,12 @@ mod tests {
         let registry = MetricsRegistry::new();
         MetricsRegistry::install_global(registry.clone());
         let manager = StreamManager::new();
-        manager.create_stream(stream_id, StreamSourceMode::Push, StreamProtocol::RTSP, None);
+        manager.create_stream(
+            stream_id,
+            StreamSourceMode::Push,
+            StreamProtocol::RTSP,
+            None,
+        );
 
         assert!(!request_publisher_keyframe(stream_id));
         assert!(latest_keyframe_request_age_ms(stream_id).is_none());

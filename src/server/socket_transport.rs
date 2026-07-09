@@ -230,7 +230,10 @@ impl ChannelSocketWriter {
     }
 
     pub async fn write(&self, buf: &[u8]) -> Result<()> {
-        self.tx.send(buf.to_vec()).await.map_err(|e| anyhow::anyhow!("Send error: {}", e))
+        self.tx
+            .send(buf.to_vec())
+            .await
+            .map_err(|e| anyhow::anyhow!("Send error: {}", e))
     }
 
     pub async fn write_all(&self, buf: &[u8]) -> Result<()> {

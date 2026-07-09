@@ -257,11 +257,15 @@ impl RtspCommon {
     }
 
     pub fn parse_sdp_tracks(sdp: &str) -> Vec<Track> {
-        let result: std::result::Result<SessionDescription, _> = SessionDescription::try_from(sdp.to_string());
+        let result: std::result::Result<SessionDescription, _> =
+            SessionDescription::try_from(sdp.to_string());
         if let Ok(sdp) = result {
             let mut tracks = Vec::new();
             for md in &sdp.media_descriptions {
-                let payload_type = md.media_name.formats.first()
+                let payload_type = md
+                    .media_name
+                    .formats
+                    .first()
                     .and_then(|f| f.parse::<u8>().ok())
                     .unwrap_or(96);
 
@@ -315,8 +319,16 @@ impl RtspCommon {
         }
     }
 
-    pub fn parse_sdp_with_sps_pps(sdp: &str) -> (Vec<Track>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
-        let result: std::result::Result<SessionDescription, _> = SessionDescription::try_from(sdp.to_string());
+    pub fn parse_sdp_with_sps_pps(
+        sdp: &str,
+    ) -> (
+        Vec<Track>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    ) {
+        let result: std::result::Result<SessionDescription, _> =
+            SessionDescription::try_from(sdp.to_string());
         if let Ok(sdp) = result {
             let mut tracks = Vec::new();
             let mut vps: Option<Vec<u8>> = None;
@@ -329,7 +341,10 @@ impl RtspCommon {
             );
 
             for md in &sdp.media_descriptions {
-                let payload_type = md.media_name.formats.first()
+                let payload_type = md
+                    .media_name
+                    .formats
+                    .first()
                     .and_then(|f| f.parse::<u8>().ok())
                     .unwrap_or(96);
 
@@ -354,7 +369,12 @@ impl RtspCommon {
         }
     }
 
-    fn extract_vps_sps_pps_from_fmtp(md: &MediaDescription, vps: &mut Option<Vec<u8>>, sps: &mut Option<Vec<u8>>, pps: &mut Option<Vec<u8>>) {
+    fn extract_vps_sps_pps_from_fmtp(
+        md: &MediaDescription,
+        vps: &mut Option<Vec<u8>>,
+        sps: &mut Option<Vec<u8>>,
+        pps: &mut Option<Vec<u8>>,
+    ) {
         for attr in &md.attributes {
             if attr.key == "fmtp" {
                 if let Some(value) = &attr.value {
@@ -378,7 +398,8 @@ impl RtspCommon {
                                                     );
                                                     debug!(
                                                         "[RTSP Common] VPS first 16 bytes: {:02X?}",
-                                                        &decoded[..std::cmp::min(16, decoded.len())]
+                                                        &decoded
+                                                            [..std::cmp::min(16, decoded.len())]
                                                     );
                                                     *vps = Some(decoded);
                                                 } else if nal_type == 7 && sps.is_none() {
@@ -388,7 +409,8 @@ impl RtspCommon {
                                                     );
                                                     debug!(
                                                         "[RTSP Common] SPS first 16 bytes: {:02X?}",
-                                                        &decoded[..std::cmp::min(16, decoded.len())]
+                                                        &decoded
+                                                            [..std::cmp::min(16, decoded.len())]
                                                     );
                                                     *sps = Some(decoded);
                                                 } else if nal_type == 8 && pps.is_none() {
@@ -398,7 +420,8 @@ impl RtspCommon {
                                                     );
                                                     debug!(
                                                         "[RTSP Common] PPS first 16 bytes: {:02X?}",
-                                                        &decoded[..std::cmp::min(16, decoded.len())]
+                                                        &decoded
+                                                            [..std::cmp::min(16, decoded.len())]
                                                     );
                                                     *pps = Some(decoded);
                                                 }
@@ -419,7 +442,12 @@ impl RtspCommon {
         }
     }
 
-    pub fn build_sdp(tracks: &[Track], vps: Option<&[u8]>, sps: Option<&[u8]>, pps: Option<&[u8]>) -> String {
+    pub fn build_sdp(
+        tracks: &[Track],
+        vps: Option<&[u8]>,
+        sps: Option<&[u8]>,
+        pps: Option<&[u8]>,
+    ) -> String {
         super::sdp_builder::build_sdp_for_stream("", tracks, vps, sps, pps)
     }
 

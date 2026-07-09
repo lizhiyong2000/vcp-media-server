@@ -278,7 +278,10 @@ pub fn build_sdp_with_codec_params(
             } else {
                 "42E01F".to_string()
             };
-            Some(format!("packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}", profile_level_id, sps_b64, pps_b64))
+            Some(format!(
+                "packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}",
+                profile_level_id, sps_b64, pps_b64
+            ))
         } else {
             Some("packetization-mode=1;profile-level-id=42E01F;sprop-parameter-sets=Z0LAHukBQBbsAAADAAQAAAMABAAAAwHNgYI=".to_string())
         };
@@ -286,7 +289,10 @@ pub fn build_sdp_with_codec_params(
         builder.add_video_track(CodecType::H264, 96, 90000, &control_video, fmtp);
     }
 
-    let audio_fmtp = Some("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3".to_string());
+    let audio_fmtp = Some(
+        "profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3"
+            .to_string(),
+    );
     builder.add_audio_track(CodecType::AAC, 97, 44100, 2, &control_audio, audio_fmtp);
 
     builder.build()
@@ -315,14 +321,24 @@ pub fn build_sdp_for_stream(
                     } else {
                         "42E01F".to_string()
                     };
-                    Some(format!("packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}", profile_level_id, sps_b64, pps_b64))
+                    Some(format!(
+                        "packetization-mode=1;profile-level-id={};sprop-parameter-sets={},{}",
+                        profile_level_id, sps_b64, pps_b64
+                    ))
                 } else {
                     Some("packetization-mode=1;profile-level-id=42E01F;sprop-parameter-sets=Z0LAHukBQBbsAAADAAQAAAMABAAAAwHNgYI=".to_string())
                 };
-                builder.add_video_track(track.codec, track.payload_type, track.clock_rate, &control, fmtp);
+                builder.add_video_track(
+                    track.codec,
+                    track.payload_type,
+                    track.clock_rate,
+                    &control,
+                    fmtp,
+                );
             }
             CodecType::H265 => {
-                let fmtp = if let (Some(vps_data), Some(sps_data), Some(pps_data)) = (vps, sps, pps) {
+                let fmtp = if let (Some(vps_data), Some(sps_data), Some(pps_data)) = (vps, sps, pps)
+                {
                     let vps_b64 = base64::engine::general_purpose::STANDARD.encode(vps_data);
                     let sps_b64 = base64::engine::general_purpose::STANDARD.encode(sps_data);
                     let pps_b64 = base64::engine::general_purpose::STANDARD.encode(pps_data);
@@ -344,17 +360,44 @@ pub fn build_sdp_for_stream(
                 } else {
                     Some("profile-space=0;profile-id=1;tier-flag=0;level-id=93".to_string())
                 };
-                builder.add_video_track(track.codec, track.payload_type, track.clock_rate, &control, fmtp);
+                builder.add_video_track(
+                    track.codec,
+                    track.payload_type,
+                    track.clock_rate,
+                    &control,
+                    fmtp,
+                );
             }
             CodecType::AAC => {
                 let fmtp = Some("profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;".to_string());
-                builder.add_audio_track(track.codec, track.payload_type, track.clock_rate, 2, &control, fmtp);
+                builder.add_audio_track(
+                    track.codec,
+                    track.payload_type,
+                    track.clock_rate,
+                    2,
+                    &control,
+                    fmtp,
+                );
             }
             CodecType::Opus => {
-                builder.add_audio_track(track.codec, track.payload_type, track.clock_rate, 2, &control, None);
+                builder.add_audio_track(
+                    track.codec,
+                    track.payload_type,
+                    track.clock_rate,
+                    2,
+                    &control,
+                    None,
+                );
             }
             CodecType::G711 => {
-                builder.add_audio_track(track.codec, track.payload_type, track.clock_rate, 1, &control, None);
+                builder.add_audio_track(
+                    track.codec,
+                    track.payload_type,
+                    track.clock_rate,
+                    1,
+                    &control,
+                    None,
+                );
             }
             _ => {
                 builder.add_video_track(CodecType::H264, track.payload_type, 90000, &control, None);

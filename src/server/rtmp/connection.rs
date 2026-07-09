@@ -123,8 +123,14 @@ impl RtmpConnection {
         messages
     }
 
-    pub async fn send_message(&mut self, msg_type: u8, msg_stream_id: u32, payload: &[u8]) -> Result<()> {
-        self.send_message_with_timestamp(msg_type, 0, msg_stream_id, payload, chunk::CSID_COMMAND).await
+    pub async fn send_message(
+        &mut self,
+        msg_type: u8,
+        msg_stream_id: u32,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.send_message_with_timestamp(msg_type, 0, msg_stream_id, payload, chunk::CSID_COMMAND)
+            .await
     }
 
     pub async fn send_message_with_timestamp(
@@ -135,7 +141,14 @@ impl RtmpConnection {
         payload: &[u8],
         chunk_stream_id: u32,
     ) -> Result<()> {
-        let message = chunk::encode_message(msg_type, timestamp, msg_stream_id, payload, self.chunk_size, chunk_stream_id);
+        let message = chunk::encode_message(
+            msg_type,
+            timestamp,
+            msg_stream_id,
+            payload,
+            self.chunk_size,
+            chunk_stream_id,
+        );
         self.writer.write_all(&message).await?;
         self.writer.flush().await?;
         Ok(())
@@ -167,7 +180,12 @@ impl RtmpConnection {
         self.buf.len()
     }
 
-    pub fn into_inner(self) -> (tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf) {
+    pub fn into_inner(
+        self,
+    ) -> (
+        tokio::net::tcp::OwnedReadHalf,
+        tokio::net::tcp::OwnedWriteHalf,
+    ) {
         (self.reader.into_inner(), self.writer)
     }
 
@@ -208,7 +226,11 @@ impl RtmpHandshake {
         matches!(self.state, RtmpHandshakeState::Completed)
     }
 
-    pub async fn server_handle_data(&mut self, buf: &mut BytesMut, writer: &mut tokio::net::tcp::OwnedWriteHalf) -> Result<bool> {
+    pub async fn server_handle_data(
+        &mut self,
+        buf: &mut BytesMut,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    ) -> Result<bool> {
         match self.state {
             RtmpHandshakeState::ServerWaitingC0C1 => {
                 if buf.len() < 1537 {

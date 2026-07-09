@@ -200,9 +200,7 @@ impl StreamHub {
         to_seq: u64,
         predicate: impl FnMut(&StoredFrame) -> bool,
     ) -> Option<MediaFrame> {
-        self.ring
-            .read()
-            .find_frame_rev(from_seq, to_seq, predicate)
+        self.ring.read().find_frame_rev(from_seq, to_seq, predicate)
     }
 
     pub fn oldest_seq(&self) -> Option<u64> {

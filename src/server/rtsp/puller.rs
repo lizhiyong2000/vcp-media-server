@@ -218,11 +218,7 @@ impl RtspPuller {
         Ok(())
     }
 
-    async fn rtp_receive_loop(
-        manager: Arc<StreamManager>,
-        stream_id: String,
-        tracks: Vec<Track>,
-    ) {
+    async fn rtp_receive_loop(manager: Arc<StreamManager>, stream_id: String, tracks: Vec<Track>) {
         let mut rtsp_response = String::new();
         let mut frame_count: u64 = 0;
         let mut bytes_received: u64 = 0;

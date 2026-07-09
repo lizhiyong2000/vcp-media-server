@@ -206,9 +206,7 @@ impl MetricsRegistry {
             return;
         };
         let metrics = registry.stream(stream_id);
-        metrics
-            .keyframe_requests
-            .fetch_add(1, Ordering::Relaxed);
+        metrics.keyframe_requests.fetch_add(1, Ordering::Relaxed);
         if delivered {
             metrics
                 .keyframe_requests_delivered
@@ -241,9 +239,7 @@ impl MetricsRegistry {
         let Some(registry) = Self::global() else {
             return;
         };
-        registry
-            .stream(stream_id)
-            .players[protocol_index(protocol)]
+        registry.stream(stream_id).players[protocol_index(protocol)]
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -321,12 +317,7 @@ impl MetricsRegistry {
         *current = update;
     }
 
-    pub fn record_hls_segment_committed(
-        stream_id: &str,
-        seq: u64,
-        duration: f64,
-        bytes: usize,
-    ) {
+    pub fn record_hls_segment_committed(stream_id: &str, seq: u64, duration: f64, bytes: usize) {
         let Some(registry) = Self::global() else {
             return;
         };
@@ -407,11 +398,8 @@ impl MetricsRegistry {
                 webrtc: webrtc_players,
                 total: 0,
             };
-            players.total = players.rtmp
-                + players.rtsp
-                + players.http_flv
-                + players.hls
-                + players.webrtc;
+            players.total =
+                players.rtmp + players.rtsp + players.http_flv + players.hls + players.webrtc;
 
             let first_frame_ms = metrics
                 .first_frame
@@ -426,9 +414,7 @@ impl MetricsRegistry {
             }
             (
                 metrics.keyframe_requests.load(Ordering::Relaxed),
-                metrics
-                    .keyframe_requests_delivered
-                    .load(Ordering::Relaxed),
+                metrics.keyframe_requests_delivered.load(Ordering::Relaxed),
                 metrics.ring_gaps.load(Ordering::Relaxed),
                 metrics.rtp_sequence_gaps.load(Ordering::Relaxed),
                 metrics
@@ -547,7 +533,14 @@ mod tests {
             },
         );
 
-        let hls = registry.streams.read().get("s1").unwrap().hls.read().clone();
+        let hls = registry
+            .streams
+            .read()
+            .get("s1")
+            .unwrap()
+            .hls
+            .read()
+            .clone();
         assert_eq!(hls.last_segment_seq, Some(42));
         assert_eq!(hls.last_segment_duration, Some(1.0));
         assert_eq!(hls.last_segment_bytes, Some(8192));

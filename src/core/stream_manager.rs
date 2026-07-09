@@ -735,9 +735,9 @@ impl Default for StreamManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::default_live_tracks;
     use bytes::Bytes;
     use std::collections::{HashMap, HashSet};
-    use crate::core::default_live_tracks;
 
     fn create_test_stream(manager: &StreamManager, stream_id: &str) -> Stream {
         manager.create_stream(
@@ -862,10 +862,7 @@ mod tests {
         manager.set_stream_tracks("s", default_live_tracks());
         manager.ensure_stream_hub("s");
 
-        assert_eq!(
-            manager.published_video_codec("s"),
-            Some(CodecType::H264)
-        );
+        assert_eq!(manager.published_video_codec("s"), Some(CodecType::H264));
 
         manager.publish_frame(MediaFrame::new(
             "s".into(),
@@ -876,10 +873,7 @@ mod tests {
             CodecType::H265,
         ));
 
-        assert_eq!(
-            manager.published_video_codec("s"),
-            Some(CodecType::H265)
-        );
+        assert_eq!(manager.published_video_codec("s"), Some(CodecType::H265));
     }
 
     #[test]

@@ -1,18 +1,16 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use std::result::Result as StdResult;
+use tracing::info;
 use webrtc::sdp::description::common::Attribute;
 use webrtc::sdp::description::media::MediaDescription;
 use webrtc::sdp::description::session::SessionDescription;
-use tracing::info;
 
 pub fn build_h265_sdp_fmtp(vps: &[u8], sps: &[u8], pps: &[u8]) -> String {
     let vps_b64 = STANDARD.encode(vps);
     let sps_b64 = STANDARD.encode(sps);
     let pps_b64 = STANDARD.encode(pps);
-    format!(
-        "sprop-vps={vps_b64};sprop-sps={sps_b64};sprop-pps={pps_b64}"
-    )
+    format!("sprop-vps={vps_b64};sprop-sps={sps_b64};sprop-pps={pps_b64}")
 }
 
 pub fn h265_payload_type_from_sdp(sdp: &str) -> Option<u8> {
@@ -40,42 +38,58 @@ pub fn h265_payload_type_from_sdp(sdp: &str) -> Option<u8> {
 }
 
 fn find_video_media_description(sdp: &SessionDescription) -> Option<&MediaDescription> {
-    sdp.media_descriptions.iter().find(|md| md.media_name.media == "video")
+    sdp.media_descriptions
+        .iter()
+        .find(|md| md.media_name.media == "video")
 }
 
 fn find_video_media_description_mut(sdp: &mut SessionDescription) -> Option<&mut MediaDescription> {
-    sdp.media_descriptions.iter_mut().find(|md| md.media_name.media == "video")
+    sdp.media_descriptions
+        .iter_mut()
+        .find(|md| md.media_name.media == "video")
 }
 
 fn find_fmtp_attr_index(md: &MediaDescription, payload_type: u8) -> Option<usize> {
     md.attributes.iter().position(|attr| {
-        attr.key == "fmtp" && attr.value.as_ref().map_or(false, |v| v.starts_with(&format!("{payload_type} ")))
+        attr.key == "fmtp"
+            && attr
+                .value
+                .as_ref()
+                .map_or(false, |v| v.starts_with(&format!("{payload_type} ")))
     })
 }
 
 fn find_rtpmap_attr_index(md: &MediaDescription, payload_type: u8) -> Option<usize> {
     md.attributes.iter().position(|attr| {
-        attr.key == "rtpmap" && attr.value.as_ref().map_or(false, |v| v.starts_with(&format!("{payload_type} ")))
+        attr.key == "rtpmap"
+            && attr
+                .value
+                .as_ref()
+                .map_or(false, |v| v.starts_with(&format!("{payload_type} ")))
     })
 }
 
 pub fn patch_answer_sdp_h265(sdp: &str, vps: &[u8], sps: &[u8], pps: &[u8]) -> String {
-    let mut sdp_result: StdResult<SessionDescription, _> = SessionDescription::try_from(sdp.to_string());
+    let mut sdp_result: StdResult<SessionDescription, _> =
+        SessionDescription::try_from(sdp.to_string());
     if let Ok(ref mut sdp) = sdp_result {
         if let Some(md) = find_video_media_description_mut(sdp) {
             if let Some(pt) = h265_payload_type_from_sdp_internal(md) {
                 let fmtp = build_h265_sdp_fmtp(vps, sps, pps);
                 let fmtp_value = format!("{pt} {fmtp}");
-                
+
                 if let Some(idx) = find_fmtp_attr_index(md, pt) {
                     md.attributes[idx].value = Some(fmtp_value);
                 } else if let Some(rtpmap_idx) = find_rtpmap_attr_index(md, pt) {
-                    md.attributes.insert(rtpmap_idx + 1, Attribute {
-                        key: "fmtp".to_string(),
-                        value: Some(fmtp_value),
-                    });
+                    md.attributes.insert(
+                        rtpmap_idx + 1,
+                        Attribute {
+                            key: "fmtp".to_string(),
+                            value: Some(fmtp_value),
+                        },
+                    );
                 }
-                
+
                 info!(
                     "[WebRTC] Patched play answer SDP H265 fmtp pt={} vps={}B sps={}B pps={}B",
                     pt,
@@ -86,7 +100,7 @@ pub fn patch_answer_sdp_h265(sdp: &str, vps: &[u8], sps: &[u8], pps: &[u8]) -> S
             }
         }
     }
-    
+
     match sdp_result {
         Ok(s) => s.marshal(),
         Err(_) => sdp.to_string(),
@@ -123,7 +137,7 @@ mod tests {
         let pps = vec![0x44, 0x01, 0xc0, 0x73];
 
         let fmtp = build_h265_sdp_fmtp(&vps, &sps, &pps);
-        
+
         assert!(fmtp.contains("sprop-vps="));
         assert!(fmtp.contains("sprop-sps="));
         assert!(fmtp.contains("sprop-pps="));

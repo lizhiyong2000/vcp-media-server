@@ -61,9 +61,9 @@ max_files = 5
 [log.modules]
 rtsp = "info"
 rtmp = "info"
-http = "info"
+http = "debug"
 http_flv = "info"
-hls = "info"
+hls = "debug"
 webrtc = "info"
 core = "info"
 analysis = "info"

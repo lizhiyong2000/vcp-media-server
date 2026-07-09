@@ -5,8 +5,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 use webrtc::rtp::packet::Packet;
 
-use crate::core::{CodecType, MediaFrame, StreamManager, VIDEO_RTP_CLOCK_RATE};
 use crate::core::MetricsRegistry;
+use crate::core::{CodecType, MediaFrame, StreamManager, VIDEO_RTP_CLOCK_RATE};
 
 use super::h264_util::{
     contains_vcl_nalu, describe_annex_b, is_keyframe_annex_b, is_parameter_set_only,

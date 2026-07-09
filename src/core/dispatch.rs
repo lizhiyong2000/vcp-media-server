@@ -179,12 +179,7 @@ impl DispatchReader {
         let deadline = Instant::now() + Duration::from_millis(800);
         info!(
             "[Dispatch] [{}] prime_from_idr start policy={:?} cursor={} baseline_latest={} baseline_idr={:?} requested_keyframe={}",
-            stream_id,
-            self.policy,
-            self.cursor,
-            baseline_latest,
-            baseline_idr,
-            requested
+            stream_id, self.policy, self.cursor, baseline_latest, baseline_idr, requested
         );
 
         while Instant::now() < deadline {
@@ -401,10 +396,7 @@ impl DispatchReader {
                 self.cursor = self.hub.snap(SnapMode::LatestIdr);
             } else if let Some(oldest) = self.hub.oldest_seq() {
                 if self.cursor < oldest || self.cursor > latest.saturating_add(1) {
-                    self.cursor = self
-                        .hub
-                        .snap(SnapMode::LatestIdr)
-                        .max(oldest);
+                    self.cursor = self.hub.snap(SnapMode::LatestIdr).max(oldest);
                 }
             }
             if self.cursor > self.hub.latest_seq() {
@@ -873,11 +865,7 @@ mod tests {
             .expect("buffered IDR should be primed immediately for WebRTC play");
 
         assert_eq!(idr.timestamp, base);
-        assert_eq!(
-            reader.cursor(),
-            1,
-            "cursor should advance past primed IDR"
-        );
+        assert_eq!(reader.cursor(), 1, "cursor should advance past primed IDR");
     }
 
     #[tokio::test]
@@ -1031,10 +1019,7 @@ mod tests {
         reader.cursor = 0;
 
         let result = tokio::time::timeout(Duration::from_millis(50), reader.recv_batch()).await;
-        assert!(
-            reader.take_live_snap(),
-            "large lag should flag live snap"
-        );
+        assert!(reader.take_live_snap(), "large lag should flag live snap");
         if let Ok(Ok(batch)) = result {
             assert!(
                 batch.len() < 100,

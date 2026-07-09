@@ -5,9 +5,9 @@ pub mod puller;
 pub mod pusher;
 pub mod session;
 
+pub use connection::{RtmpConnection, RtmpHandshake};
 pub use puller::RtmpPuller;
 pub use pusher::RtmpPusher;
-pub use connection::{RtmpConnection, RtmpHandshake};
 
 use anyhow::Result;
 use bytes::{Buf, Bytes, BytesMut};
@@ -642,10 +642,8 @@ impl RtmpServer {
                                 let is_keyframe = header_keyframe
                                     || crate::core::is_keyframe_annex_b(video_codec, &annex_b);
                                 if video_codec == CodecType::H265 {
-                                    conn.stream_manager.ensure_video_track_codec(
-                                        &conn.stream_id,
-                                        CodecType::H265,
-                                    );
+                                    conn.stream_manager
+                                        .ensure_video_track_codec(&conn.stream_id, CodecType::H265);
                                 }
                                 let frame = MediaFrame::new(
                                     conn.stream_id.clone(),

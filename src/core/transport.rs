@@ -31,7 +31,10 @@ impl TransportStatus {
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self, TransportStatus::Connected | TransportStatus::Publishing | TransportStatus::Playing)
+        matches!(
+            self,
+            TransportStatus::Connected | TransportStatus::Publishing | TransportStatus::Playing
+        )
     }
 }
 
@@ -70,7 +73,11 @@ pub struct TransportConfig {
 }
 
 impl TransportConfig {
-    pub fn new(stream_manager: Arc<StreamManager>, protocol: StreamProtocol, stream_id: &str) -> Self {
+    pub fn new(
+        stream_manager: Arc<StreamManager>,
+        protocol: StreamProtocol,
+        stream_id: &str,
+    ) -> Self {
         Self {
             stream_manager,
             protocol,

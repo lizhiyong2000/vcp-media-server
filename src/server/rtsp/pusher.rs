@@ -115,13 +115,20 @@ impl RtspPusher {
             return Err(anyhow::anyhow!("OPTIONS failed: {}", response));
         }
 
-        let vps = self.stream_manager.get_stream(&self.stream_id)
+        let vps = self
+            .stream_manager
+            .get_stream(&self.stream_id)
             .and_then(|s| s.vps.clone());
-        let sps = self.stream_manager.get_stream(&self.stream_id)
+        let sps = self
+            .stream_manager
+            .get_stream(&self.stream_id)
             .and_then(|s| s.sps.clone());
-        let pps = self.stream_manager.get_stream(&self.stream_id)
+        let pps = self
+            .stream_manager
+            .get_stream(&self.stream_id)
             .and_then(|s| s.pps.clone());
-        let sdp = RtspClientSession::build_sdp(tracks, vps.as_deref(), sps.as_deref(), pps.as_deref());
+        let sdp =
+            RtspClientSession::build_sdp(tracks, vps.as_deref(), sps.as_deref(), pps.as_deref());
         info!("[RTSP Pusher] [Step 3/5] Sending ANNOUNCE...");
         let response = session.send_announce(&sdp).await?;
         if !response.starts_with("RTSP/1.0 200 OK") {
@@ -310,13 +317,8 @@ impl RtspPusher {
                         let sps_rtp = RtspClientSession::build_rtp_packet(
                             96, seq, timestamp, 0x12345678, false, &sps_data,
                         );
-                        if let Err(e) = send_rtp_packet(
-                            use_udp,
-                            &udp_tracks,
-                            track.id as usize,
-                            &sps_rtp,
-                        )
-                        .await
+                        if let Err(e) =
+                            send_rtp_packet(use_udp, &udp_tracks, track.id as usize, &sps_rtp).await
                         {
                             error!("[RTSP Pusher] [RTP Loop] Failed to send SPS: {}", e);
                             break;
@@ -335,13 +337,8 @@ impl RtspPusher {
                             false,
                             &pps_data,
                         );
-                        if let Err(e) = send_rtp_packet(
-                            use_udp,
-                            &udp_tracks,
-                            track.id as usize,
-                            &pps_rtp,
-                        )
-                        .await
+                        if let Err(e) =
+                            send_rtp_packet(use_udp, &udp_tracks, track.id as usize, &pps_rtp).await
                         {
                             error!("[RTSP Pusher] [RTP Loop] Failed to send PPS: {}", e);
                             break;
@@ -378,13 +375,8 @@ impl RtspPusher {
                     bytes_sent += rtp_packet.len() as u64;
                 }
 
-                if let Err(e) = send_rtp_packet(
-                    use_udp,
-                    &udp_tracks,
-                    track.id as usize,
-                    &rtp_packet,
-                )
-                .await
+                if let Err(e) =
+                    send_rtp_packet(use_udp, &udp_tracks, track.id as usize, &rtp_packet).await
                 {
                     error!(
                         "[RTSP Pusher] [RTP Loop] Frame #{:>6} - Failed to send RTP packet: {}",

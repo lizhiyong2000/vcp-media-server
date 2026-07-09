@@ -348,14 +348,17 @@ pub fn parse_enhanced_hevc_video_message(data: &[u8]) -> Option<EnhancedHevcVide
 
 pub fn hvcc_payload_to_annex_b(payload: &[u8]) -> Vec<u8> {
     if payload.len() < 4 {
-        debug!("[VideoCodec] hvcc_payload_to_annex_b: payload too small ({})", payload.len());
+        debug!(
+            "[VideoCodec] hvcc_payload_to_annex_b: payload too small ({})",
+            payload.len()
+        );
         return Vec::new();
     }
-    
+
     let mut annex_b = Vec::with_capacity(payload.len());
     let mut offset = 0;
     let mut nalu_count = 0;
-    
+
     while offset + 4 <= payload.len() {
         let nalu_len = u32::from_be_bytes([
             payload[offset],
@@ -364,44 +367,67 @@ pub fn hvcc_payload_to_annex_b(payload: &[u8]) -> Vec<u8> {
             payload[offset + 3],
         ]) as usize;
         offset += 4;
-        
+
         if nalu_len == 0 {
-            debug!("[VideoCodec] hvcc_payload_to_annex_b: zero NALU length at offset {}", offset);
+            debug!(
+                "[VideoCodec] hvcc_payload_to_annex_b: zero NALU length at offset {}",
+                offset
+            );
             break;
         }
-        
+
         if nalu_len > 10 * 1024 * 1024 {
-            debug!("[VideoCodec] hvcc_payload_to_annex_b: NALU too large ({}) at offset {}", nalu_len, offset);
+            debug!(
+                "[VideoCodec] hvcc_payload_to_annex_b: NALU too large ({}) at offset {}",
+                nalu_len, offset
+            );
             break;
         }
-        
+
         if offset + nalu_len > payload.len() {
-            debug!("[VideoCodec] hvcc_payload_to_annex_b: NALU exceeds payload (offset={}, len={}, payload_len={})", offset, nalu_len, payload.len());
+            debug!(
+                "[VideoCodec] hvcc_payload_to_annex_b: NALU exceeds payload (offset={}, len={}, payload_len={})",
+                offset,
+                nalu_len,
+                payload.len()
+            );
             break;
         }
-        
+
         let nalu_type = if !payload[offset..offset + nalu_len].is_empty() {
             hevc_nalu_type(payload[offset])
         } else {
             0
         };
-        
+
         if nalu_count == 0 {
-            debug!("[VideoCodec] hvcc_payload_to_annex_b: first NALU type={}, len={}, payload_len={}", nalu_type, nalu_len, payload.len());
+            debug!(
+                "[VideoCodec] hvcc_payload_to_annex_b: first NALU type={}, len={}, payload_len={}",
+                nalu_type,
+                nalu_len,
+                payload.len()
+            );
         }
-        
+
         annex_b.extend_from_slice(&ANNEX_B_PREFIX);
         annex_b.extend_from_slice(&payload[offset..offset + nalu_len]);
         offset += nalu_len;
         nalu_count += 1;
-        
+
         if nalu_count > 1000 {
-            debug!("[VideoCodec] hvcc_payload_to_annex_b: too many NALUs ({})", nalu_count);
+            debug!(
+                "[VideoCodec] hvcc_payload_to_annex_b: too many NALUs ({})",
+                nalu_count
+            );
             break;
         }
     }
-    
-    debug!("[VideoCodec] hvcc_payload_to_annex_b: converted {} NALUs, output len={}", nalu_count, annex_b.len());
+
+    debug!(
+        "[VideoCodec] hvcc_payload_to_annex_b: converted {} NALUs, output len={}",
+        nalu_count,
+        annex_b.len()
+    );
     annex_b
 }
 
@@ -677,7 +703,12 @@ pub fn packetize_hevc_access_unit_for_rtp(
     for (i, nal) in nalus.iter().enumerate() {
         let marker = i + 1 == nalus.len();
         packets.extend(packetize_hevc_nal_for_rtp(
-            nal, payload_type, seq, ts, ssrc, marker,
+            nal,
+            payload_type,
+            seq,
+            ts,
+            ssrc,
+            marker,
         ));
     }
     packets
@@ -819,10 +850,8 @@ mod tests {
 
     #[test]
     fn hevc_idr_detection_skips_leading_aud() {
-        let au = prepare_video_au_for_ts(
-            CodecType::H265,
-            &[0x00, 0x00, 0x00, 0x01, 0x2a, 0x01, 0xaf],
-        );
+        let au =
+            prepare_video_au_for_ts(CodecType::H265, &[0x00, 0x00, 0x00, 0x01, 0x2a, 0x01, 0xaf]);
         assert!(contains_hevc_idr(&au));
     }
 

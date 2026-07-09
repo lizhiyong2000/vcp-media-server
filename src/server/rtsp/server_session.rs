@@ -22,7 +22,7 @@ use crate::core::{
     CodecType, DispatchPolicy, MediaFrame, MetricsRegistry, PlaybackProtocol, StreamManager, Track,
     AAC_DEFAULT_CLOCK_RATE,
 };
-use crate::server::socket_transport::{ChannelSocketWriter, SocketReader, spawn_write_loop};
+use crate::server::socket_transport::{spawn_write_loop, ChannelSocketWriter, SocketReader};
 use crate::server::webrtc::{H264RtpIngest, HevcRtpIngest};
 
 pub struct RtspServerSession {
@@ -284,7 +284,10 @@ impl RtspServerSession {
     }
 
     pub async fn start(mut self) {
-        info!("[RTSP] [{}] Starting session handler", self.conn.peer_addr());
+        info!(
+            "[RTSP] [{}] Starting session handler",
+            self.conn.peer_addr()
+        );
 
         let result = self.read_loop().await;
         self.cleanup_on_disconnect();
@@ -325,7 +328,10 @@ impl RtspServerSession {
         while self.running {
             let n = self.conn.read_into(&mut buffer).await?;
             if n == 0 {
-                info!("[RTSP] [{}] Connection closed by peer", self.conn.peer_addr());
+                info!(
+                    "[RTSP] [{}] Connection closed by peer",
+                    self.conn.peer_addr()
+                );
                 break;
             }
 
@@ -719,7 +725,9 @@ impl RtspServerSession {
             if self.session.is_rtcp_channel(channel) {
                 debug!(
                     "[RTSP] [{}] Ignore RTCP interleaved channel={} stream='{}'",
-                    self.conn.peer_addr(), channel, stream_id
+                    self.conn.peer_addr(),
+                    channel,
+                    stream_id
                 );
                 return;
             }
@@ -727,7 +735,9 @@ impl RtspServerSession {
             let Some(track_id) = self.session.rtp_track_for_channel(channel) else {
                 debug!(
                     "[RTSP] [{}] Ignore unknown interleaved channel={} stream='{}'",
-                    self.conn.peer_addr(), channel, stream_id
+                    self.conn.peer_addr(),
+                    channel,
+                    stream_id
                 );
                 return;
             };
@@ -789,7 +799,10 @@ impl RtspServerSession {
                 _ => {
                     debug!(
                         "[RTSP] [{}] Ignore unsupported RTP codec {:?} track={} stream='{}'",
-                        self.conn.peer_addr(), track_codec, track_id, stream_id
+                        self.conn.peer_addr(),
+                        track_codec,
+                        track_id,
+                        stream_id
                     );
                     return;
                 }
@@ -884,7 +897,9 @@ impl RtspServerSession {
 
         debug!(
             "[RTSP] [{}] Request #{}, cseq={}",
-            self.conn.peer_addr(), request_count, cseq
+            self.conn.peer_addr(),
+            request_count,
+            cseq
         );
         debug!(
             "[RTSP] [{}] Received request:\n{}",
@@ -913,7 +928,9 @@ impl RtspServerSession {
                         .await
                     {
                         Ok(ports) => setup_server_ports = Some(ports),
-                        Err(e) => warn!("[RTSP] [{}] UDP SETUP failed: {}", self.conn.peer_addr(), e),
+                        Err(e) => {
+                            warn!("[RTSP] [{}] UDP SETUP failed: {}", self.conn.peer_addr(), e)
+                        }
                     }
                 }
             }
@@ -1082,8 +1099,9 @@ impl RtspServerSession {
                             continue;
                         }
                     } else {
-                        let rtp_channel = rtp_channel_for_track(&interleaved_channels, frame.track_id)
-                            .unwrap_or(frame.track_id);
+                        let rtp_channel =
+                            rtp_channel_for_track(&interleaved_channels, frame.track_id)
+                                .unwrap_or(frame.track_id);
                         for packet in packets {
                             if packet.is_empty() {
                                 continue;

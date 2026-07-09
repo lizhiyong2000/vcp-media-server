@@ -26,8 +26,8 @@ pub use common::{
     extract_stream_id, extract_track_id, extract_transport, is_udp_transport,
     parse_transport_server_ports, url_prefers_udp, TransportInfo,
 };
-pub use common::{RtpHeader, RtspCommon, UdpTransport};
 pub use common::{InterleavedChannel, RtspSessionState, TransportMode};
+pub use common::{RtpHeader, RtspCommon, UdpTransport};
 pub use messages::{RtspRequest, RtspResponse};
 pub use puller::RtspPuller;
 pub use pusher::RtspPusher;
@@ -587,11 +587,14 @@ impl RtspServer {
     }
 
     fn build_sdp(stream_id: &str, manager: &StreamManager) -> String {
-        let vps = manager.get_stream(&stream_id.to_string())
+        let vps = manager
+            .get_stream(&stream_id.to_string())
             .and_then(|s| s.vps.clone());
-        let sps = manager.get_stream(&stream_id.to_string())
+        let sps = manager
+            .get_stream(&stream_id.to_string())
             .and_then(|s| s.sps.clone());
-        let pps = manager.get_stream(&stream_id.to_string())
+        let pps = manager
+            .get_stream(&stream_id.to_string())
             .and_then(|s| s.pps.clone());
 
         let tracks = if let Some(stream) = manager.get_stream(&stream_id.to_string()) {
@@ -604,7 +607,13 @@ impl RtspServer {
             crate::core::default_live_tracks()
         };
 
-        sdp_builder::build_sdp_for_stream(stream_id, &tracks, vps.as_deref(), sps.as_deref(), pps.as_deref())
+        sdp_builder::build_sdp_for_stream(
+            stream_id,
+            &tracks,
+            vps.as_deref(),
+            sps.as_deref(),
+            pps.as_deref(),
+        )
     }
 
     fn extract_cseq(request: &str) -> &str {
@@ -676,7 +685,8 @@ fn normalize_announced_tracks_for_publish(tracks: &[Track]) -> Vec<Track> {
 }
 
 fn parse_hevc_params_from_sdp(sdp: &str) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let result: std::result::Result<SessionDescription, _> = SessionDescription::try_from(sdp.to_string());
+    let result: std::result::Result<SessionDescription, _> =
+        SessionDescription::try_from(sdp.to_string());
     if let Ok(sdp) = result {
         for md in &sdp.media_descriptions {
             for attr in &md.attributes {

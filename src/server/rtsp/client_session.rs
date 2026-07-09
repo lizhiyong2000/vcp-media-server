@@ -128,7 +128,9 @@ impl RtspClientSession {
     }
 
     fn conn_mut(&mut self) -> Result<&mut RtspConnection> {
-        self.conn.as_mut().ok_or_else(|| anyhow::anyhow!("Not connected"))
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Not connected"))
     }
 
     pub async fn send_request(&mut self, method: &str, url: &str) -> Result<String> {
@@ -451,7 +453,12 @@ impl RtspClientSession {
         RtspCommon::parse_sdp_tracks(sdp)
     }
 
-    pub fn build_sdp(tracks: &[Track], vps: Option<&[u8]>, sps: Option<&[u8]>, pps: Option<&[u8]>) -> String {
+    pub fn build_sdp(
+        tracks: &[Track],
+        vps: Option<&[u8]>,
+        sps: Option<&[u8]>,
+        pps: Option<&[u8]>,
+    ) -> String {
         RtspCommon::build_sdp(tracks, vps, sps, pps)
     }
 
