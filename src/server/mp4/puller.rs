@@ -59,119 +59,124 @@ impl Mp4Puller {
             .build()?;
 
         let session = self.stream_manager.begin_pull_loop(stream_id);
-        self.stream_manager.create_stream(
-            stream_id,
-            StreamSourceMode::Pull,
-            StreamProtocol::MP4,
-            Some(remote_url.to_string()),
-        );
-        let _ = self.stream_manager.set_unpublished(stream_id);
-        self.stream_manager.set_stream_broadcast(stream_id);
-        let _ = self.stream_manager.set_publishing(stream_id);
+        let result: Result<()> = async {
+            self.stream_manager.create_stream(
+                stream_id,
+                StreamSourceMode::Pull,
+                StreamProtocol::MP4,
+                Some(remote_url.to_string()),
+            );
+            let _ = self.stream_manager.set_unpublished(stream_id);
+            self.stream_manager.set_stream_broadcast(stream_id);
+            let _ = self.stream_manager.set_publishing(stream_id);
 
-        let movie = fetch_mp4_metadata(&client, remote_url).await?;
-        info!(
-            "[MP4 Puller] Parsed MP4 stream='{}' duration_ms={} timescale={} samples={} nal_len={} sps={} pps={}",
-            stream_id,
-            movie.duration_ms(),
-            movie.video.timescale,
-            movie.video.samples.len(),
-            movie.video.nal_length_size,
-            movie.video.sps.len(),
-            movie.video.pps.len()
-        );
+            let movie = fetch_mp4_metadata(&client, remote_url).await?;
+            info!(
+                "[MP4 Puller] Parsed MP4 stream='{}' duration_ms={} timescale={} samples={} nal_len={} sps={} pps={}",
+                stream_id,
+                movie.duration_ms(),
+                movie.video.timescale,
+                movie.video.samples.len(),
+                movie.video.nal_length_size,
+                movie.video.sps.len(),
+                movie.video.pps.len()
+            );
 
-        self.stream_manager
-            .ensure_video_track_codec(stream_id, CodecType::H264);
-        self.stream_manager.set_stream_sps_pps(
-            stream_id,
-            movie.video.sps.clone(),
-            movie.video.pps.clone(),
-        );
+            self.stream_manager
+                .ensure_video_track_codec(stream_id, CodecType::H264);
+            self.stream_manager.set_stream_sps_pps(
+                stream_id,
+                movie.video.sps.clone(),
+                movie.video.pps.clone(),
+            );
 
-        let mut published = 0usize;
-        let mut last_dts_ms = None;
-        for sample in &movie.video.samples {
-            if session.is_stopped() {
-                info!(
-                    "[MP4 Puller] Pull stopped for stream '{}', exiting sample loop",
-                    stream_id
+            let mut published = 0usize;
+            let mut last_dts_ms = None;
+            for sample in &movie.video.samples {
+                if session.is_stopped() {
+                    info!(
+                        "[MP4 Puller] Pull stopped for stream '{}', exiting sample loop",
+                        stream_id
+                    );
+                    break;
+                }
+
+                if sample.size == 0 || sample.size > MAX_SAMPLE_BYTES {
+                    warn!(
+                        "[MP4 Puller] Skip invalid sample stream='{}' offset={} size={}",
+                        stream_id, sample.offset, sample.size
+                    );
+                    continue;
+                }
+
+                if let Some(prev_ms) = last_dts_ms {
+                    let delay = sample.dts_ms.saturating_sub(prev_ms).min(200);
+                    if delay > 0 {
+                        sleep(Duration::from_millis(delay)).await;
+                    }
+                }
+                last_dts_ms = Some(sample.dts_ms);
+
+                let data =
+                    fetch_range_exact(&client, remote_url, sample.offset, u64::from(sample.size))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "fetch MP4 sample offset={} size={}",
+                                sample.offset, sample.size
+                            )
+                        })?;
+                let annex_b = avc_sample_to_annex_b(
+                    &data,
+                    movie.video.nal_length_size,
+                    if sample.is_sync {
+                        Some((&movie.video.sps, &movie.video.pps))
+                    } else {
+                        None
+                    },
+                )?;
+                if annex_b.is_empty() {
+                    continue;
+                }
+                let is_keyframe = sample.is_sync || is_keyframe_annex_b(CodecType::H264, &annex_b);
+                if is_keyframe && published == 0 {
+                    info!(
+                        "[MP4 Puller] Published first keyframe for stream '{}'",
+                        stream_id
+                    );
+                }
+
+                self.stream_manager.publish_frame(
+                    MediaFrame::new(
+                        stream_id.to_string(),
+                        0,
+                        sample.dts_ms,
+                        Bytes::from(annex_b),
+                        is_keyframe,
+                        CodecType::H264,
+                    )
+                    .with_clock_rate(MILLISECOND_CLOCK_RATE),
                 );
-                break;
-            }
-
-            if sample.size == 0 || sample.size > MAX_SAMPLE_BYTES {
-                warn!(
-                    "[MP4 Puller] Skip invalid sample stream='{}' offset={} size={}",
-                    stream_id, sample.offset, sample.size
-                );
-                continue;
-            }
-
-            if let Some(prev_ms) = last_dts_ms {
-                let delay = sample.dts_ms.saturating_sub(prev_ms).min(200);
-                if delay > 0 {
-                    sleep(Duration::from_millis(delay)).await;
+                published += 1;
+                if published <= 3 || published % 300 == 0 {
+                    debug!(
+                        "[MP4 Puller] published video frame stream='{}' dts_ms={} size={} keyframe={} count={}",
+                        stream_id, sample.dts_ms, sample.size, is_keyframe, published
+                    );
                 }
             }
-            last_dts_ms = Some(sample.dts_ms);
 
-            let data =
-                fetch_range_exact(&client, remote_url, sample.offset, u64::from(sample.size))
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "fetch MP4 sample offset={} size={}",
-                            sample.offset, sample.size
-                        )
-                    })?;
-            let annex_b = avc_sample_to_annex_b(
-                &data,
-                movie.video.nal_length_size,
-                if sample.is_sync {
-                    Some((&movie.video.sps, &movie.video.pps))
-                } else {
-                    None
-                },
-            )?;
-            if annex_b.is_empty() {
-                continue;
-            }
-            let is_keyframe = sample.is_sync || is_keyframe_annex_b(CodecType::H264, &annex_b);
-            if is_keyframe && published == 0 {
-                info!(
-                    "[MP4 Puller] Published first keyframe for stream '{}'",
-                    stream_id
-                );
-            }
-
-            self.stream_manager.publish_frame(
-                MediaFrame::new(
-                    stream_id.to_string(),
-                    0,
-                    sample.dts_ms,
-                    Bytes::from(annex_b),
-                    is_keyframe,
-                    CodecType::H264,
-                )
-                .with_clock_rate(MILLISECOND_CLOCK_RATE),
+            info!(
+                "[MP4 Puller] Finished MP4 pull stream='{}' published_video={}",
+                stream_id, published
             );
-            published += 1;
-            if published <= 3 || published % 300 == 0 {
-                debug!(
-                    "[MP4 Puller] published video frame stream='{}' dts_ms={} size={} keyframe={} count={}",
-                    stream_id, sample.dts_ms, sample.size, is_keyframe, published
-                );
-            }
+            let _ = self.stream_manager.set_stopped(stream_id);
+            Ok(())
         }
+        .await;
 
-        info!(
-            "[MP4 Puller] Finished MP4 pull stream='{}' published_video={}",
-            stream_id, published
-        );
-        let _ = self.stream_manager.set_stopped(stream_id);
         self.stream_manager.end_pull_loop(stream_id, &session);
-        Ok(())
+        result
     }
 }
 

@@ -1,7 +1,7 @@
 /// HLS Puller - Pure Rust implementation (no ffmpeg)
 /// Downloads m3u8 playlist, fetches TS segments, parses MPEG-TS to extract
 /// H264/H265 video and AAC audio, publishes via StreamManager.
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -10,8 +10,8 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::core::{
-    CodecType, MILLISECOND_CLOCK_RATE, MediaFrame, MediaTransport, StreamManager, StreamProtocol,
-    StreamPuller, StreamSourceMode, TransportStatus, default_live_tracks, is_keyframe_annex_b,
+    default_live_tracks, is_keyframe_annex_b, CodecType, MediaFrame, MediaTransport, StreamManager,
+    StreamProtocol, StreamPuller, StreamSourceMode, TransportStatus, MILLISECOND_CLOCK_RATE,
 };
 
 use crate::server::http_flv::puller::{is_m3u8_url, parse_m3u8_for_segment, resolve_relative_url};
@@ -631,8 +631,7 @@ async fn download_and_process_segment_streaming(
         if publisher.is_stopped() {
             debug!(
                 "[HLS Puller] abort segment streaming stream='{}' url='{}' (pull stopped)",
-                stream_id,
-                url
+                stream_id, url
             );
             break;
         }
@@ -1342,6 +1341,7 @@ mod tests {
         manager.create_stream("s", StreamSourceMode::Pull, StreamProtocol::HLS, None);
         let mut ts_counter_ms = 0;
         let mut sps_pps_stored = false;
+        let session = crate::core::PullSessionHandle::new_active();
         let mut publisher = HlsSegmentPublisher::new(
             &manager,
             "s",
@@ -1349,6 +1349,7 @@ mod tests {
             &mut sps_pps_stored,
             false,
             false,
+            session,
         );
 
         publisher.publish_nal(
@@ -1380,6 +1381,7 @@ mod tests {
         manager.create_stream("s", StreamSourceMode::Pull, StreamProtocol::HLS, None);
         let mut ts_counter_ms = 0;
         let mut sps_pps_stored = false;
+        let session = crate::core::PullSessionHandle::new_active();
         let mut publisher = HlsSegmentPublisher::new(
             &manager,
             "s",
@@ -1387,6 +1389,7 @@ mod tests {
             &mut sps_pps_stored,
             false,
             false,
+            session,
         );
 
         publisher.publish_nal(
