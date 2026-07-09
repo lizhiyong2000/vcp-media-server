@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use parking_lot::RwLock;
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use super::dispatch::{DispatchPolicy, DispatchReader};
@@ -15,6 +16,69 @@ use super::{
     StreamProtocol, StreamReceiver, StreamSinkMode, StreamSourceMode, StreamStatus, Track,
     VIDEO_RTP_CLOCK_RATE,
 };
+
+// ---------------------------------------------------------------------------
+// Stream lifecycle events — broadcast to all protocol / process subscribers
+// ---------------------------------------------------------------------------
+
+/// A lifecycle event emitted by [`StreamManager`] whenever a stream, publisher,
+/// or receiver enters or leaves a state.  Protocol modules (RTMP, RTSP,
+/// WebRTC, HLS, HTTP‑FLV) and process modules (record, snapshot, transcode,
+/// analysis) can subscribe via [`StreamManager::subscribe_events`] and react
+/// without polling.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// A new stream has been registered.
+    StreamCreated {
+        stream_id: StreamId,
+        source: StreamSourceMode,
+        protocol: StreamProtocol,
+        pull_url: Option<String>,
+    },
+    /// A stream has been removed (hub destroyed).
+    StreamRemoved {
+        stream_id: StreamId,
+    },
+    /// Stream status changed (e.g. Created → Publishing → Unpublished).
+    StreamStatusChanged {
+        stream_id: StreamId,
+        old_status: StreamStatus,
+        new_status: StreamStatus,
+    },
+    /// A publisher acquired the stream (only one at a time).
+    PublisherAcquired {
+        stream_id: StreamId,
+        publisher_id: String,
+    },
+    /// A publisher released the stream.
+    PublisherReleased {
+        stream_id: StreamId,
+        publisher_id: String,
+    },
+    /// A playback receiver / sink was created (HTTP‑FLV, HLS, RTMP play, …).
+    ReceiverCreated {
+        stream_id: StreamId,
+        receiver_id: ReceiverId,
+        mode: StreamSinkMode,
+        protocol: StreamProtocol,
+        client_addr: Option<String>,
+    },
+    /// A receiver was removed (playback stopped).
+    ReceiverRemoved {
+        stream_id: StreamId,
+        receiver_id: ReceiverId,
+    },
+    /// Receiver status changed (e.g. Idle → Playing).
+    ReceiverStatusChanged {
+        stream_id: StreamId,
+        receiver_id: ReceiverId,
+        old_status: ReceiverStatus,
+        new_status: ReceiverStatus,
+    },
+}
+
+/// Convenience alias for the broadcast receiver end of the event channel.
+pub type StreamEventReceiver = broadcast::Receiver<StreamEvent>;
 
 /// Per-pull-loop cancellation handle.
 pub struct PullSessionHandle {
@@ -40,13 +104,59 @@ impl PullSessionHandle {
 pub struct StreamManager {
     hubs: RwLock<HashMap<StreamId, Arc<StreamHub>>>,
     pull_sessions: RwLock<HashMap<StreamId, Arc<PullSessionHandle>>>,
+    /// Broadcast sender for stream lifecycle events.
+    /// Protocol / process modules subscribe via [`StreamManager::subscribe_events`].
+    event_tx: broadcast::Sender<StreamEvent>,
 }
 
 impl StreamManager {
+    /// Capacity of the lifecycle event broadcast channel.
+    /// 256 should be enough to absorb short bursts (many receivers
+    /// starting/stopping concurrently) without dropping events for
+    /// slow subscribers.
+    const EVENT_CHANNEL_CAPACITY: usize = 256;
+
     pub fn new() -> Self {
+        let (event_tx, _) = broadcast::channel(Self::EVENT_CHANNEL_CAPACITY);
         Self {
             hubs: RwLock::new(HashMap::new()),
             pull_sessions: RwLock::new(HashMap::new()),
+            event_tx,
+        }
+    }
+
+    /// Subscribe to stream lifecycle events.
+    ///
+    /// Returns a [`broadcast::Receiver`] that yields every
+    /// [`StreamEvent`] emitted by this manager.  Protocol modules
+    /// and processing pipelines can call this once at startup and
+    /// then `recv().await` to react to stream/publisher/receiver
+    /// changes without polling.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut rx = manager.subscribe_events();
+    /// tokio::spawn(async move {
+    ///     while let Ok(event) = rx.recv().await {
+    ///         match event {
+    ///             StreamEvent::StreamCreated { stream_id, .. } => { /* … */ }
+    ///             StreamEvent::StreamRemoved { stream_id }    => { /* … */ }
+    ///             _ => {}
+    ///         }
+    ///     }
+    /// });
+    /// ```
+    pub fn subscribe_events(&self) -> StreamEventReceiver {
+        self.event_tx.subscribe()
+    }
+
+    /// Emit an event to all subscribers (fire-and-forget).
+    fn emit(&self, event: StreamEvent) {
+        // Ignore SendError (no receivers) — callers that care about
+        // lagged receivers can use `.receiver_count()`.
+        if self.event_tx.receiver_count() > 0 {
+            let _ = self.event_tx.send(event);
         }
     }
 
@@ -143,6 +253,13 @@ impl StreamManager {
         let hub = StreamHub::with_stream(stream.clone());
         hubs.insert(stream_id.to_string(), hub);
         info!("[Core] StreamHub ready for stream '{}'", stream_id);
+
+        self.emit(StreamEvent::StreamCreated {
+            stream_id: stream_id.to_string(),
+            source: stream.source.clone(),
+            protocol: stream.protocol.clone(),
+            pull_url: stream.pull_url.clone(),
+        });
 
         stream
     }
@@ -374,7 +491,13 @@ impl StreamManager {
 
     pub fn remove_stream(&self, stream_id: &StreamId) -> Option<Stream> {
         self.request_pull_stop(stream_id);
-        self.hubs.write().remove(stream_id).map(|hub| hub.stream())
+        let removed = self.hubs.write().remove(stream_id).map(|hub| hub.stream());
+        if removed.is_some() {
+            self.emit(StreamEvent::StreamRemoved {
+                stream_id: stream_id.clone(),
+            });
+        }
+        removed
     }
 
     pub fn get_stream(&self, stream_id: &StreamId) -> Option<Stream> {
@@ -388,14 +511,22 @@ impl StreamManager {
 
     pub fn set_status(&self, stream_id: &str, status: StreamStatus) -> Result<()> {
         if let Some(hub) = self.get_hub(stream_id) {
+            let mut old_status = StreamStatus::Created;
             hub.update_stream(|stream| {
-                let old_status = stream.status.clone();
+                old_status = stream.status.clone();
                 stream.status = status.clone();
                 info!(
                     "[Core] Stream {} status changed from {:?} to {:?}",
                     stream_id, old_status, status
                 );
             });
+            if old_status != status {
+                self.emit(StreamEvent::StreamStatusChanged {
+                    stream_id: stream_id.to_string(),
+                    old_status,
+                    new_status: status,
+                });
+            }
             Ok(())
         } else {
             Err(anyhow::anyhow!("Stream {} not found", stream_id))
@@ -466,6 +597,10 @@ impl StreamManager {
                     "[Core] Publisher {} acquired stream {}",
                     publisher_id, stream_id
                 );
+                self.emit(StreamEvent::PublisherAcquired {
+                    stream_id: stream_id.to_string(),
+                    publisher_id: publisher_id.to_string(),
+                });
                 Ok(())
             }
             Err(current) => {
@@ -493,6 +628,10 @@ impl StreamManager {
                 "[Core] Publisher {} released stream {}",
                 publisher_id, stream_id
             );
+            self.emit(StreamEvent::PublisherReleased {
+                stream_id: stream_id.to_string(),
+                publisher_id: publisher_id.to_string(),
+            });
         } else {
             debug!(
                 "[Core] Publisher {} did not own stream {}, release ignored",
@@ -529,6 +668,15 @@ impl StreamManager {
             "[Core] Created receiver {} for stream {}",
             receiver.id, stream_id
         );
+
+        self.emit(StreamEvent::ReceiverCreated {
+            stream_id: stream_id.to_string(),
+            receiver_id: receiver.id.clone(),
+            mode: receiver.mode.clone(),
+            protocol: receiver.protocol.clone(),
+            client_addr: receiver.client_addr.clone(),
+        });
+
         receiver
     }
 
@@ -554,6 +702,15 @@ impl StreamManager {
             "[Core] Created pull receiver {} for stream {} from client {}",
             receiver.id, stream_id, client_addr
         );
+
+        self.emit(StreamEvent::ReceiverCreated {
+            stream_id: stream_id.to_string(),
+            receiver_id: receiver.id.clone(),
+            mode: StreamSinkMode::Pull,
+            protocol: receiver.protocol.clone(),
+            client_addr: Some(client_addr.to_string()),
+        });
+
         receiver
     }
 
@@ -579,6 +736,15 @@ impl StreamManager {
             "[Core] Created push receiver {} for stream {} to {}",
             receiver.id, stream_id, push_addr
         );
+
+        self.emit(StreamEvent::ReceiverCreated {
+            stream_id: stream_id.to_string(),
+            receiver_id: receiver.id.clone(),
+            mode: StreamSinkMode::Push,
+            protocol: receiver.protocol.clone(),
+            client_addr: None,
+        });
+
         receiver
     }
 
@@ -594,6 +760,10 @@ impl StreamManager {
                 "[Core] Removed receiver {} for stream {}",
                 r.id, r.stream_id
             );
+            self.emit(StreamEvent::ReceiverRemoved {
+                stream_id: r.stream_id.clone(),
+                receiver_id: r.id.clone(),
+            });
         }
 
         receiver
@@ -625,16 +795,30 @@ impl StreamManager {
         receiver_id: &ReceiverId,
         status: ReceiverStatus,
     ) -> Result<()> {
-        let old_status = self
-            .hubs
-            .read()
-            .values()
-            .find_map(|hub| hub.set_receiver_status(receiver_id, status.clone()));
-        if let Some(old_status) = old_status {
+        let hubs = self.hubs.read();
+        let mut stream_id = None;
+        let mut old_status = None;
+        for hub in hubs.values() {
+            if let Some(os) = hub.set_receiver_status(receiver_id, status.clone()) {
+                old_status = Some(os);
+                stream_id = Some(hub.stream_id.clone());
+                break;
+            }
+        }
+        drop(hubs);
+        if let (Some(old_status), Some(stream_id)) = (old_status, stream_id) {
             info!(
                 "[Core] Receiver {} status changed from {:?} to {:?}",
                 receiver_id, old_status, status
             );
+            if old_status != status {
+                self.emit(StreamEvent::ReceiverStatusChanged {
+                    stream_id,
+                    receiver_id: receiver_id.clone(),
+                    old_status,
+                    new_status: status,
+                });
+            }
             Ok(())
         } else {
             Err(anyhow::anyhow!("Receiver {} not found", receiver_id))
@@ -707,21 +891,43 @@ impl StreamManager {
         }
 
         if let Some(hub) = self.get_hub(&stream_id) {
-            hub.update_stream(|stream| match stream.status {
-                StreamStatus::Created | StreamStatus::Unpublished => {
-                    stream.status = StreamStatus::Publishing;
-                    debug!("[Core] Stream {} status -> Publishing", stream_id);
+            let mut old_status = StreamStatus::Created;
+            hub.update_stream(|stream| {
+                match stream.status {
+                    StreamStatus::Created | StreamStatus::Unpublished => {
+                        old_status = stream.status.clone();
+                        stream.status = StreamStatus::Publishing;
+                        debug!("[Core] Stream {} status -> Publishing", stream_id);
+                    }
+                    _ => {}
                 }
-                _ => {}
             });
+            if old_status != StreamStatus::Publishing
+                && matches!(old_status, StreamStatus::Created | StreamStatus::Unpublished)
+            {
+                self.emit(StreamEvent::StreamStatusChanged {
+                    stream_id: stream_id.clone(),
+                    old_status,
+                    new_status: StreamStatus::Publishing,
+                });
+            }
         }
     }
 
     pub fn update_stream_status(&self, stream_id: &StreamId, status: StreamStatus) {
         if let Some(hub) = self.get_hub(stream_id) {
+            let mut old_status = StreamStatus::Created;
             hub.update_stream(|stream| {
-                stream.status = status;
+                old_status = stream.status.clone();
+                stream.status = status.clone();
             });
+            if old_status != status {
+                self.emit(StreamEvent::StreamStatusChanged {
+                    stream_id: stream_id.clone(),
+                    old_status,
+                    new_status: status,
+                });
+            }
         }
     }
 }

@@ -15,7 +15,7 @@ mod video_codec;
 pub use dispatch::{coalesce_flv_batch, DispatchError, DispatchPolicy, DispatchReader};
 pub use frame_ring::{is_playable_video, is_video_keyframe, FrameRing, SnapMode};
 pub use stream_hub::StreamHub;
-pub use stream_manager::{PullSessionHandle, StreamManager};
+pub use stream_manager::{PullSessionHandle, StreamEvent, StreamEventReceiver, StreamManager};
 
 use bytes::Bytes;
 use std::collections::HashMap;

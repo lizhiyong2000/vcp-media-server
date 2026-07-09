@@ -1,5 +1,6 @@
 target/
 .git/
+.gitignore
 .idea/
 .vscode/
 .DS_Store
@@ -12,3 +13,6 @@ saving/
 docs/
 tests/
 deploy/kubernetes/
+Dockerfile
+.dockerignore
+docker-compose*
