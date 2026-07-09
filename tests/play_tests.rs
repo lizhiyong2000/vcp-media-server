@@ -556,5 +556,354 @@ mod tests {
 
             println!("All real integration tests completed successfully!");
         }
+
+        // =========================================================================
+        // Multi-protocol playback helpers
+        // =========================================================================
+
+        /// Play an active stream via RTMP, HTTP-FLV, and RTSP (live, non-HLS protocols).
+        async fn play_via_live_protocols(
+            server: &MediaServer,
+            stream_id: &str,
+            codec: PublishCodec,
+        ) -> Result<(), String> {
+            // 1) RTMP
+            let mut rtmp = PlayConfig::rtmp(&server.rtmp_url("live", stream_id)).duration(3);
+            if matches!(codec, PublishCodec::H265) {
+                rtmp = rtmp.enhanced_rtmp_hevc();
+            }
+            run_ffplay_playback(&rtmp).await
+                .map_err(|e| format!("RTMP playback: {e}"))?;
+            println!("  [OK] RTMP   <- {stream_id}");
+
+            // 2) HTTP-FLV
+            let flv = PlayConfig::http_flv(&server.http_flv_url(stream_id)).duration(3);
+            run_ffplay_playback(&flv).await
+                .map_err(|e| format!("HTTP-FLV playback: {e}"))?;
+            println!("  [OK] FLV    <- {stream_id}");
+
+            // 3) RTSP
+            let rtsp = PlayConfig::rtsp(&server.rtsp_url(stream_id)).duration(3);
+            run_ffplay_playback(&rtsp).await
+                .map_err(|e| format!("RTSP playback: {e}"))?;
+            println!("  [OK] RTSP   <- {stream_id}");
+
+            Ok(())
+        }
+
+        /// Trigger HLS m3u8, wait for segments, then play via HLS.
+        async fn play_via_hls(
+            server: &MediaServer,
+            stream_id: &str,
+        ) -> Result<(), String> {
+            server.trigger_hls(stream_id).await?;
+            sleep(Duration::from_secs(6)).await;
+            let hls = PlayConfig::hls(&server.hls_url(stream_id)).duration(5);
+            run_ffplay_playback(&hls).await
+                .map_err(|e| format!("HLS playback: {e}"))?;
+            println!("  [OK] HLS    <- {stream_id}");
+            Ok(())
+        }
+
+        /// Push via ffmpeg, then test RTMP + FLV + RTSP + HLS playback against the same stream.
+        async fn push_and_play_all_protocols(
+            publish: &PublishConfig,
+            codec: PublishCodec,
+            server: &MediaServer,
+            stream_id: &str,
+        ) -> Result<(), String> {
+            let mut ffmpeg = spawn_ffmpeg(&publish.ffmpeg_args()).map_err(|e| e.to_string())?;
+            assert_ffmpeg_publishing(&mut ffmpeg, Duration::from_millis(2000)).await?;
+
+            let mut result = play_via_live_protocols(server, stream_id, codec).await;
+            if result.is_ok() {
+                result = play_via_hls(server, stream_id).await;
+            }
+
+            let _ = stop_child(&mut ffmpeg);
+            result
+        }
+
+        /// Push source, trigger API pull, then test all 4 play protocols from the pulled stream.
+        async fn pull_and_play_all_protocols(
+            server: &MediaServer,
+            publish: &PublishConfig,
+            remote_url: &str,
+            pulled_stream_id: &str,
+            rtsp_pull: bool,
+            play_codec: PublishCodec,
+        ) -> Result<(), String> {
+            let mut ffmpeg = spawn_ffmpeg(&publish.ffmpeg_args()).map_err(|e| e.to_string())?;
+            assert_ffmpeg_publishing(&mut ffmpeg, Duration::from_millis(2000)).await?;
+
+            let resp = if rtsp_pull {
+                server.api_rtsp_pull(remote_url, pulled_stream_id).await?
+            } else {
+                server.api_rtmp_pull(remote_url, pulled_stream_id).await?
+            };
+            if resp.status != 200 {
+                let _ = stop_child(&mut ffmpeg);
+                return Err(format!(
+                    "pull API failed: status {} body {}",
+                    resp.status, resp.body
+                ));
+            }
+
+            sleep(Duration::from_secs(3)).await;
+            let mut result = play_via_live_protocols(server, pulled_stream_id, play_codec).await;
+            if result.is_ok() {
+                result = play_via_hls(server, pulled_stream_id).await;
+            }
+
+            let _ = stop_child(&mut ffmpeg);
+            result
+        }
+
+        /// Create an RTSP publish config with optional transport.
+        fn rtsp_publish_cfg(
+            server: &MediaServer,
+            stream_id: &str,
+            codec: PublishCodec,
+            duration_secs: u32,
+            tcp: bool,
+        ) -> PublishConfig {
+            let mut cfg = PublishConfig::rtsp("127.0.0.1", server.ports().rtsp, stream_id)
+                .resolution(640, 480)
+                .framerate(25)
+                .duration(duration_secs)
+                .codec(codec);
+            if tcp {
+                cfg = cfg.rtsp_transport_tcp();
+            } else {
+                cfg = cfg.rtsp_transport_udp();
+            }
+            cfg
+        }
+
+        // =========================================================================
+        // RTMP Push → All Play Protocols
+        // =========================================================================
+
+        #[tokio::test]
+        async fn test_rtmp_push_h264_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let sid = unique_stream("rp_h264");
+            let cfg = rtmp_publish(&server, &sid, PublishCodec::H264, 22);
+            push_and_play_all_protocols(&cfg, PublishCodec::H264, &server, &sid)
+                .await
+                .expect("RTMP H264 → RTMP/FLV/RTSP/HLS");
+            println!("RTMP push H264 → all protocols OK: {sid}");
+        }
+
+        #[tokio::test]
+        async fn test_rtmp_push_h265_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let sid = unique_stream("rp_h265");
+            let cfg = rtmp_publish(&server, &sid, PublishCodec::H265, 22);
+            push_and_play_all_protocols(&cfg, PublishCodec::H265, &server, &sid)
+                .await
+                .expect("RTMP H265 → RTMP/FLV/RTSP/HLS");
+            println!("RTMP push H265 → all protocols OK: {sid}");
+        }
+
+        // =========================================================================
+        // RTSP Push (TCP/UDP) → All Play Protocols
+        // =========================================================================
+
+        #[tokio::test]
+        async fn test_rtsp_push_h264_tcp_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let sid = unique_stream("rsp_h264_tcp");
+            let cfg = rtsp_publish_cfg(&server, &sid, PublishCodec::H264, 22, true);
+            push_and_play_all_protocols(&cfg, PublishCodec::H264, &server, &sid)
+                .await
+                .expect("RTSP TCP H264 → RTMP/FLV/RTSP/HLS");
+            println!("RTSP push H264 TCP → all protocols OK: {sid}");
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_push_h264_udp_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let sid = unique_stream("rsp_h264_udp");
+            let cfg = rtsp_publish_cfg(&server, &sid, PublishCodec::H264, 22, false);
+            push_and_play_all_protocols(&cfg, PublishCodec::H264, &server, &sid)
+                .await
+                .expect("RTSP UDP H264 → RTMP/FLV/RTSP/HLS");
+            println!("RTSP push H264 UDP → all protocols OK: {sid}");
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_push_h265_tcp_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let sid = unique_stream("rsp_h265_tcp");
+            let cfg = rtsp_publish_cfg(&server, &sid, PublishCodec::H265, 22, true);
+            push_and_play_all_protocols(&cfg, PublishCodec::H265, &server, &sid)
+                .await
+                .expect("RTSP TCP H265 → RTMP/FLV/RTSP/HLS");
+            println!("RTSP push H265 TCP → all protocols OK: {sid}");
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_push_h265_udp_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let sid = unique_stream("rsp_h265_udp");
+            let cfg = rtsp_publish_cfg(&server, &sid, PublishCodec::H265, 22, false);
+            push_and_play_all_protocols(&cfg, PublishCodec::H265, &server, &sid)
+                .await
+                .expect("RTSP UDP H265 → RTMP/FLV/RTSP/HLS");
+            println!("RTSP push H265 UDP → all protocols OK: {sid}");
+        }
+
+        // =========================================================================
+        // RTMP Pull → All Play Protocols
+        // =========================================================================
+
+        #[tokio::test]
+        async fn test_rtmp_pull_h264_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let src_id = unique_stream("rmpl_h264_src");
+            let pulled_id = unique_stream("rmpl_h264_out");
+            let publish = rtmp_publish(&server, &src_id, PublishCodec::H264, 24);
+            let remote_url = server.rtmp_url("live", &src_id);
+
+            pull_and_play_all_protocols(
+                &server, &publish, &remote_url, &pulled_id, false, PublishCodec::H264,
+            )
+            .await
+            .expect("RTMP pull H264 → RTMP/FLV/RTSP/HLS");
+            println!("RTMP pull H264 → all protocols OK: {src_id}->{pulled_id}");
+        }
+
+        #[tokio::test]
+        async fn test_rtmp_pull_h265_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let src_id = unique_stream("rmpl_h265_src");
+            let pulled_id = unique_stream("rmpl_h265_out");
+            let publish = rtmp_publish(&server, &src_id, PublishCodec::H265, 24);
+            let remote_url = server.rtmp_url("live", &src_id);
+
+            pull_and_play_all_protocols(
+                &server, &publish, &remote_url, &pulled_id, false, PublishCodec::H265,
+            )
+            .await
+            .expect("RTMP pull H265 → RTMP/FLV/RTSP/HLS");
+            println!("RTMP pull H265 → all protocols OK: {src_id}->{pulled_id}");
+        }
+
+        // =========================================================================
+        // RTSP Pull (TCP/UDP) → All Play Protocols
+        // =========================================================================
+
+        #[tokio::test]
+        async fn test_rtsp_pull_h264_tcp_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let src_id = unique_stream("rspl_h264t_src");
+            let pulled_id = unique_stream("rspl_h264t_out");
+            let publish = rtsp_publish_cfg(&server, &src_id, PublishCodec::H264, 24, true);
+            let remote_url = server.rtsp_url(&src_id);
+
+            pull_and_play_all_protocols(
+                &server, &publish, &remote_url, &pulled_id, true, PublishCodec::H264,
+            )
+            .await
+            .expect("RTSP pull H264 TCP → RTMP/FLV/RTSP/HLS");
+            println!("RTSP pull H264 TCP → all protocols OK: {src_id}->{pulled_id}");
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_pull_h264_udp_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let src_id = unique_stream("rspl_h264u_src");
+            let pulled_id = unique_stream("rspl_h264u_out");
+            let publish = rtsp_publish_cfg(&server, &src_id, PublishCodec::H264, 24, false);
+            let remote_url = format!("{}?transport=udp", server.rtsp_url(&src_id));
+
+            pull_and_play_all_protocols(
+                &server, &publish, &remote_url, &pulled_id, true, PublishCodec::H264,
+            )
+            .await
+            .expect("RTSP pull H264 UDP → RTMP/FLV/RTSP/HLS");
+            println!("RTSP pull H264 UDP → all protocols OK: {src_id}->{pulled_id}");
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_pull_h265_tcp_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let src_id = unique_stream("rspl_h265t_src");
+            let pulled_id = unique_stream("rspl_h265t_out");
+            let publish = rtsp_publish_cfg(&server, &src_id, PublishCodec::H265, 24, true);
+            let remote_url = server.rtsp_url(&src_id);
+
+            pull_and_play_all_protocols(
+                &server, &publish, &remote_url, &pulled_id, true, PublishCodec::H265,
+            )
+            .await
+            .expect("RTSP pull H265 TCP → RTMP/FLV/RTSP/HLS");
+            println!("RTSP pull H265 TCP → all protocols OK: {src_id}->{pulled_id}");
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_pull_h265_udp_play_all_protocols() {
+            require_ffmpeg_ffplay();
+            let server = MediaServer::start_isolated()
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            let src_id = unique_stream("rspl_h265u_src");
+            let pulled_id = unique_stream("rspl_h265u_out");
+            let publish = rtsp_publish_cfg(&server, &src_id, PublishCodec::H265, 24, false);
+            let remote_url = format!("{}?transport=udp", server.rtsp_url(&src_id));
+
+            pull_and_play_all_protocols(
+                &server, &publish, &remote_url, &pulled_id, true, PublishCodec::H265,
+            )
+            .await
+            .expect("RTSP pull H265 UDP → RTMP/FLV/RTSP/HLS");
+            println!("RTSP pull H265 UDP → all protocols OK: {src_id}->{pulled_id}");
+        }
     }
 }

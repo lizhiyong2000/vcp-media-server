@@ -144,6 +144,8 @@ pub struct PublishConfig {
     pub framerate: u32,
     pub duration_secs: u32,
     pub codec: PublishCodec,
+    /// RTSP transport mode (only used when publishing to RTSP).
+    pub rtsp_transport: Option<RtspTransport>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -161,6 +163,7 @@ impl Default for PublishConfig {
             framerate: 25,
             duration_secs: 10,
             codec: PublishCodec::H264,
+            rtsp_transport: None,
         }
     }
 }
@@ -207,6 +210,18 @@ impl PublishConfig {
         self
     }
 
+    /// Force RTSP TCP transport for publish.
+    pub fn rtsp_transport_tcp(mut self) -> Self {
+        self.rtsp_transport = Some(RtspTransport::Tcp);
+        self
+    }
+
+    /// Force RTSP UDP transport for publish.
+    pub fn rtsp_transport_udp(mut self) -> Self {
+        self.rtsp_transport = Some(RtspTransport::Udp);
+        self
+    }
+
     /// Build ffmpeg command arguments.
     pub fn ffmpeg_args(&self) -> Vec<String> {
         let codec_name = match self.codec {
@@ -232,9 +247,22 @@ impl PublishConfig {
             "lavfi".to_string(),
             "-i".to_string(),
             "aevalsrc=0.1*sin(2*PI*440*t):sample_rate=48000".to_string(),
-            "-c:v".to_string(),
-            codec_name.to_string(),
         ];
+
+        // RTSP transport mode for publish
+        if output_format == "rtsp" {
+            if let Some(transport) = &self.rtsp_transport {
+                args.push("-rtsp_transport".to_string());
+                args.push(match transport {
+                    RtspTransport::Tcp => "tcp",
+                    RtspTransport::Udp => "udp",
+                }
+                .to_string());
+            }
+        }
+
+        args.push("-c:v".to_string());
+        args.push(codec_name.to_string());
 
         if matches!(self.codec, PublishCodec::H264) {
             args.push("-g".to_string());
