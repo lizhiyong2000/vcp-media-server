@@ -8,7 +8,7 @@ use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 use url;
 
-use super::common::{parse_transport_server_ports, url_prefers_udp, RtspCommon};
+use super::common::{extract_transport, parse_transport_server_ports, url_prefers_udp, RtspCommon};
 use super::connection::RtspConnection;
 use super::messages::RtspRequest;
 use super::{RtspSessionState, TransportMode};
@@ -21,6 +21,8 @@ pub struct RtspClientSession {
     remote_url: String,
     cseq: u32,
     udp_tracks: HashMap<usize, TrackUdpTransport>,
+    tcp_rtp_channels: HashMap<u8, usize>,
+    tcp_rtcp_channels: HashMap<u8, usize>,
 }
 
 struct TrackUdpTransport {
@@ -39,6 +41,8 @@ impl RtspClientSession {
             remote_url: remote_url.to_string(),
             cseq: 1,
             udp_tracks: HashMap::new(),
+            tcp_rtp_channels: HashMap::new(),
+            tcp_rtcp_channels: HashMap::new(),
         }
     }
 
@@ -110,6 +114,14 @@ impl RtspClientSession {
 
     pub fn is_udp_configured(&self) -> bool {
         !self.udp_tracks.is_empty()
+    }
+
+    pub fn tcp_track_index_for_rtp_channel(&self, channel: u8) -> Option<usize> {
+        self.tcp_rtp_channels.get(&channel).copied()
+    }
+
+    pub fn is_tcp_rtcp_channel(&self, channel: u8) -> bool {
+        self.tcp_rtcp_channels.contains_key(&channel)
     }
 
     pub async fn connect(&mut self) -> Result<()> {
@@ -313,6 +325,17 @@ impl RtspClientSession {
 
         self.session.session_id = RtspCommon::extract_session_id(&response);
         self.session.transport_mode = TransportMode::Tcp;
+        let transport = extract_transport(&response);
+        let (rtp_channel, rtcp_channel) = transport
+            .client_port
+            .and_then(|(rtp, rtcp)| Some((u8::try_from(rtp).ok()?, u8::try_from(rtcp).ok()?)))
+            .unwrap_or_else(|| ((track_idx * 2) as u8, (track_idx * 2 + 1) as u8));
+        self.tcp_rtp_channels.insert(rtp_channel, track_idx);
+        self.tcp_rtcp_channels.insert(rtcp_channel, track_idx);
+        info!(
+            "[RTSP Client] TCP SETUP track {} channels rtp={} rtcp={}",
+            track_idx, rtp_channel, rtcp_channel
+        );
 
         Ok(response)
     }

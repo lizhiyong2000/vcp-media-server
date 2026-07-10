@@ -2,10 +2,10 @@
 //!
 //! This module provides shared test infrastructure for cross-protocol streaming tests.
 
-pub mod frame_generators;
 pub mod ffmpeg_helper;
-pub mod http_client;
+pub mod frame_generators;
 pub mod hls_helper;
+pub mod http_client;
 pub mod http_flv_helper;
 pub mod media_server_runner;
 pub mod process_manager;
@@ -13,6 +13,7 @@ pub mod rtmp_helper;
 pub mod rtsp_helper;
 pub mod server_helper;
 pub mod stream_helper;
+pub mod verify;
 
 /// Test configuration for cross-protocol tests.
 #[derive(Debug, Clone)]

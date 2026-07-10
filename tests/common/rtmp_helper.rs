@@ -2,8 +2,8 @@
 //!
 //! Provides utilities for RTMP protocol testing.
 
-use bytes::BytesMut;
 use super::TestCodec;
+use bytes::BytesMut;
 
 /// RTMP test helper structure.
 #[derive(Debug, Clone)]
@@ -60,18 +60,12 @@ impl RtmpTestHelper {
 ///
 /// Returns the command bytes for a publish request.
 pub fn create_rtmp_publish_command(stream_key: &str, app: &str) -> String {
-    format!(
-        "publish {} live",
-        stream_key
-    )
+    format!("publish {} live", stream_key)
 }
 
 /// Create RTMP play command in AMF0 format.
 pub fn create_rtmp_play_command(stream_key: &str, app: &str) -> String {
-    format!(
-        "play {}",
-        stream_key
-    )
+    format!("play {}", stream_key)
 }
 
 /// Build RTMP connect command.

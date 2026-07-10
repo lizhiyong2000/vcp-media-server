@@ -75,7 +75,7 @@ pub fn generate_h265_vps_sps_pps() -> Bytes {
     // VPS NAL - type 32
     let vps = vec![
         0x40, 0x01, 0x0C, 0x01, // NAL header + vps_id
-        0xFF, 0x00, 0x00,       // vps_base_layer_internal_flag, etc.
+        0xFF, 0x00, 0x00, // vps_base_layer_internal_flag, etc.
     ];
 
     // SPS NAL - type 33
@@ -87,7 +87,7 @@ pub fn generate_h265_vps_sps_pps() -> Bytes {
     // PPS NAL - type 34
     let pps = vec![
         0x44, 0x01, 0x00, 0x01, // NAL header + pps_id
-        0x60, 0x00,             // pps_pic_parameter_set_id, etc.
+        0x60, 0x00, // pps_pic_parameter_set_id, etc.
     ];
 
     let mut data = Vec::with_capacity(32);

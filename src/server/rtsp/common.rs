@@ -379,8 +379,11 @@ impl RtspCommon {
             if attr.key == "fmtp" {
                 if let Some(value) = &attr.value {
                     debug!("[RTSP Common] Found fmtp line: {}", value);
-                    let fmtp_content = value.split_whitespace().last().unwrap_or(value);
-                    for part in fmtp_content.split(';') {
+                    let fmtp_content = value
+                        .split_once(char::is_whitespace)
+                        .map(|(_, params)| params.trim())
+                        .unwrap_or(value);
+                    for part in fmtp_content.split(';').map(str::trim) {
                         if let Some(params) = part.strip_prefix("sprop-parameter-sets=") {
                             debug!("[RTSP Common] Found sprop-parameter-sets: {}", params);
                             for (idx, param) in params.split(',').enumerate() {

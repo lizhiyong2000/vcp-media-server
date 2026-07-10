@@ -32,7 +32,10 @@ impl HlsTestHelper {
 
     /// Get the master playlist URL (if using adaptive streaming).
     pub fn master_playlist_url(&self, host: &str, port: u16) -> String {
-        format!("http://{}:{}/hls/{}/master.m3u8", host, port, self.stream_id)
+        format!(
+            "http://{}:{}/hls/{}/master.m3u8",
+            host, port, self.stream_id
+        )
     }
 
     /// Get the playlist URL for a specific variant.
@@ -58,7 +61,9 @@ impl HlsTestHelper {
 
     /// Get local path to playlist.
     pub fn playlist_path(&self, variant: &str) -> PathBuf {
-        self.output_dir.join(&self.stream_id).join(format!("{}.m3u8", variant))
+        self.output_dir
+            .join(&self.stream_id)
+            .join(format!("{}.m3u8", variant))
     }
 
     /// Get local path to segment.
@@ -77,7 +82,9 @@ pub fn parse_m3u8_header(data: &str) -> Option<&str> {
 
 /// Check if file is a valid m3u8 playlist.
 pub fn is_valid_m3u8(data: &str) -> bool {
-    parse_m3u8_header(data).map(|h| h == "#EXTM3U").unwrap_or(false)
+    parse_m3u8_header(data)
+        .map(|h| h == "#EXTM3U")
+        .unwrap_or(false)
 }
 
 /// Parse m3u8 playlist info.

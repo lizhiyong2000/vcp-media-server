@@ -2,7 +2,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::channel;
 use tracing::{debug, info};
 
 use super::common::{format_rtsp_message, RtspCommon};
@@ -13,6 +13,7 @@ pub struct RtspConnection {
     reader: SocketReader<tokio::net::tcp::OwnedReadHalf>,
     writer: ChannelSocketWriter,
     peer_addr: SocketAddr,
+    read_buffer: BytesMut,
 }
 
 impl RtspConnection {
@@ -31,6 +32,7 @@ impl RtspConnection {
             reader: SocketReader::new(reader),
             writer: ChannelSocketWriter::new(write_tx),
             peer_addr,
+            read_buffer: BytesMut::with_capacity(8192),
         }
     }
 
@@ -39,8 +41,7 @@ impl RtspConnection {
     }
 
     pub async fn read_request(&mut self) -> Result<Option<RtspRequest>> {
-        let mut buffer = BytesMut::with_capacity(8192);
-        let request_data = self.read_rtsp_message(&mut buffer).await?;
+        let request_data = self.read_rtsp_message().await?;
 
         if request_data.is_empty() {
             return Ok(None);
@@ -57,8 +58,7 @@ impl RtspConnection {
     }
 
     pub async fn read_response(&mut self) -> Result<String> {
-        let mut buffer = BytesMut::with_capacity(8192);
-        let data = self.read_rtsp_message(&mut buffer).await?;
+        let data = self.read_rtsp_message().await?;
         Ok(String::from_utf8_lossy(&data).to_string())
     }
 
@@ -91,53 +91,72 @@ impl RtspConnection {
         self.writer.write_all(&interleaved).await
     }
 
-    pub async fn read_rtsp_message(&mut self, buffer: &mut BytesMut) -> Result<BytesMut> {
+    pub async fn read_rtsp_message(&mut self) -> Result<BytesMut> {
         loop {
-            let n = self.reader.read_into(buffer).await?;
+            if let Some(pos) = self.read_buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let content_length = self.parse_content_length(&self.read_buffer, pos);
+                let total_length = pos + 4 + content_length;
+
+                if self.read_buffer.len() >= total_length {
+                    let data = self.read_buffer.split_to(total_length);
+                    return Ok(data);
+                }
+            }
+
+            let n = self.reader.read_into(&mut self.read_buffer).await?;
             if n == 0 {
                 info!("[RTSP] [{}] Connection closed by peer", self.peer_addr);
                 return Ok(BytesMut::new());
-            }
-
-            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-                let content_length = self.parse_content_length(buffer, pos);
-                let total_length = pos + 4 + content_length;
-
-                if buffer.len() >= total_length {
-                    let data = buffer.split_to(total_length);
-                    return Ok(data);
-                }
             }
         }
     }
 
     pub async fn read_interleaved_data(&mut self) -> Result<Option<(u8, BytesMut)>> {
-        let mut buffer = BytesMut::with_capacity(8192);
         loop {
-            let n = self.reader.read_into(&mut buffer).await?;
-            if n == 0 {
-                return Ok(None);
+            if self.read_buffer.starts_with(b"$") {
+                if self.read_buffer.len() >= 4 {
+                    let channel = self.read_buffer[1];
+                    let length =
+                        ((self.read_buffer[2] as usize) << 8) | (self.read_buffer[3] as usize);
+                    let packet_length = 4 + length;
+
+                    if self.read_buffer.len() >= packet_length {
+                        let mut data = self.read_buffer.split_to(packet_length);
+                        let rtp_data = data.split_off(4);
+                        return Ok(Some((channel, rtp_data)));
+                    }
+                }
+
+                let n = self.reader.read_into(&mut self.read_buffer).await?;
+                if n == 0 {
+                    return Ok(None);
+                }
+                continue;
             }
 
-            if buffer.starts_with(b"$") && buffer.len() >= 4 {
-                let channel = buffer[1];
-                let length = ((buffer[2] as usize) << 8) | (buffer[3] as usize);
-                let packet_length = 4 + length;
-
-                if buffer.len() >= packet_length {
-                    let mut data = buffer.split_to(packet_length);
-                    let rtp_data = data.split_off(4);
-                    return Ok(Some((channel, rtp_data)));
+            if let Some(pos) = self.read_buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let content_length = self.parse_content_length(&self.read_buffer, pos);
+                let total_length = pos + 4 + content_length;
+                if self.read_buffer.len() >= total_length {
+                    let _message = self.read_buffer.split_to(total_length);
+                    debug!(
+                        "[RTSP] [{}] Got RTSP message instead of interleaved data, ignoring",
+                        self.peer_addr
+                    );
+                    continue;
                 }
             }
 
-            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-                let request_data = buffer.split_to(pos + 4);
-                debug!(
-                    "[RTSP] [{}] Got RTSP message instead of interleaved data, ignoring",
-                    self.peer_addr
-                );
-                continue;
+            if let Some(pos) = self.read_buffer.iter().position(|b| *b == b'$') {
+                if pos > 0 {
+                    let _ = self.read_buffer.split_to(pos);
+                    continue;
+                }
+            }
+
+            let n = self.reader.read_into(&mut self.read_buffer).await?;
+            if n == 0 {
+                return Ok(None);
             }
         }
     }

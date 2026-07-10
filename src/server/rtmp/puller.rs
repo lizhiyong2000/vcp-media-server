@@ -12,10 +12,11 @@ use tracing::{debug, error, info, warn};
 use super::amf0::{self, Amf0Value};
 use super::chunk::{self, ChunkAssembler, ChunkHeader};
 use crate::core::{
-    hvcc_payload_to_annex_b, is_keyframe_annex_b, parse_enhanced_hevc_video_message,
-    parse_hevc_decoder_config_record, CodecType, MediaFrame, MediaTransport, StreamManager,
-    StreamProtocol, StreamPuller, StreamSourceMode, TransportStatus, MILLISECOND_CLOCK_RATE,
-    RTMP_PKT_CODED_FRAMES, RTMP_PKT_CODED_FRAMES_X, RTMP_PKT_SEQUENCE_START,
+    default_live_tracks, hvcc_payload_to_annex_b, is_keyframe_annex_b, iter_annex_b_nal_ranges,
+    parse_enhanced_hevc_video_message, parse_hevc_decoder_config_record, CodecType, MediaFrame,
+    MediaTransport, StreamManager, StreamProtocol, StreamPuller, StreamSourceMode, TransportStatus,
+    MILLISECOND_CLOCK_RATE, RTMP_PKT_CODED_FRAMES, RTMP_PKT_CODED_FRAMES_X,
+    RTMP_PKT_SEQUENCE_START,
 };
 
 #[derive(Debug, Clone)]
@@ -157,6 +158,8 @@ impl RtmpPuller {
         );
         let _ = self.stream_manager.set_unpublished(local_stream_id);
         self.stream_manager.set_stream_broadcast(local_stream_id);
+        self.stream_manager
+            .set_stream_tracks(local_stream_id, default_live_tracks());
         let _ = self.stream_manager.set_publishing(local_stream_id);
 
         // Step 3: play
@@ -228,6 +231,7 @@ impl RtmpPuller {
                 }
 
                 if let Some(frame) = rtmp_message_to_frame(&msg, &local_id) {
+                    merge_video_config_from_frame(&manager, &local_id, &frame);
                     frames_received += 1;
                     if frames_received == 1 {
                         info!(
@@ -628,6 +632,15 @@ fn extract_and_store_h264_sps_pps(data: &[u8], manager: &StreamManager, stream_i
             stream_id
         );
         manager.set_stream_sps_pps(stream_id, sps_data, pps_data);
+    }
+}
+
+fn merge_video_config_from_frame(manager: &StreamManager, stream_id: &str, frame: &MediaFrame) {
+    if !matches!(frame.codec, CodecType::H264 | CodecType::H265) {
+        return;
+    }
+    for (start, end) in iter_annex_b_nal_ranges(&frame.data) {
+        manager.merge_stream_nalu_config(stream_id, frame.codec, &frame.data[start..end]);
     }
 }
 

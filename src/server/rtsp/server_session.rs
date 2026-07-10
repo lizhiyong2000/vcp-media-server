@@ -1226,7 +1226,8 @@ fn codec_for_track_or_payload(
 ) -> Option<CodecType> {
     tracks
         .iter()
-        .find(|track| track.id == track_id || track.payload_type == payload_type)
+        .find(|track| track.payload_type == payload_type)
+        .or_else(|| tracks.iter().find(|track| track.id == track_id))
         .map(|track| track.codec)
 }
 
@@ -1244,7 +1245,8 @@ fn clock_rate_for_track_or_payload(
 ) -> Option<u32> {
     tracks
         .iter()
-        .find(|track| track.id == track_id || track.payload_type == payload_type)
+        .find(|track| track.payload_type == payload_type)
+        .or_else(|| tracks.iter().find(|track| track.id == track_id))
         .map(|track| track.clock_rate)
 }
 

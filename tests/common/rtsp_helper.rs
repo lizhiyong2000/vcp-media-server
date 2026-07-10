@@ -164,8 +164,8 @@ pub fn create_h264_sdp() -> String {
          a=fmtp:96 packetization-mode=1;profile-level-id=42001E;sprop-parameter-sets=Z0IAKeKQCgC3ycQKAqCxI0DUFCgK1CFAQ==,aMuMsg==\r\n\
          m=audio 0 RTP/AVP 97\r\n\
          a=rtpmap:97 mpeg4-generic/44100/2\r\n\
-         a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3\r\n"
-        , ts, ts
+         a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3\r\n",
+        ts, ts
     )
 }
 
@@ -188,8 +188,8 @@ pub fn create_h265_sdp() -> String {
          a=fmtp:98 profile-id=1;tier-flag=0;level-id=93;sprop-layer-id=1;sprop-layer-info=NAL...;sprop-vps=NAL...;sprop-sps=NAL...;sprop-pps=NAL...\r\n\
          m=audio 0 RTP/AVP 97\r\n\
          a=rtpmap:97 mpeg4-generic/44100/2\r\n\
-         a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3\r\n"
-        , ts, ts
+         a=fmtp:97 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3\r\n",
+        ts, ts
     )
 }
 
@@ -217,7 +217,14 @@ pub fn parse_session_header(response: &str) -> Option<String> {
     for line in response.lines() {
         if line.to_lowercase().starts_with("session:") {
             let value = line.trim_start_matches("session:");
-            return Some(value.trim().split(';').next().unwrap_or(value.trim()).to_string());
+            return Some(
+                value
+                    .trim()
+                    .split(';')
+                    .next()
+                    .unwrap_or(value.trim())
+                    .to_string(),
+            );
         }
     }
     None

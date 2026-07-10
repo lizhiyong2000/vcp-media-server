@@ -155,9 +155,12 @@ fn parse_sprop_from_fmtp(fmtp: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     let mut sps = None;
     let mut pps = None;
 
-    let fmtp = fmtp.split_whitespace().last().unwrap_or(fmtp);
+    let fmtp = fmtp
+        .split_once(char::is_whitespace)
+        .and_then(|(payload_type, params)| payload_type.parse::<u8>().ok().map(|_| params.trim()))
+        .unwrap_or(fmtp);
 
-    for param in fmtp.split(';') {
+    for param in fmtp.split(';').map(str::trim) {
         if let Some(params) = param.strip_prefix("sprop-parameter-sets=") {
             for (idx, b64) in params.split(',').enumerate() {
                 if b64.is_empty() {
@@ -248,5 +251,15 @@ a=rtpmap:103 H264/90000
         let patched = patch_answer_sdp_h264(sdp, &sps, &pps);
         assert!(patched.contains("a=fmtp:103"));
         assert!(patched.contains("profile-level-id=42001f"));
+    }
+
+    #[test]
+    fn parses_plain_fmtp_params_with_spaces() {
+        let (sps, pps) = parse_sprop_from_fmtp(
+            "sprop-parameter-sets=Z0LAHukBQBbsAAADAAQAAAMABAAAAwHNgYI=,aM4xsg==; profile-level-id=42e01f",
+        );
+
+        assert!(sps.is_some());
+        assert!(pps.is_some());
     }
 }

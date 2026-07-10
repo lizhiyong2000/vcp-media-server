@@ -96,7 +96,10 @@ pub fn create_rtmp_publish_command(
         "-f".to_string(),
         "lavfi".to_string(),
         "-i".to_string(),
-        format!("testsrc2=size={}x{}:rate={}", config.width, config.height, config.framerate),
+        format!(
+            "testsrc2=size={}x{}:rate={}",
+            config.width, config.height, config.framerate
+        ),
         "-f".to_string(),
         "lavfi".to_string(),
         "-i".to_string(),
@@ -156,7 +159,10 @@ pub fn create_rtsp_publish_command(
         "-f".to_string(),
         "lavfi".to_string(),
         "-i".to_string(),
-        format!("testsrc2=size={}x{}:rate={}", config.width, config.height, config.framerate),
+        format!(
+            "testsrc2=size={}x{}:rate={}",
+            config.width, config.height, config.framerate
+        ),
         "-f".to_string(),
         "lavfi".to_string(),
         "-i".to_string(),
@@ -215,9 +221,7 @@ pub fn create_rtsp_play_command(
         "10".to_string()
     };
 
-    let mut cmd = vec![
-        "ffplay".to_string(),
-    ];
+    let mut cmd = vec!["ffplay".to_string()];
 
     if tcp_mode {
         cmd.push("-rtsp_transport".to_string());

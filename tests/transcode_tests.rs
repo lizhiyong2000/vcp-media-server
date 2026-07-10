@@ -86,30 +86,33 @@ mod transcode_manager_tests {
         let transcode_manager = TranscodeManager::new(stream_manager, &config, 8081, 1935);
 
         let req = StartTranscodeRequest {
-            source_stream_id: "test_source".to_string(),
-            target_stream_id: "test_target".to_string(),
+            source_stream_id: "transcode_manager_h264_src".to_string(),
+            target_stream_id: "transcode_manager_h265_out".to_string(),
             profile: None,
         };
 
         let result = transcode_manager.start(req);
         assert!(result.is_ok());
         let session_info = result.unwrap();
-        assert_eq!(session_info.source_stream_id, "test_source");
-        assert_eq!(session_info.target_stream_id, "test_target");
+        assert_eq!(session_info.source_stream_id, "transcode_manager_h264_src");
+        assert_eq!(session_info.target_stream_id, "transcode_manager_h265_out");
         assert_eq!(session_info.status, "starting");
 
         let sessions = transcode_manager.active_sessions();
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].source_stream_id, "test_source");
+        assert_eq!(sessions[0].source_stream_id, "transcode_manager_h264_src");
 
         let stop_req = StopTranscodeRequest {
-            source_stream_id: "test_source".to_string(),
-            target_stream_id: Some("test_target".to_string()),
+            source_stream_id: "transcode_manager_h264_src".to_string(),
+            target_stream_id: Some("transcode_manager_h265_out".to_string()),
         };
 
         let stop_result = transcode_manager.stop(stop_req);
         assert!(stop_result.is_ok());
-        assert_eq!(stop_result.unwrap().source_stream_id, "test_source");
+        assert_eq!(
+            stop_result.unwrap().source_stream_id,
+            "transcode_manager_h264_src"
+        );
 
         let sessions = transcode_manager.active_sessions();
         assert_eq!(sessions.len(), 0);
@@ -126,8 +129,8 @@ mod transcode_manager_tests {
         let transcode_manager = TranscodeManager::new(stream_manager, &config, 8081, 1935);
 
         let req = StartTranscodeRequest {
-            source_stream_id: "test_source".to_string(),
-            target_stream_id: "test_target".to_string(),
+            source_stream_id: "transcode_disabled_h264_src".to_string(),
+            target_stream_id: "transcode_disabled_h265_out".to_string(),
             profile: None,
         };
 
@@ -147,31 +150,33 @@ mod transcode_manager_tests {
         let transcode_manager = TranscodeManager::new(stream_manager, &config, 8081, 1935);
 
         let req1 = StartTranscodeRequest {
-            source_stream_id: "source1".to_string(),
-            target_stream_id: "target1".to_string(),
+            source_stream_id: "transcode_worker_h264_src".to_string(),
+            target_stream_id: "transcode_worker_h265_out".to_string(),
             profile: None,
         };
         let result1 = transcode_manager.start(req1);
         assert!(result1.is_ok());
 
         let req2 = StartTranscodeRequest {
-            source_stream_id: "source2".to_string(),
-            target_stream_id: "target2".to_string(),
+            source_stream_id: "transcode_worker_extra_h264_src".to_string(),
+            target_stream_id: "transcode_worker_extra_h265_out".to_string(),
             profile: None,
         };
         let result2 = transcode_manager.start(req2);
         assert!(result2.is_err());
-        assert!(result2.unwrap_err().contains("max transcode workers reached"));
+        assert!(result2
+            .unwrap_err()
+            .contains("max transcode workers reached"));
 
         let stop_req = StopTranscodeRequest {
-            source_stream_id: "source1".to_string(),
-            target_stream_id: Some("target1".to_string()),
+            source_stream_id: "transcode_worker_h264_src".to_string(),
+            target_stream_id: Some("transcode_worker_h265_out".to_string()),
         };
         transcode_manager.stop(stop_req).unwrap();
 
         let req3 = StartTranscodeRequest {
-            source_stream_id: "source3".to_string(),
-            target_stream_id: "target3".to_string(),
+            source_stream_id: "transcode_worker_next_h264_src".to_string(),
+            target_stream_id: "transcode_worker_next_h265_out".to_string(),
             profile: None,
         };
         let result3 = transcode_manager.start(req3);
@@ -189,16 +194,16 @@ mod transcode_manager_tests {
         let transcode_manager = TranscodeManager::new(stream_manager, &config, 8081, 1935);
 
         let req1 = StartTranscodeRequest {
-            source_stream_id: "same_source".to_string(),
-            target_stream_id: "same_target".to_string(),
+            source_stream_id: "transcode_duplicate_h264_src".to_string(),
+            target_stream_id: "transcode_duplicate_h265_out".to_string(),
             profile: None,
         };
         let result1 = transcode_manager.start(req1);
         assert!(result1.is_ok());
 
         let req2 = StartTranscodeRequest {
-            source_stream_id: "same_source".to_string(),
-            target_stream_id: "same_target".to_string(),
+            source_stream_id: "transcode_duplicate_h264_src".to_string(),
+            target_stream_id: "transcode_duplicate_h265_out".to_string(),
             profile: None,
         };
         let result2 = transcode_manager.start(req2);
@@ -206,8 +211,8 @@ mod transcode_manager_tests {
         assert!(result2.unwrap_err().contains("already exists"));
 
         let stop_req = StopTranscodeRequest {
-            source_stream_id: "same_source".to_string(),
-            target_stream_id: Some("same_target".to_string()),
+            source_stream_id: "transcode_duplicate_h264_src".to_string(),
+            target_stream_id: Some("transcode_duplicate_h265_out".to_string()),
         };
         transcode_manager.stop(stop_req).unwrap();
     }
@@ -223,8 +228,8 @@ mod transcode_manager_tests {
         let transcode_manager = TranscodeManager::new(stream_manager, &config, 8081, 1935);
 
         let stop_req = StopTranscodeRequest {
-            source_stream_id: "nonexistent".to_string(),
-            target_stream_id: Some("target".to_string()),
+            source_stream_id: "transcode_missing_h264_src".to_string(),
+            target_stream_id: Some("transcode_missing_h265_out".to_string()),
         };
 
         let result = transcode_manager.stop(stop_req);
@@ -243,14 +248,14 @@ mod transcode_manager_tests {
         let transcode_manager = TranscodeManager::new(stream_manager, &config, 8081, 1935);
 
         let req = StartTranscodeRequest {
-            source_stream_id: "source_without_target".to_string(),
-            target_stream_id: "target_for_source".to_string(),
+            source_stream_id: "transcode_stop_by_source_h264_src".to_string(),
+            target_stream_id: "transcode_stop_by_source_h265_out".to_string(),
             profile: None,
         };
         transcode_manager.start(req).unwrap();
 
         let stop_req = StopTranscodeRequest {
-            source_stream_id: "source_without_target".to_string(),
+            source_stream_id: "transcode_stop_by_source_h264_src".to_string(),
             target_stream_id: None,
         };
 
@@ -258,7 +263,7 @@ mod transcode_manager_tests {
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap().target_stream_id,
-            "target_for_source"
+            "transcode_stop_by_source_h265_out"
         );
 
         let sessions = transcode_manager.active_sessions();
@@ -278,15 +283,15 @@ mod transcode_manager_tests {
         assert_eq!(transcode_manager.active_sessions().len(), 0);
 
         let req1 = StartTranscodeRequest {
-            source_stream_id: "stream1".to_string(),
-            target_stream_id: "stream1_low".to_string(),
+            source_stream_id: "transcode_list_h264_src".to_string(),
+            target_stream_id: "transcode_list_h264_low_out".to_string(),
             profile: None,
         };
         transcode_manager.start(req1).unwrap();
 
         let req2 = StartTranscodeRequest {
-            source_stream_id: "stream2".to_string(),
-            target_stream_id: "stream2_high".to_string(),
+            source_stream_id: "transcode_list_h265_src".to_string(),
+            target_stream_id: "transcode_list_h265_high_out".to_string(),
             profile: None,
         };
         transcode_manager.start(req2).unwrap();
@@ -295,8 +300,8 @@ mod transcode_manager_tests {
         assert_eq!(sessions.len(), 2);
 
         let stop_req1 = StopTranscodeRequest {
-            source_stream_id: "stream1".to_string(),
-            target_stream_id: Some("stream1_low".to_string()),
+            source_stream_id: "transcode_list_h264_src".to_string(),
+            target_stream_id: Some("transcode_list_h264_low_out".to_string()),
         };
         transcode_manager.stop(stop_req1).unwrap();
 
@@ -304,8 +309,8 @@ mod transcode_manager_tests {
         assert_eq!(sessions.len(), 1);
 
         let stop_req2 = StopTranscodeRequest {
-            source_stream_id: "stream2".to_string(),
-            target_stream_id: Some("stream2_high".to_string()),
+            source_stream_id: "transcode_list_h265_src".to_string(),
+            target_stream_id: Some("transcode_list_h265_high_out".to_string()),
         };
         transcode_manager.stop(stop_req2).unwrap();
 
@@ -346,8 +351,14 @@ mod codec_conversion_tests {
         assert!(result.is_ok());
         let session_info = result.unwrap();
         assert_eq!(session_info.profile.video_codec, Some("h265".to_string()));
-        assert_eq!(session_info.profile.video_bitrate, Some("1500k".to_string()));
-        assert_eq!(session_info.profile.resolution, Some("1280x720".to_string()));
+        assert_eq!(
+            session_info.profile.video_bitrate,
+            Some("1500k".to_string())
+        );
+        assert_eq!(
+            session_info.profile.resolution,
+            Some("1280x720".to_string())
+        );
 
         let stop_req = StopTranscodeRequest {
             source_stream_id: "h264_source".to_string(),
@@ -384,8 +395,14 @@ mod codec_conversion_tests {
         assert!(result.is_ok());
         let session_info = result.unwrap();
         assert_eq!(session_info.profile.video_codec, Some("h264".to_string()));
-        assert_eq!(session_info.profile.video_bitrate, Some("2000k".to_string()));
-        assert_eq!(session_info.profile.resolution, Some("1920x1080".to_string()));
+        assert_eq!(
+            session_info.profile.video_bitrate,
+            Some("2000k".to_string())
+        );
+        assert_eq!(
+            session_info.profile.resolution,
+            Some("1920x1080".to_string())
+        );
 
         let stop_req = StopTranscodeRequest {
             source_stream_id: "h265_source".to_string(),
@@ -485,8 +502,8 @@ mod h264_to_h265_integration_tests {
     use crate::common::{
         media_server_runner::MediaServer,
         process_manager::{
-            assert_ffmpeg_publishing, is_ffmpeg_available, is_ffplay_available, run_ffplay_playback,
-            spawn_ffmpeg, stop_child, PlayConfig, PublishCodec, PublishConfig,
+            assert_ffmpeg_publishing, is_ffmpeg_available, is_ffplay_available,
+            run_ffplay_playback, spawn_ffmpeg, stop_child, PlayConfig, PublishCodec, PublishConfig,
         },
     };
 
@@ -558,8 +575,8 @@ mod h264_to_h265_integration_tests {
         );
         server.wait_ready().await;
 
-        let source_id = unique_stream("h264_src");
-        let target_id = unique_stream("h265_out");
+        let source_id = unique_stream("transcode_h264_to_h265_src");
+        let target_id = unique_stream("transcode_h264_to_h265_out");
 
         let publish = PublishConfig::rtmp("127.0.0.1", server.ports().rtmp, "live", &source_id)
             .resolution(640, 480)
@@ -589,7 +606,10 @@ mod h264_to_h265_integration_tests {
                 }}
             }}"#
         );
-        let start_resp = server.api_transcode_start(&start_body).await.expect("transcode start");
+        let start_resp = server
+            .api_transcode_start(&start_body)
+            .await
+            .expect("transcode start");
         assert_eq!(
             start_resp.status, 200,
             "transcode start failed: {}",
@@ -612,11 +632,17 @@ mod h264_to_h265_integration_tests {
                 .expect("ffplay should decode transcoded H265 RTMP stream");
         }
 
-        let stop_body = format!(
-            r#"{{"source_stream_id":"{source_id}","target_stream_id":"{target_id}"}}"#
+        let stop_body =
+            format!(r#"{{"source_stream_id":"{source_id}","target_stream_id":"{target_id}"}}"#);
+        let stop_resp = server
+            .api_transcode_stop(&stop_body)
+            .await
+            .expect("transcode stop");
+        assert_eq!(
+            stop_resp.status, 200,
+            "transcode stop failed: {}",
+            stop_resp.body
         );
-        let stop_resp = server.api_transcode_stop(&stop_body).await.expect("transcode stop");
-        assert_eq!(stop_resp.status, 200, "transcode stop failed: {}", stop_resp.body);
 
         let _ = stop_child(&mut publisher);
     }

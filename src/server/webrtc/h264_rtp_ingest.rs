@@ -6,7 +6,9 @@ use tracing::{debug, info, warn};
 use webrtc::rtp::packet::Packet;
 
 use crate::core::MetricsRegistry;
-use crate::core::{CodecType, MediaFrame, StreamManager, VIDEO_RTP_CLOCK_RATE};
+use crate::core::{
+    iter_annex_b_nal_ranges, CodecType, MediaFrame, StreamManager, VIDEO_RTP_CLOCK_RATE,
+};
 
 use super::h264_util::{
     contains_vcl_nalu, describe_annex_b, is_keyframe_annex_b, is_parameter_set_only,
@@ -112,6 +114,10 @@ impl H264RtpIngest {
             combined.extend_from_slice(part);
         }
         let is_keyframe = self.batch.is_keyframe || is_keyframe_annex_b(&combined);
+        merge_annex_b_config(&self.manager, &self.stream_id, &combined);
+        if is_keyframe {
+            combined = prepend_cached_h264_config(&self.manager, &self.stream_id, combined);
+        }
         let desc = describe_annex_b(&combined);
         let keyframe_request = if is_keyframe {
             latest_keyframe_request_age_ms(&self.stream_id)
@@ -217,6 +223,60 @@ impl H264RtpIngest {
         self.batch.parts.clear();
         self.batch.is_keyframe = false;
     }
+}
+
+fn merge_annex_b_config(manager: &StreamManager, stream_id: &str, data: &[u8]) {
+    for (start, end) in iter_annex_b_nal_ranges(data) {
+        let nalu = &data[start..end];
+        let Some(first) = nalu.first() else {
+            continue;
+        };
+        let nal_type = first & 0x1f;
+        if nal_type == 7 || nal_type == 8 {
+            manager.merge_stream_nalu_config(stream_id, CodecType::H264, nalu);
+        }
+    }
+}
+
+fn prepend_cached_h264_config(manager: &StreamManager, stream_id: &str, data: Vec<u8>) -> Vec<u8> {
+    let mut has_sps = false;
+    let mut has_pps = false;
+    for (start, end) in iter_annex_b_nal_ranges(&data) {
+        let nalu = &data[start..end];
+        let Some(first) = nalu.first() else {
+            continue;
+        };
+        match first & 0x1f {
+            7 => has_sps = true,
+            8 => has_pps = true,
+            _ => {}
+        }
+    }
+    if has_sps && has_pps {
+        return data;
+    }
+
+    let Some(stream) = manager.get_stream(&stream_id.to_string()) else {
+        return data;
+    };
+    let (Some(sps), Some(pps)) = (stream.sps, stream.pps) else {
+        return data;
+    };
+    if sps.is_empty() || pps.is_empty() {
+        return data;
+    }
+
+    let mut out = Vec::with_capacity(data.len() + sps.len() + pps.len() + 8);
+    if !has_sps {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&sps);
+    }
+    if !has_pps {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&pps);
+    }
+    out.extend_from_slice(&data);
+    out
 }
 
 struct RtpH264PacketInfo<'a> {

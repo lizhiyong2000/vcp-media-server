@@ -6,6 +6,7 @@
 const _: &str = env!("CARGO_BIN_EXE_vcp-media-server");
 
 use std::fs;
+use std::net::TcpListener as StdTcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -36,20 +37,22 @@ impl Default for ServerPorts {
 }
 
 impl ServerPorts {
-    /// Create a random port configuration for parallel test isolation.
-    pub fn random() -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let base = (10000 + (seed % 50000)) as u16;
-        Self {
-            rtmp: base,
-            rtsp: base + 1,
-            http: base + 2,
-            webrtc: base + 3,
-        }
+    /// Ask the OS for currently available listener ports for parallel tests.
+    pub fn available() -> std::io::Result<Self> {
+        let rtmp = bind_available_port()?;
+        let rtsp = bind_available_port()?;
+        let http = bind_available_port()?;
+        let webrtc = bind_available_port()?;
+
+        let ports = Self {
+            rtmp: rtmp.local_addr()?.port(),
+            rtsp: rtsp.local_addr()?.port(),
+            http: http.local_addr()?.port(),
+            webrtc: webrtc.local_addr()?.port(),
+        };
+
+        drop((rtmp, rtsp, http, webrtc));
+        Ok(ports)
     }
 }
 
@@ -58,21 +61,34 @@ pub struct MediaServer {
     ports: ServerPorts,
     child: Child,
     config_path: PathBuf,
+    log_label: Option<String>,
 }
 
 impl MediaServer {
     /// Start the media server on default ports (requires ports to be free).
     pub fn start() -> std::io::Result<Self> {
-        Self::start_with_ports(ServerPorts::default())
+        Self::start_with_ports_inner(ServerPorts::default(), None)
     }
 
-    /// Start the media server on random ports (recommended for tests).
+    /// Start the media server on available ports selected by the OS.
     pub fn start_isolated() -> std::io::Result<Self> {
-        Self::start_with_ports(ServerPorts::random())
+        Self::start_with_ports_inner(ServerPorts::available()?, None)
+    }
+
+    /// Start the media server on available ports and prefix runner logs with a stream id.
+    pub fn start_isolated_for_stream(stream_id: &str) -> std::io::Result<Self> {
+        Self::start_with_ports_inner(ServerPorts::available()?, Some(stream_id.to_string()))
     }
 
     /// Start the media server with specific ports via config file.
     pub fn start_with_ports(ports: ServerPorts) -> std::io::Result<Self> {
+        Self::start_with_ports_inner(ports, None)
+    }
+
+    fn start_with_ports_inner(
+        ports: ServerPorts,
+        log_label: Option<String>,
+    ) -> std::io::Result<Self> {
         let exe_path = find_server_executable()?;
         if !exe_path.exists() {
             return Err(std::io::Error::new(
@@ -94,18 +110,22 @@ impl MediaServer {
             .stderr(Stdio::null())
             .spawn()?;
 
-        println!(
-            "Started media server {} (RTMP={}, RTSP={}, HTTP={})",
-            exe_path.display(),
-            ports.rtmp,
-            ports.rtsp,
-            ports.http
-        );
+        // println!(
+        //     "{}[MEDIA_SERVER_PORTS] started exe={} rtmp={} rtsp={} http={} webrtc={} config={}",
+        //     log_prefix(log_label.as_deref()),
+        //     exe_path.display(),
+        //     ports.rtmp,
+        //     ports.rtsp,
+        //     ports.http,
+        //     ports.webrtc,
+        //     config_path.display()
+        // );
 
         Ok(Self {
             ports,
             child,
             config_path,
+            log_label,
         })
     }
 
@@ -116,13 +136,20 @@ impl MediaServer {
         wait_for_port("127.0.0.1", self.ports.rtsp, deadline).await;
         wait_for_port("127.0.0.1", self.ports.http, deadline).await;
         println!(
-            "Media server ready (RTMP={}, RTSP={}, HTTP={})",
-            self.ports.rtmp, self.ports.rtsp, self.ports.http
+            "{}[MEDIA_SERVER_PORTS] ready rtmp={} rtsp={} http={} webrtc={}",
+            log_prefix(self.log_label.as_deref()),
+            self.ports.rtmp,
+            self.ports.rtsp,
+            self.ports.http,
+            self.ports.webrtc
         );
     }
 
     pub fn rtmp_url(&self, app: &str, stream_key: &str) -> String {
-        format!("rtmp://127.0.0.1:{}/{}/{}", self.ports.rtmp, app, stream_key)
+        format!(
+            "rtmp://127.0.0.1:{}/{}/{}",
+            self.ports.rtmp, app, stream_key
+        )
     }
 
     pub fn rtsp_url(&self, stream_id: &str) -> String {
@@ -174,9 +201,7 @@ impl MediaServer {
         remote_url: &str,
         stream_id: &str,
     ) -> Result<HttpResponse, String> {
-        let body = format!(
-            r#"{{"url":"{remote_url}","stream_id":"{stream_id}"}}"#
-        );
+        let body = format!(r#"{{"url":"{remote_url}","stream_id":"{stream_id}"}}"#);
         self.post_json("/api/pull/rtmp", &body).await
     }
 
@@ -186,13 +211,11 @@ impl MediaServer {
         remote_url: &str,
         stream_id: &str,
     ) -> Result<HttpResponse, String> {
-        let body = format!(
-            r#"{{"url":"{remote_url}","stream_id":"{stream_id}"}}"#
-        );
+        let body = format!(r#"{{"url":"{remote_url}","stream_id":"{stream_id}"}}"#);
         self.post_json("/api/pull/rtsp", &body).await
     }
 
-/// Trigger HLS generation with a single playlist request (avoid repeated m3u8 polling).
+    /// Trigger HLS generation with a single playlist request (avoid repeated m3u8 polling).
     pub async fn trigger_hls(&self, stream_id: &str) -> Result<(), String> {
         let path = format!("/hls/{stream_id}/live.m3u8");
         tokio::time::timeout(Duration::from_secs(10), self.get(&path))
@@ -211,7 +234,10 @@ impl MediaServer {
         }
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.config_path);
-        println!("Media server stopped");
+        println!(
+            "{}Media server stopped",
+            log_prefix(self.log_label.as_deref())
+        );
     }
 }
 
@@ -219,6 +245,12 @@ impl Drop for MediaServer {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn log_prefix(log_label: Option<&str>) -> String {
+    log_label
+        .map(|label| format!("[{label}] "))
+        .unwrap_or_default()
 }
 
 async fn wait_for_port(host: &str, port: u16, deadline: tokio::time::Instant) {
@@ -231,6 +263,10 @@ async fn wait_for_port(host: &str, port: u16, deadline: tokio::time::Instant) {
         }
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn bind_available_port() -> std::io::Result<StdTcpListener> {
+    StdTcpListener::bind(("0.0.0.0", 0))
 }
 
 fn create_test_config(ports: &ServerPorts) -> std::io::Result<PathBuf> {

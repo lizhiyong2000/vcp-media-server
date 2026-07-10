@@ -19,11 +19,15 @@ mod tests {
     use tokio::time::sleep;
 
     use vcp_media_server::core::{
-        CodecType, DispatchPolicy, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode, Track,
+        CodecType, DispatchPolicy, MediaFrame, StreamManager, StreamProtocol, StreamSourceMode,
+        Track,
     };
 
     use crate::common::{
-        frame_generators::{generate_h264_idr_frame, generate_h265_idr_frame, generate_h264_sps_pps, generate_h265_vps_sps_pps},
+        frame_generators::{
+            generate_h264_idr_frame, generate_h264_sps_pps, generate_h265_idr_frame,
+            generate_h265_vps_sps_pps,
+        },
         hls_helper::HlsTestHelper,
         http_flv_helper::HttpFlvTestHelper,
         rtmp_helper::RtmpTestHelper,
@@ -59,7 +63,8 @@ mod tests {
             assert!(stream.is_some(), "Stream should exist after publish");
 
             // Subscribe for HTTP-FLV playback
-            let reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
+            let reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
             assert!(reader.is_some(), "Should be able to subscribe for HTTP-FLV");
 
             // Cleanup
@@ -80,7 +85,8 @@ mod tests {
             sleep(Duration::from_millis(500)).await;
 
             // Subscribe for RTSP playback
-            let reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::SequentialFromIdr);
+            let reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::SequentialFromIdr);
             assert!(reader.is_some(), "Should be able to subscribe for RTSP");
 
             cleanup_test_streams(&manager, &[&config.stream_id]);
@@ -124,7 +130,8 @@ mod tests {
             sleep(Duration::from_millis(500)).await;
 
             // Subscribe for HTTP-FLV
-            let reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
+            let reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
             assert!(reader.is_some());
 
             cleanup_test_streams(&manager, &[&config.stream_id]);
@@ -143,7 +150,8 @@ mod tests {
             sleep(Duration::from_millis(500)).await;
 
             // Subscribe for RTMP playback
-            let reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
+            let reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
             assert!(reader.is_some());
 
             cleanup_test_streams(&manager, &[&config.stream_id]);
@@ -185,9 +193,12 @@ mod tests {
             sleep(Duration::from_millis(500)).await;
 
             // Test all playback protocols
-            let rtmp_reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
-            let rtsp_reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::SequentialFromIdr);
-            let webrtc_reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::WebRtcPlay);
+            let rtmp_reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
+            let rtsp_reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::SequentialFromIdr);
+            let webrtc_reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::WebRtcPlay);
 
             assert!(rtmp_reader.is_some(), "RTMP playback should work");
             assert!(rtsp_reader.is_some(), "RTSP playback should work");
@@ -220,7 +231,8 @@ mod tests {
             let stream = manager.get_stream(&config.stream_id);
             assert!(stream.is_some());
 
-            let reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
+            let reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
             assert!(reader.is_some());
 
             cleanup_test_streams(&manager, &[&config.stream_id]);
@@ -238,7 +250,8 @@ mod tests {
 
             sleep(Duration::from_millis(500)).await;
 
-            let reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::SequentialFromIdr);
+            let reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::SequentialFromIdr);
             assert!(reader.is_some());
 
             cleanup_test_streams(&manager, &[&config.stream_id]);
@@ -278,7 +291,8 @@ mod tests {
 
             sleep(Duration::from_millis(500)).await;
 
-            let reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
+            let reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
             assert!(reader.is_some());
 
             cleanup_test_streams(&manager, &[&config.stream_id]);
@@ -296,7 +310,8 @@ mod tests {
 
             sleep(Duration::from_millis(500)).await;
 
-            let reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
+            let reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
             assert!(reader.is_some());
 
             cleanup_test_streams(&manager, &[&config.stream_id]);
@@ -336,13 +351,19 @@ mod tests {
 
             sleep(Duration::from_millis(500)).await;
 
-            let rtmp_reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
-            let rtsp_reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::SequentialFromIdr);
-            let webrtc_reader = manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::WebRtcPlay);
+            let rtmp_reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::LiveCoalesce);
+            let rtsp_reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::SequentialFromIdr);
+            let webrtc_reader =
+                manager.dispatch_subscribe(&config.stream_id, DispatchPolicy::WebRtcPlay);
 
             assert!(rtmp_reader.is_some(), "RTMP playback should work for H265");
             assert!(rtsp_reader.is_some(), "RTSP playback should work for H265");
-            assert!(webrtc_reader.is_some(), "WebRTC playback should work for H265");
+            assert!(
+                webrtc_reader.is_some(),
+                "WebRTC playback should work for H265"
+            );
 
             cleanup_test_streams(&manager, &[&config.stream_id]);
         }
@@ -360,11 +381,11 @@ mod tests {
             let manager = Arc::new(StreamManager::new());
 
             // H264 stream
-            let h264_stream_id = "test_h264_concurrent";
+            let h264_stream_id = "concurrent_push_h264";
             let _tracks = setup_test_stream(&manager, h264_stream_id, TestCodec::H264);
 
             // H265 stream
-            let h265_stream_id = "test_h265_concurrent";
+            let h265_stream_id = "concurrent_push_h265";
             let _tracks = setup_test_stream(&manager, h265_stream_id, TestCodec::H265);
 
             // Publish to both
@@ -381,8 +402,12 @@ mod tests {
             assert!(manager.get_stream(&h265_stream_id.to_string()).is_some());
 
             // Both should be playable via HTTP-FLV
-            assert!(manager.dispatch_subscribe(h264_stream_id, DispatchPolicy::LiveCoalesce).is_some());
-            assert!(manager.dispatch_subscribe(h265_stream_id, DispatchPolicy::LiveCoalesce).is_some());
+            assert!(manager
+                .dispatch_subscribe(h264_stream_id, DispatchPolicy::LiveCoalesce)
+                .is_some());
+            assert!(manager
+                .dispatch_subscribe(h265_stream_id, DispatchPolicy::LiveCoalesce)
+                .is_some());
 
             cleanup_test_streams(&manager, &[h264_stream_id, h265_stream_id]);
         }
@@ -428,10 +453,15 @@ mod tests {
         #[tokio::test]
         async fn test_stream_creation_and_deletion() {
             let manager = Arc::new(StreamManager::new());
-            let stream_id = "test_create_delete";
+            let stream_id = "stream_create_delete_h264";
 
             // Create stream
-            manager.create_stream(stream_id, StreamSourceMode::Push, StreamProtocol::RTMP, None);
+            manager.create_stream(
+                stream_id,
+                StreamSourceMode::Push,
+                StreamProtocol::RTMP,
+                None,
+            );
             assert!(manager.get_stream(&stream_id.to_string()).is_some());
 
             // Remove stream
@@ -444,21 +474,31 @@ mod tests {
         async fn test_stream_list_operations() {
             let manager = Arc::new(StreamManager::new());
 
-            manager.create_stream("stream1", StreamSourceMode::Push, StreamProtocol::RTMP, None);
-            manager.create_stream("stream2", StreamSourceMode::Pull, StreamProtocol::RTSP, None);
+            manager.create_stream(
+                "rtmp_push_list_h264",
+                StreamSourceMode::Push,
+                StreamProtocol::RTMP,
+                None,
+            );
+            manager.create_stream(
+                "rtsp_pull_list_h264",
+                StreamSourceMode::Pull,
+                StreamProtocol::RTSP,
+                None,
+            );
 
             let streams = manager.list_streams();
             assert_eq!(streams.len(), 2);
-            assert!(streams.contains(&"stream1".to_string()));
-            assert!(streams.contains(&"stream2".to_string()));
+            assert!(streams.contains(&"rtmp_push_list_h264".to_string()));
+            assert!(streams.contains(&"rtsp_pull_list_h264".to_string()));
 
-            cleanup_test_streams(&manager, &["stream1", "stream2"]);
+            cleanup_test_streams(&manager, &["rtmp_push_list_h264", "rtsp_pull_list_h264"]);
         }
 
         #[tokio::test]
         async fn test_multiple_subscribers_same_stream() {
             let manager = Arc::new(StreamManager::new());
-            let stream_id = "test_multi_sub";
+            let stream_id = "stream_multi_sub_h264";
 
             let _tracks = setup_test_stream(&manager, stream_id, TestCodec::H264);
 
@@ -475,7 +515,7 @@ mod tests {
         #[tokio::test]
         async fn test_stream_with_pull_url() {
             let manager = Arc::new(StreamManager::new());
-            let stream_id = "test_pull_stream";
+            let stream_id = "rtsp_pull_stream_h264";
             let pull_url = "rtsp://example.com/live";
 
             manager.create_stream(
@@ -504,33 +544,25 @@ mod tests {
         #[tokio::test]
         async fn test_h264_frame_with_sps_pps() {
             let manager = Arc::new(StreamManager::new());
-            let stream_id = "test_h264_sps";
+            let stream_id = "frame_h264_sps_pps";
 
-            manager.create_stream(stream_id, StreamSourceMode::Push, StreamProtocol::Unknown, None);
+            manager.create_stream(
+                stream_id,
+                StreamSourceMode::Push,
+                StreamProtocol::Unknown,
+                None,
+            );
             manager.ensure_stream_hub(stream_id);
 
             // Send SPS/PPS first
             let sps_pps = generate_h264_sps_pps();
-            let frame = MediaFrame::new(
-                stream_id.to_string(),
-                0,
-                0,
-                sps_pps,
-                true,
-                CodecType::H264,
-            );
+            let frame =
+                MediaFrame::new(stream_id.to_string(), 0, 0, sps_pps, true, CodecType::H264);
             manager.publish_frame(frame);
 
             // Send IDR
             let idr = generate_h264_idr_frame(0);
-            let frame = MediaFrame::new(
-                stream_id.to_string(),
-                0,
-                3600,
-                idr,
-                true,
-                CodecType::H264,
-            );
+            let frame = MediaFrame::new(stream_id.to_string(), 0, 3600, idr, true, CodecType::H264);
             manager.publish_frame(frame);
 
             sleep(Duration::from_millis(100)).await;
@@ -545,9 +577,14 @@ mod tests {
         #[tokio::test]
         async fn test_h265_frame_with_vps_sps_pps() {
             let manager = Arc::new(StreamManager::new());
-            let stream_id = "test_h265_params";
+            let stream_id = "frame_h265_vps_sps_pps";
 
-            manager.create_stream(stream_id, StreamSourceMode::Push, StreamProtocol::Unknown, None);
+            manager.create_stream(
+                stream_id,
+                StreamSourceMode::Push,
+                StreamProtocol::Unknown,
+                None,
+            );
             manager.ensure_stream_hub(stream_id);
 
             // Send VPS/SPS/PPS
@@ -564,14 +601,7 @@ mod tests {
 
             // Send IDR
             let idr = generate_h265_idr_frame(0);
-            let frame = MediaFrame::new(
-                stream_id.to_string(),
-                0,
-                3600,
-                idr,
-                true,
-                CodecType::H265,
-            );
+            let frame = MediaFrame::new(stream_id.to_string(), 0, 3600, idr, true, CodecType::H265);
             manager.publish_frame(frame);
 
             sleep(Duration::from_millis(100)).await;
@@ -585,9 +615,14 @@ mod tests {
         #[tokio::test]
         async fn test_frame_sequence_numbers() {
             let manager = Arc::new(StreamManager::new());
-            let stream_id = "test_seq";
+            let stream_id = "frame_sequence_h264";
 
-            manager.create_stream(stream_id, StreamSourceMode::Push, StreamProtocol::Unknown, None);
+            manager.create_stream(
+                stream_id,
+                StreamSourceMode::Push,
+                StreamProtocol::Unknown,
+                None,
+            );
             manager.ensure_stream_hub(stream_id);
 
             // Publish 10 frames
@@ -623,7 +658,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_rtmp_command_generation() {
-            let stream_key = "test_stream";
+            let stream_key = "rtmp_command_h264";
             let app = "live";
 
             let command = crate::common::rtmp_helper::create_rtmp_publish_command(stream_key, app);
@@ -648,15 +683,15 @@ mod tests {
 
         #[tokio::test]
         async fn test_http_flv_helper_creation() {
-            let helper = HttpFlvTestHelper::new("test_flv", "127.0.0.1", 8081);
-            assert_eq!(helper.stream_id(), "test_flv");
+            let helper = HttpFlvTestHelper::new("http_flv_helper_h264", "127.0.0.1", 8081);
+            assert_eq!(helper.stream_id(), "http_flv_helper_h264");
             assert_eq!(helper.port(), 8081);
         }
 
         #[tokio::test]
         async fn test_hls_helper_creation() {
-            let helper = HlsTestHelper::new("test_hls", "/tmp/hls");
-            assert_eq!(helper.stream_id(), "test_hls");
+            let helper = HlsTestHelper::new("hls_helper_h264", "/tmp/hls");
+            assert_eq!(helper.stream_id(), "hls_helper_h264");
         }
     }
 }

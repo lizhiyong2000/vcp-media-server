@@ -24,9 +24,8 @@ async fn http_get_inner(host: &str, port: u16, path: &str) -> Result<HttpRespons
         .await
         .map_err(|e| format!("connect {host}:{port}: {e}"))?;
 
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-    );
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await

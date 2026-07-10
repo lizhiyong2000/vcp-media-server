@@ -63,7 +63,10 @@ async fn wait_for_tcp(host: &str, port: u16, timeout: Duration) {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("Timed out waiting for RTMP test server on {}:{}", host, port);
+            panic!(
+                "Timed out waiting for RTMP test server on {}:{}",
+                host, port
+            );
         }
         sleep(Duration::from_millis(50)).await;
     }
