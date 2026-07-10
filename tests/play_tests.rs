@@ -38,6 +38,10 @@ mod tests {
             spawn_ffmpeg, spawn_ffmpeg_for_stream, stop_child, verify_hls_playlist,
             verify_http_flv_stream, PlayConfig, PlayProtocol, PublishCodec, PublishConfig,
         },
+        realtime_probe::{
+            assert_realtime_stats, measure_realtime_playback, RealtimeProbeConfig,
+            TimestampPublisherConfig, TimestampVideoPublisher,
+        },
         rtmp_helper::RtmpTestHelper,
         rtsp_helper::{create_rtsp_announce_sdp, RtspTestHelper},
         stream_helper::{cleanup_test_streams, setup_test_stream},
@@ -640,10 +644,10 @@ mod tests {
         // Multi-protocol playback helpers
         // =========================================================================
 
-        /// Play an active stream via RTMP, RTSP, HTTP-FLV, and HLS.
+        /// Play an active stream via RTMP, RTSP-TCP, RTSP-UDP, HTTP-FLV, and HLS.
         ///
         /// Verification order is fixed to match the plan output:
-        /// RTMP -> RTSP -> FLV -> HLS.
+        /// RTMP -> RTSP-TCP -> RTSP-UDP -> FLV -> HLS.
         /// - RTMP/RTSP/HLS: ffmpeg null-muxer decode (frame count) + ffprobe
         /// - HTTP-FLV: raw TCP download + FLV tag counting (Scheme 4)
         async fn play_via_live_protocols(
@@ -671,8 +675,11 @@ mod tests {
             if let Err(e) = play_via_rtmp(server, stream_id, codec).await {
                 errors.push(format!("RTMP: {e}"));
             }
-            if let Err(e) = play_via_rtsp(server, stream_id).await {
-                errors.push(format!("RTSP: {e}"));
+            if let Err(e) = play_via_rtsp(server, stream_id, "tcp", "RTSP-TCP").await {
+                errors.push(format!("RTSP-TCP: {e}"));
+            }
+            if let Err(e) = play_via_rtsp(server, stream_id, "udp", "RTSP-UDP").await {
+                errors.push(format!("RTSP-UDP: {e}"));
             }
             if let Err(e) = play_via_flv(server, stream_id).await {
                 errors.push(format!("HTTP-FLV: {e}"));
@@ -726,33 +733,36 @@ mod tests {
             }
         }
 
-        /// Play via RTSP over TCP using ffmpeg decode + ffprobe. Server API is
-        /// checked by the caller before protocol-specific playback.
-        async fn play_via_rtsp(server: &MediaServer, stream_id: &str) -> Result<(), String> {
-            // Default to TCP transport: UDP RTSP often fails on localhost due
-            // to dynamic RTP port negotiation. TCP is more reliable.
+        /// Play via RTSP using ffmpeg decode + ffprobe. Server API is checked
+        /// by the caller before protocol-specific playback.
+        async fn play_via_rtsp(
+            server: &MediaServer,
+            stream_id: &str,
+            transport: &str,
+            label: &str,
+        ) -> Result<(), String> {
             let rtsp_url = server.rtsp_url(stream_id);
-            eprintln!("[{stream_id}] [PROGRESS] Checking RTSP playback (TCP) at {rtsp_url}...");
+            eprintln!("[{stream_id}] [PROGRESS] Checking {label} playback at {rtsp_url}...");
             match run_ffmpeg_decode_without_api_check(
                 &rtsp_url,
                 PlayProtocol::RTSP,
                 stream_id,
                 5,
                 false,
-                Some("tcp"),
+                Some(transport),
             )
             .await
             {
                 Ok(stats) => {
                     println!(
-                        "[{stream_id}] [OK] RTSP   <- {:.0}fps, {} frames",
+                        "[{stream_id}] [OK] {label:<8} <- {:.0}fps, {} frames",
                         stats.fps.unwrap_or(0.0),
                         stats.video_frames
                     );
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("[{stream_id}] [ERROR] RTSP <- {e}");
+                    eprintln!("[{stream_id}] [ERROR] {label} <- {e}");
                     Err(e)
                 }
             }
@@ -932,13 +942,23 @@ mod tests {
                     )
                 ),
                 format!(
-                    "PLAY_RTSP {}",
+                    "PLAY_RTSP_TCP {}",
                     planned_ffmpeg_decode_command(
                         &rtsp_url,
                         PlayProtocol::RTSP,
                         5,
                         false,
                         Some("tcp"),
+                    )
+                ),
+                format!(
+                    "PLAY_RTSP_UDP {}",
+                    planned_ffmpeg_decode_command(
+                        &rtsp_url,
+                        PlayProtocol::RTSP,
+                        5,
+                        false,
+                        Some("udp"),
                     )
                 ),
                 format!(
@@ -1022,7 +1042,7 @@ mod tests {
             format_command("ffmpeg", &args)
         }
 
-        /// Push via ffmpeg, then test RTMP + RTSP + FLV + HLS playback against the same stream.
+        /// Push via ffmpeg, then test RTMP + RTSP-TCP + RTSP-UDP + FLV + HLS playback.
         async fn push_and_play_all_protocols(
             publish: &PublishConfig,
             codec: PublishCodec,
@@ -1038,7 +1058,7 @@ mod tests {
             // at least one full GOP is available before the decode check.
             assert_ffmpeg_publishing(&mut ffmpeg, Duration::from_millis(4000)).await?;
             eprintln!(
-                "[{stream_id}] [PROGRESS] Publisher running, verifying protocols (RTMP/RTSP/FLV/HLS)..."
+                "[{stream_id}] [PROGRESS] Publisher running, verifying protocols (RTMP/RTSP-TCP/RTSP-UDP/FLV/HLS)..."
             );
 
             let result = play_via_live_protocols(server, stream_id, codec).await;
@@ -1081,7 +1101,7 @@ mod tests {
             }
         }
 
-        /// Push source, trigger API pull, then test all 4 play protocols from the pulled stream.
+        /// Push source, trigger API pull, then test all 5 playback paths from the pulled stream.
         async fn pull_and_play_all_protocols(
             server: &MediaServer,
             publish: &PublishConfig,
@@ -1161,6 +1181,289 @@ mod tests {
 
             let _ = stop_child(&mut ffmpeg);
             result
+        }
+
+        #[derive(Clone, Copy)]
+        enum RealtimePublishInput {
+            Rtmp { enhanced_hevc: bool },
+            Rtsp { transport: &'static str },
+        }
+
+        fn realtime_probe_config() -> RealtimeProbeConfig {
+            RealtimeProbeConfig {
+                max_dropped_frames: Some(30),
+                ..RealtimeProbeConfig::default()
+            }
+        }
+
+        fn hls_realtime_probe_config() -> RealtimeProbeConfig {
+            RealtimeProbeConfig {
+                max_startup_latency: Duration::from_millis(15000),
+                max_p95_latency: Duration::from_millis(12000),
+                max_latency: Duration::from_millis(15000),
+                max_dropped_frames: Some(180),
+                ..RealtimeProbeConfig::default()
+            }
+        }
+
+        fn realtime_publisher_config(
+            server: &MediaServer,
+            stream_id: &str,
+            codec: PublishCodec,
+            input: RealtimePublishInput,
+        ) -> TimestampPublisherConfig {
+            match input {
+                RealtimePublishInput::Rtmp { enhanced_hevc } => TimestampPublisherConfig {
+                    url: server.rtmp_url("live", stream_id),
+                    codec,
+                    rtmp_enhanced_hevc: enhanced_hevc,
+                    rtsp_transport: None,
+                },
+                RealtimePublishInput::Rtsp { transport } => TimestampPublisherConfig {
+                    url: server.rtsp_url(stream_id),
+                    codec,
+                    rtmp_enhanced_hevc: true,
+                    rtsp_transport: Some(transport),
+                },
+            }
+        }
+
+        fn realtime_remote_url(
+            server: &MediaServer,
+            stream_id: &str,
+            input: RealtimePublishInput,
+        ) -> String {
+            match input {
+                RealtimePublishInput::Rtmp { .. } => server.rtmp_url("live", stream_id),
+                RealtimePublishInput::Rtsp { transport: "udp" } => {
+                    format!("{}?transport=udp", server.rtsp_url(stream_id))
+                }
+                RealtimePublishInput::Rtsp { .. } => server.rtsp_url(stream_id),
+            }
+        }
+
+        async fn measure_realtime_via_all_protocols(
+            server: &MediaServer,
+            stream_id: &str,
+            codec: PublishCodec,
+        ) -> Result<(), String> {
+            wait_for_server_side_frames(
+                server,
+                stream_id,
+                "realtime stream",
+                Duration::from_secs(15),
+            )
+            .await?;
+
+            let live_probe = realtime_probe_config();
+            let hls_probe = hls_realtime_probe_config();
+            let enhanced_rtmp_hevc = matches!(codec, PublishCodec::H265);
+            let mut errors = Vec::new();
+
+            server
+                .trigger_hls(stream_id)
+                .await
+                .map_err(|e| format!("HLS trigger failed: {e}"))?;
+            sleep(Duration::from_secs(3)).await;
+
+            let mut tasks = Vec::new();
+            let live_checks = [
+                (
+                    "RTMP",
+                    PlayProtocol::RTMP,
+                    server.rtmp_url("live", stream_id),
+                    None,
+                ),
+                (
+                    "HTTP-FLV",
+                    PlayProtocol::HTTP_FLV,
+                    server.http_flv_url(stream_id),
+                    None,
+                ),
+                (
+                    "RTSP-TCP",
+                    PlayProtocol::RTSP,
+                    server.rtsp_url(stream_id),
+                    Some("tcp"),
+                ),
+                (
+                    "RTSP-UDP",
+                    PlayProtocol::RTSP,
+                    server.rtsp_url(stream_id),
+                    Some("udp"),
+                ),
+            ];
+
+            for (label, protocol, url, rtsp_transport) in live_checks {
+                let task_stream_id = stream_id.to_string();
+                let task_probe = live_probe.clone();
+                let task_label = label.to_string();
+                tasks.push(tokio::spawn(async move {
+                    let result = measure_realtime_playback(
+                        &task_stream_id,
+                        &url,
+                        protocol,
+                        &task_probe,
+                        rtsp_transport,
+                        enhanced_rtmp_hevc && matches!(protocol, PlayProtocol::RTMP),
+                    )
+                    .await;
+                    (task_label, task_probe, result)
+                }));
+            }
+
+            {
+                let task_stream_id = stream_id.to_string();
+                let task_probe = hls_probe.clone();
+                let url = server.hls_url(stream_id);
+                tasks.push(tokio::spawn(async move {
+                    let result = measure_realtime_playback(
+                        &task_stream_id,
+                        &url,
+                        PlayProtocol::HLS,
+                        &task_probe,
+                        None,
+                        false,
+                    )
+                    .await;
+                    ("HLS".to_string(), task_probe, result)
+                }));
+            }
+
+            eprintln!(
+                "[{stream_id}] [REALTIME] running {} protocol playback probes concurrently for {}s",
+                tasks.len(),
+                live_probe.measure_duration.as_secs()
+            );
+
+            for task in tasks {
+                match task.await {
+                    Ok((label, probe, Ok(stats))) => {
+                        if let Err(e) = assert_realtime_stats(stream_id, &label, &stats, &probe) {
+                            errors.push(e);
+                        }
+                    }
+                    Ok((label, _, Err(e))) => errors.push(format!("{label}: {e}")),
+                    Err(e) => errors.push(format!("realtime playback task join failed: {e}")),
+                }
+            }
+
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "realtime protocol failures for {stream_id}: {}",
+                    errors.join(" | ")
+                ))
+            }
+        }
+
+        async fn push_and_measure_realtime_all_protocols(
+            server: &MediaServer,
+            stream_id: &str,
+            codec: PublishCodec,
+            input: RealtimePublishInput,
+        ) -> Result<(), String> {
+            let probe = realtime_probe_config();
+            let publisher_config = realtime_publisher_config(server, stream_id, codec, input);
+            let mut publisher =
+                TimestampVideoPublisher::start(stream_id, &publisher_config, &probe)?;
+
+            let result = measure_realtime_via_all_protocols(server, stream_id, codec).await;
+            publisher.stop();
+            result
+        }
+
+        async fn pull_and_measure_realtime_all_protocols(
+            server: &MediaServer,
+            source_stream_id: &str,
+            pulled_stream_id: &str,
+            codec: PublishCodec,
+            input: RealtimePublishInput,
+        ) -> Result<(), String> {
+            let probe = realtime_probe_config();
+            let publisher_config =
+                realtime_publisher_config(server, source_stream_id, codec, input);
+            let mut publisher =
+                TimestampVideoPublisher::start(source_stream_id, &publisher_config, &probe)?;
+
+            if let Err(e) = wait_for_server_side_frames(
+                server,
+                source_stream_id,
+                "realtime source stream",
+                Duration::from_secs(15),
+            )
+            .await
+            {
+                publisher.stop();
+                return Err(e);
+            }
+
+            let remote_url = realtime_remote_url(server, source_stream_id, input);
+            let resp = match input {
+                RealtimePublishInput::Rtmp { .. } => {
+                    server.api_rtmp_pull(&remote_url, pulled_stream_id).await
+                }
+                RealtimePublishInput::Rtsp { .. } => {
+                    server.api_rtsp_pull(&remote_url, pulled_stream_id).await
+                }
+            }
+            .map_err(|e| {
+                publisher.stop();
+                e
+            })?;
+
+            if resp.status != 200 {
+                publisher.stop();
+                return Err(format!(
+                    "pull API failed: status {} body {}",
+                    resp.status, resp.body
+                ));
+            }
+
+            let result = measure_realtime_via_all_protocols(server, pulled_stream_id, codec).await;
+            publisher.stop();
+            result
+        }
+
+        async fn run_realtime_push_case(
+            stream_prefix: &str,
+            label: &str,
+            codec: PublishCodec,
+            input: RealtimePublishInput,
+        ) {
+            require_ffmpeg_ffplay();
+            let sid = unique_stream(stream_prefix);
+            eprintln!("[{sid}] [TEST] Starting realtime: {label}");
+            let server =
+                MediaServer::start_isolated_for_stream(&sid).expect("failed to start media server");
+            server.wait_ready().await;
+
+            push_and_measure_realtime_all_protocols(&server, &sid, codec, input)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            println!("[{sid}] [TEST] realtime {label} OK");
+        }
+
+        async fn run_realtime_pull_case(
+            source_prefix: &str,
+            pulled_prefix: &str,
+            label: &str,
+            codec: PublishCodec,
+            input: RealtimePublishInput,
+        ) {
+            require_ffmpeg_ffplay();
+            let src_id = unique_stream(source_prefix);
+            let pulled_id = unique_stream(pulled_prefix);
+            eprintln!("[{pulled_id}] [TEST] Starting realtime: {label} ({src_id}->{pulled_id})");
+            let server = MediaServer::start_isolated_for_stream(&pulled_id)
+                .expect("failed to start media server");
+            server.wait_ready().await;
+
+            pull_and_measure_realtime_all_protocols(&server, &src_id, &pulled_id, codec, input)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            println!("[{pulled_id}] [TEST] realtime {label} OK ({src_id}->{pulled_id})");
         }
 
         /// Create an RTSP publish config with optional transport.
@@ -1549,6 +1852,183 @@ mod tests {
             println!(
                 "[{pulled_id}] [TEST] RTSP pull H265 UDP → all protocols OK ({src_id}->{pulled_id})"
             );
+        }
+
+        // =========================================================================
+        // Realtime Marker Latency → All Play Protocols
+        // =========================================================================
+
+        #[tokio::test]
+        async fn test_rtmp_push_h264_latency_all_protocols() {
+            run_realtime_push_case(
+                "rtmp_push_h264_realtime",
+                "RTMP push H264 → realtime all protocols",
+                PublishCodec::H264,
+                RealtimePublishInput::Rtmp {
+                    enhanced_hevc: true,
+                },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtmp_push_h265_latency_all_protocols() {
+            run_realtime_push_case(
+                "rtmp_push_h265_realtime",
+                "RTMP push H265 → realtime all protocols",
+                PublishCodec::H265,
+                RealtimePublishInput::Rtmp {
+                    enhanced_hevc: true,
+                },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtmp_push_h265_legacy_latency_all_protocols() {
+            run_realtime_push_case(
+                "rtmp_push_h265_legacy_realtime",
+                "RTMP push H265 legacy → realtime all protocols",
+                PublishCodec::H265,
+                RealtimePublishInput::Rtmp {
+                    enhanced_hevc: false,
+                },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_push_h264_tcp_latency_all_protocols() {
+            run_realtime_push_case(
+                "rtsp_push_tcp_h264_realtime",
+                "RTSP push H264 TCP → realtime all protocols",
+                PublishCodec::H264,
+                RealtimePublishInput::Rtsp { transport: "tcp" },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_push_h264_udp_latency_all_protocols() {
+            run_realtime_push_case(
+                "rtsp_push_udp_h264_realtime",
+                "RTSP push H264 UDP → realtime all protocols",
+                PublishCodec::H264,
+                RealtimePublishInput::Rtsp { transport: "udp" },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_push_h265_tcp_latency_all_protocols() {
+            run_realtime_push_case(
+                "rtsp_push_tcp_h265_realtime",
+                "RTSP push H265 TCP → realtime all protocols",
+                PublishCodec::H265,
+                RealtimePublishInput::Rtsp { transport: "tcp" },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_push_h265_udp_latency_all_protocols() {
+            run_realtime_push_case(
+                "rtsp_push_udp_h265_realtime",
+                "RTSP push H265 UDP → realtime all protocols",
+                PublishCodec::H265,
+                RealtimePublishInput::Rtsp { transport: "udp" },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtmp_pull_h264_latency_all_protocols() {
+            run_realtime_pull_case(
+                "rtmp_pull_h264_realtime_src",
+                "rtmp_pull_h264_realtime_out",
+                "RTMP pull H264 → realtime all protocols",
+                PublishCodec::H264,
+                RealtimePublishInput::Rtmp {
+                    enhanced_hevc: true,
+                },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtmp_pull_h265_latency_all_protocols() {
+            run_realtime_pull_case(
+                "rtmp_pull_h265_realtime_src",
+                "rtmp_pull_h265_realtime_out",
+                "RTMP pull H265 → realtime all protocols",
+                PublishCodec::H265,
+                RealtimePublishInput::Rtmp {
+                    enhanced_hevc: true,
+                },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtmp_pull_h265_legacy_latency_all_protocols() {
+            run_realtime_pull_case(
+                "rtmp_pull_h265_legacy_realtime_src",
+                "rtmp_pull_h265_legacy_realtime_out",
+                "RTMP pull H265 legacy → realtime all protocols",
+                PublishCodec::H265,
+                RealtimePublishInput::Rtmp {
+                    enhanced_hevc: false,
+                },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_pull_h264_tcp_latency_all_protocols() {
+            run_realtime_pull_case(
+                "rtsp_pull_tcp_h264_realtime_src",
+                "rtsp_pull_tcp_h264_realtime_out",
+                "RTSP pull H264 TCP → realtime all protocols",
+                PublishCodec::H264,
+                RealtimePublishInput::Rtsp { transport: "tcp" },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_pull_h264_udp_latency_all_protocols() {
+            run_realtime_pull_case(
+                "rtsp_pull_udp_h264_realtime_src",
+                "rtsp_pull_udp_h264_realtime_out",
+                "RTSP pull H264 UDP → realtime all protocols",
+                PublishCodec::H264,
+                RealtimePublishInput::Rtsp { transport: "udp" },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_pull_h265_tcp_latency_all_protocols() {
+            run_realtime_pull_case(
+                "rtsp_pull_tcp_h265_realtime_src",
+                "rtsp_pull_tcp_h265_realtime_out",
+                "RTSP pull H265 TCP → realtime all protocols",
+                PublishCodec::H265,
+                RealtimePublishInput::Rtsp { transport: "tcp" },
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn test_rtsp_pull_h265_udp_latency_all_protocols() {
+            run_realtime_pull_case(
+                "rtsp_pull_udp_h265_realtime_src",
+                "rtsp_pull_udp_h265_realtime_out",
+                "RTSP pull H265 UDP → realtime all protocols",
+                PublishCodec::H265,
+                RealtimePublishInput::Rtsp { transport: "udp" },
+            )
+            .await;
         }
     }
 }

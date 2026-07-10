@@ -9,6 +9,7 @@ pub mod http_client;
 pub mod http_flv_helper;
 pub mod media_server_runner;
 pub mod process_manager;
+pub mod realtime_probe;
 pub mod rtmp_helper;
 pub mod rtsp_helper;
 pub mod server_helper;
